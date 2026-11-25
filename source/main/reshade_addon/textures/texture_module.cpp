@@ -10,6 +10,7 @@
 #include "../config.h"
 #include "../migoto/port_api.h" // their [TextureOverride*] dispatch and [Resource*] registry
 #include "tex_crawl.h"
+#include "tex_struct_solver.hpp"
 #include "../mods/ib_hash.h"    // ForgetRange: a whole-buffer copy replaces the mesh hashes inside it
 #include "../instrumentation/profiler.h"
 #include "../addon_state.h" // g_res_to_slot / HeapKey (late re-stamp slot map)
@@ -47,7 +48,35 @@ bool        TexLookHasAnySig(uint32_t key);
 bool        TexLookWantsLiveSig(uint32_t hash, uint32_t w, uint32_t h, uint32_t fmt);
 void        TexLookCacheLiveCut(uint32_t hash, const TexLookCut& cut);
 void        TexLookCheckCutoutMask(uint32_t hash, uint32_t w, uint32_t h, uint32_t fmt, const uint8_t* bc, size_t bc_bytes);
+bool        TexLookIsCutoutMask(uint32_t hash);
+void        TexLookMarkCutoutMask(uint32_t hash);
 bool        TexLodPromoteLookalike(uint32_t from_hash, uint32_t to_hash);
+
+static std::shared_mutex                    g_vis_parent_mtx;
+static wwmi_struct_tex::VisualMipParentTable g_vis_mip_parents;
+static std::atomic<bool>                    g_vis_parent_any{ false };
+
+uint32_t TexVisualParentOf(uint32_t hash)
+{
+    if (!hash || !g_vis_parent_any.load(std::memory_order_acquire)) return 0;
+    std::shared_lock l(g_vis_parent_mtx);
+    return g_vis_mip_parents.Resolve(hash);
+}
+
+void TexNoteVisualMipParent(uint32_t child, uint32_t parent)
+{
+    if (!g_tex_struct_fallback || !child || !parent || child == parent || TexLodDegenerate(child)) return;
+    std::unique_lock l(g_vis_parent_mtx);
+    if (g_vis_mip_parents.Note(child, parent))
+        g_vis_parent_any.store(true, std::memory_order_release);
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> TexCopyVisualMipParentsFor(const std::unordered_set<uint32_t>& parents)
+{
+    if (parents.empty() || !g_vis_parent_any.load(std::memory_order_acquire)) return {};
+    std::shared_lock l(g_vis_parent_mtx);
+    return g_vis_mip_parents.CollectForParents([&](uint32_t p) { return parents.count(p) != 0; });
+}
 
 // A texture whose bytes never passed an upload hook: its mip0 copied to a readback buffer, hashed frames later.
 // IMPORTANT: TexReadback must NEVER call dst->AddRef() on game textures. During UE4 scene
@@ -1173,6 +1202,18 @@ static bool TexAssetLayoutOf(const D3D12_RESOURCE_DESC& d, uint32_t mip, TexAsse
     o.floor = (uint64_t)o.w * o.h >= kTexHashFloorPx;
     return true;
 }
+// Streaming resident mip-tail cutout mask candidate (e.g. 64x64 m7 or 128x128 m8 BC1/BC3/BC7).
+// Excludes single-mip UI icons/LUTs via MipLevels >= 7; only hashed/stored if CheckCutoutMask confirms it.
+static inline bool IsCutoutResidentTailMip(const D3D12_RESOURCE_DESC& d, const TexAssetLayout& L, uint32_t sub) noexcept
+{
+    if (sub != 0 || !g_tex_struct_fallback) return false;
+    const uint32_t w = L.w;
+    const uint32_t h = L.h;
+    if (w != h || w < 64 || w >= 256 || (w & (w - 1)) != 0) return false;
+    if (d.MipLevels < 7) return false;
+    const uint32_t bc = TexTypelessBC((uint32_t)d.Format);
+    return bc == 70 || bc == 76 || bc == 97;
+}
 
 #if defined(__clang__)
 __attribute__((target("sse4.1")))
@@ -1322,6 +1363,11 @@ static void TexMipIdentityFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOU
             PropagateRuleUpward(h0, rule);
         }
     }
+    if (g_tex_struct_fallback && id != h0) {
+        if (!rule && !TexRuleHashFor(id)) TexNoteVisualMipParent(id, h0);
+        if (TexLookIsCutoutMask(h0)) TexLookMarkCutoutMask(id);
+        else if (TexLookIsCutoutMask(id)) TexLookMarkCutoutMask(h0);
+    }
     if (rule) g_ts_mipk_target.fetch_add(1, std::memory_order_relaxed);
     const uint32_t high = rule ? rule : TexCrawlOn() ? h0 : 0;
     if (high && id != high && id != h0) MipExactRecord(dest, sub, id, high);
@@ -1436,7 +1482,9 @@ static void TexHashFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOURCE_DES
     const uint64_t destKey = reinterpret_cast<uint64_t>(dest);
     if (expected_gen && !TexResStillLive(destKey, expected_gen)) return;
     TexAssetLayout L;
-    if (!TexAssetLayoutOf(d, 0, L) || !L.floor) return;
+    if (!TexAssetLayoutOf(d, 0, L)) return;
+    const bool cutout_tail = !L.floor && IsCutoutResidentTailMip(d, L, 0);
+    if (!L.floor && !cutout_tail) return;
     const uint32_t w = L.w;
     const uint32_t h = L.h;
     const uint32_t fmt = (uint32_t)d.Format;
@@ -1451,6 +1499,51 @@ static void TexHashFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOURCE_DES
     const uint32_t mips0 = d.MipLevels ? d.MipLevels : 1;
     const uint32_t arr0 = d.DepthOrArraySize ? d.DepthOrArraySize : 1;
     uint32_t       crc = TexIdentityHash(data_hash, w, h, mips0, arr0, fmt);
+    if (cutout_tail) {
+        TexLookCheckCutoutMask(crc, w, h, fmt, tight.data(), tight.size());
+        uint32_t prev_tail = 0;
+        uint64_t cur_gen_tail = expected_gen;
+        bool     inherited_tail = false;
+        {
+            std::shared_lock l(g_tex_mutex);
+            if (expected_gen && !TexResStillLiveLocked(destKey, expected_gen)) return;
+            auto pit = g_res_texhash.find(destKey);
+            prev_tail = (pit != g_res_texhash.end()) ? pit->second : 0;
+            inherited_tail = g_res_inherited.count(destKey) != 0;
+        }
+        if (inherited_tail && prev_tail && prev_tail != crc && TexLookIsCutoutMask(prev_tail))
+            TexLookMarkCutoutMask(crc);
+        if (!TexLookIsCutoutMask(crc)) return;
+        {
+            std::lock_guard l(g_tex_mutex);
+            if (expected_gen && !TexResStillLiveLocked(destKey, expected_gen)) return;
+            if (!cur_gen_tail) {
+                auto git = g_tex_res_gen.find(destKey);
+                if (git != g_tex_res_gen.end()) cur_gen_tail = git->second;
+            }
+            g_res_texhash[destKey] = crc;
+            g_res_texhash_gen.fetch_add(1, std::memory_order_acq_rel);
+            g_res_inherited.erase(destKey);
+        }
+        if (inherited_tail && prev_tail && prev_tail != crc && !TexRuleHashFor(prev_tail))
+            TexLookMarkCutoutMask(prev_tail);
+        std::vector<PendingFeedSrc> fed_src_tail;
+        {
+            std::lock_guard l(g_feed_pending_mtx);
+            auto            sit = g_feed_src_pending.find(destKey);
+            if (sit != g_feed_src_pending.end()) {
+                fed_src_tail.swap(sit->second);
+                g_feed_src_pending.erase(sit);
+            }
+        }
+        for (const auto& e : fed_src_tail) {
+            if (e.smallerGen != 0 && cur_gen_tail != 0 && e.smallerGen != cur_gen_tail) continue;
+            if (!TexResStillLive(e.biggerH, e.biggerGen)) continue;
+            PropagateTexLineage(destKey, e.biggerH, false);
+            LineageAlias(destKey, e.biggerH, e.steps);
+        }
+        return;
+    }
     uint32_t       prev = 0;
     uint64_t       cur_gen = expected_gen;
     bool           inherited = false;
@@ -1514,6 +1607,10 @@ static void TexHashFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOURCE_DES
     bool            tex_is_target = tr.hash_to_rule.count(crc) != 0;
     if (g_tex_struct_fallback && !tex_is_target && !TexRuleHashFor(crc))
         TexLookCheckCutoutMask(crc, w, h, fmt, tight.data(), tight.size());
+    if (g_tex_struct_fallback && inherited && prev && prev != crc && !TexRuleHashFor(prev) && !TexRuleHashFor(crc)) {
+        if (TexLookIsCutoutMask(prev)) TexLookMarkCutoutMask(crc);
+        else if (TexLookIsCutoutMask(crc)) TexLookMarkCutoutMask(prev);
+    }
     if (TexResStillLive(destKey, expected_gen))
         g_tex_lod_worker.Queue(dest, crc, w, h, fmt, tex_is_target, tight);
     if (tex_is_target || tr.targets.count(crc) || TexLodKnown(crc) || TexLodLookup(crc)) {
@@ -1579,7 +1676,10 @@ static void TexHashFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOURCE_DES
             }
             if (live && !g_addon_disabled) RestampResource(destKey);
         } else if (!sRule && !TexRuleHashFor(crc) && e.sId != crc && g_tex_struct_fallback) {
+            TexNoteVisualMipParent(e.sId, crc);
             if (TexLodTargetOf(e.sId) && !TexLodTargetOf(crc)) TexLodPromoteLookalike(e.sId, crc);
+            if (TexLookIsCutoutMask(e.sId)) TexLookMarkCutoutMask(crc);
+            else if (TexLookIsCutoutMask(crc)) TexLookMarkCutoutMask(e.sId);
         }
         TexLodFeeds(e.sId, crc, tex_is_target || TexCrawlOn() ? crc : 0, e.steps);
     }
@@ -1606,6 +1706,25 @@ static void TexHashFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOURCE_DES
                         break;
                     }
                 }
+            }
+        }
+        if (g_tex_struct_fallback && !rule) {
+            std::sort(held.begin(), held.end(), [](const PendingMip& a, const PendingMip& b) { return a.sub < b.sub; });
+            for (const auto& m : held) {
+                if (m.id && m.id != crc && !m.sub_rule && !TexRuleHashFor(m.id))
+                    TexNoteVisualMipParent(m.id, crc);
+            }
+            if (!TexLookIsCutoutMask(crc)) {
+                for (const auto& m : held) {
+                    if (m.id && m.id != crc && TexLookIsCutoutMask(m.id)) {
+                        TexLookMarkCutoutMask(crc);
+                        break;
+                    }
+                }
+            }
+            if (TexLookIsCutoutMask(crc)) {
+                for (const auto& m : held)
+                    if (m.id && m.id != crc) TexLookMarkCutoutMask(m.id);
             }
         }
         const uint32_t high = rule ? rule : TexCrawlOn() ? crc : 0;
@@ -1680,14 +1799,19 @@ static void PropagateTexLineage(uint64_t srcH, uint64_t dstH, bool same_image)
     bool           has_vis_lineage = false;
     if (!rule && !same_image && shash && g_tex_struct_fallback) {
         const uint32_t lod = TexLodTargetOf(shash);
-        has_vis_lineage = (lod != 0 && TexLookHasRef(lod)) || TexLookHasAnySig(shash);
+        has_vis_lineage = (lod != 0 && TexLookHasRef(lod)) || TexLookHasAnySig(shash) || TexLookIsCutoutMask(shash);
     }
     if (!shash || (!rule && !same_image && !has_vis_lineage)) return; // a copy holding its source's image (whole, streamed down, or visual-tracked stream-up) is that texture
-    bool tagged = false;
+    bool     tagged = false;
+    uint32_t existing_verified_dst = 0;
     {
         std::lock_guard l(g_tex_mutex);
         auto            it = g_res_texhash.find(dstH);
-        if (it == g_res_texhash.end() || it->second != shash) {
+        if (!same_image && it != g_res_texhash.end() && it->second != 0 && !g_res_inherited.count(dstH)) {
+            // Destination already holds its own verified mip0 hash: never overwrite it with
+            // a smaller source hash (LineageAlias will propagate rule/cutout classification).
+            existing_verified_dst = it->second;
+        } else if (it == g_res_texhash.end() || it->second != shash) {
             g_res_texhash[dstH] = shash; // dest now swaps as the mod target on next placement
             g_res_texhash_gen.fetch_add(1, std::memory_order_acq_rel);
             g_modtex_res.insert(dstH);
@@ -1695,6 +1819,9 @@ static void PropagateTexLineage(uint64_t srcH, uint64_t dstH, bool same_image)
             ++g_tex_lineage_count;
             tagged = true;
         }
+    }
+    if (existing_verified_dst && existing_verified_dst != shash && g_tex_struct_fallback && !rule && !TexRuleHashFor(existing_verified_dst)) {
+        if (TexLookIsCutoutMask(shash)) TexLookMarkCutoutMask(existing_verified_dst);
     }
     if (tagged && rule && !g_addon_disabled) RestampResource(dstH);
 }
@@ -1741,7 +1868,10 @@ static void LineageAlias(uint64_t smallerH, uint64_t biggerH, uint32_t steps)
         if (!g_addon_disabled) RestampResource(biggerH);
         PropagateRuleUpward(bId, sRule);
     } else if (!sRule && !TexRuleHashFor(bId) && g_tex_struct_fallback) {
+        TexNoteVisualMipParent(sId, bId);
         if (TexLodTargetOf(sId) && !TexLodTargetOf(bId)) TexLodPromoteLookalike(sId, bId);
+        if (TexLookIsCutoutMask(sId)) TexLookMarkCutoutMask(bId);
+        else if (TexLookIsCutoutMask(bId)) TexLookMarkCutoutMask(sId);
     }
     const bool known_before = TexLodKnown(sId) != 0;
     TexLodFeeds(sId, bId, TexRulesNow().hash_to_rule.count(bId) || TexCrawlOn() ? bId : 0, steps);
@@ -1764,8 +1894,8 @@ bool on_copy_texture_region(command_list* cl, resource source, uint32_t src_sub,
     uint32_t            h = dd.Height;
     {
         TexAssetLayout L;
-        if (!TexAssetLayoutOf(dd, 0, L) || !L.floor) return false;
-    } // the same assets the hash covers
+        if (!TexAssetLayoutOf(dd, 0, L) || (!L.floor && !IsCutoutResidentTailMip(dd, L, 0))) return false;
+    } // the same assets the hash covers, plus resident tail mip cutout masks
     g_ts_tex2tex.fetch_add(1, std::memory_order_relaxed);
     const bool same_fmt = sd.Format == dd.Format ||
         (DxgiIsBc((uint32_t)sd.Format) && TexTypelessBC((uint32_t)sd.Format) == TexTypelessBC((uint32_t)dd.Format));
@@ -1789,10 +1919,11 @@ bool on_copy_texture_region(command_list* cl, resource source, uint32_t src_sub,
             g_ts_stream.fetch_add(1, std::memory_order_relaxed);
             if (!TexHashOf(dst_smaller ? source.handle : dest.handle)) g_ts_stream_nobig.fetch_add(1, std::memory_order_relaxed);
             PropagateTexLineage(source.handle, dest.handle, dst_smaller); // tag the fresh variant (the chain)
-            if (dst_smaller)
-                LineageAlias(dest.handle, source.handle, steps);
-            else
-                LineageAlias(source.handle, dest.handle, steps);
+            const uint64_t smallerH = dst_smaller ? dest.handle : source.handle;
+            const uint64_t biggerH = dst_smaller ? source.handle : dest.handle;
+            const bool     smaller_floor = (uint64_t)sm.Width * sm.Height >= kTexHashFloorPx;
+            if (smaller_floor || TexHashOf(smallerH) != 0)
+                LineageAlias(smallerH, biggerH, steps);
         }
     }
 
@@ -2115,7 +2246,7 @@ bool on_copy_resource(command_list*, resource source, resource dest)
     if (dest.handle) {
         auto* d = reinterpret_cast<ID3D12Resource*>(dest.handle);
         if (const uint64_t va = d->GetGPUVirtualAddress()) {
-            if (!g_addon_disabled) IbHash::ForgetRange(va, d->GetDesc().Width);
+            if (!g_addon_disabled || g_rt_blocked) IbHash::ForgetRange(va, d->GetDesc().Width);
             return false;
         }
     }
@@ -2210,7 +2341,7 @@ bool on_copy_buffer_to_texture(command_list* cl, resource source, uint64_t sourc
     auto*               dst = reinterpret_cast<ID3D12Resource*>(dest.handle);
     D3D12_RESOURCE_DESC dd = dst->GetDesc();
     TexAssetLayout      L;
-    if (!TexAssetLayoutOf(dd, dest_subresource, L) || !L.floor) return false;
+    if (!TexAssetLayoutOf(dd, dest_subresource, L) || (!L.floor && !IsCutoutResidentTailMip(dd, L, dest_subresource))) return false;
     // a partial upload (an atlas region) is not the texture, and its source holds only the region
     if (dst_box && (dst_box->left || dst_box->top || dst_box->right != L.w || dst_box->bottom != L.h)) return false;
 

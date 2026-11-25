@@ -150,6 +150,7 @@ if(WIN32 AND WWMI_BUILD_RUNTIME
         "${_STAGED_WWMI}/reshade_addon/migoto/dx12_wrap.cpp"
         "${_STAGED_WWMI}/reshade_addon/migoto/dx12_pipeline.cpp"
         "${_STAGED_WWMI}/reshade_addon/migoto/dx12_skcap.cpp"
+        "${_STAGED_WWMI}/reshade_addon/migoto/mod_ui_shield.cpp"
         "${_STAGED_WWMI}/reshade_addon/migoto/port_api.cpp"
         "${_STAGED_WWMI}/reshade_addon/migoto/hacker_context_shim.cpp"
         "${_STAGED_WWMI}/reshade_addon/migoto/port_vars.cpp"

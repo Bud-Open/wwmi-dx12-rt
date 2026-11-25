@@ -299,6 +299,8 @@ int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
     out.object_guid = (int)PortApi::GetVarNs(ns.c_str(), L"object_guid", 0.f);
     out.mesh_vertex_count = (uint32_t)PortApi::GetVarNs(ns.c_str(), L"mesh_vertex_count", 0.f);
 
+    std::unordered_map<std::wstring, std::wstring> tail_to_fq;
+
     // Components are numbered from 0 and dense in every shipped WWMI mod: the first gap ends the scan.
     for (int i = 0;; ++i) {
         wchar_t            fq[512] = {};
@@ -306,6 +308,7 @@ int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
         if (!PortApi::ResolveSection(ns.c_str(), nullptr, sec.c_str(), fq, std::size(fq)) || !fq[0]) break;
         Component c;
         ReadComponent(fq, i, c);
+        tail_to_fq[Lower(c.tail)] = fq;
         out.comps.push_back(std::move(c));
     }
     out.comps.erase(std::remove_if(out.comps.begin(), out.comps.end(),
@@ -339,16 +342,18 @@ int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
                 wchar_t folder[512] = {};
                 if (PortApi::SectionFolder(fq.c_str(), folder, std::size(folder))) out.dir = folder;
             }
+            tail_to_fq[Lower(c.tail)] = fq;
             out.comps.push_back(std::move(c));
             ++next;
         }
     }
 
     // A WWMI geometry unit targets one native mesh (one IndexBuffer content_hash).
-    // Mods may also place auxiliary ranged overrides (e.g. skip-only shadow/proxy
+    // Mods may also place auxiliary ranged overrides (e.g. skip-only shadow/proxy/shell
     // meshes on a different IB hash) in the same namespace; mixing multiple IB
     // hashes inside one Mod::comps causes RT intent validation to reject the whole
-    // mod. Keep only the primary mesh's IB hash.
+    // mod. Keep the primary mesh's IB hash in Mod::comps and preserve verified
+    // skip-only auxiliary meshes separately in Mod::aux_skip_meshes.
     {
         struct HashGroup {
             uint32_t hash = 0;
@@ -395,8 +400,23 @@ int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
                     if (i >= numbered_count) c.index = next_extra++;
                     kept.push_back(std::move(c));
                 } else {
-                    logger::write("WwmiMod: ns='%ls' excluded auxiliary ranged override '%ls' (hash=%08x != primary %08x)",
-                        ns.c_str(), c.tail.c_str(), c.ib_hash, primary_hash);
+                    const auto fq_it = tail_to_fq.find(Lower(c.tail));
+                    const bool skip_only = fq_it != tail_to_fq.end() && PortApi::IsSkipOnlyTextureOverride(fq_it->second.c_str());
+                    if (skip_only && c.ib_hash && c.match_index_count) {
+                        auto am = std::find_if(out.aux_skip_meshes.begin(), out.aux_skip_meshes.end(),
+                            [&](const AuxSkipMesh& m) { return m.ib_hash == c.ib_hash; });
+                        if (am == out.aux_skip_meshes.end()) {
+                            out.aux_skip_meshes.push_back(AuxSkipMesh{ c.ib_hash, {} });
+                            am = out.aux_skip_meshes.end() - 1;
+                        }
+                        logger::write("WwmiMod: ns='%ls' kept auxiliary skip-only override '%ls' (hash=%08x != primary %08x)",
+                            ns.c_str(), c.tail.c_str(), c.ib_hash, primary_hash);
+                        c.index = (int)am->comps.size();
+                        am->comps.push_back(std::move(c));
+                    } else {
+                        logger::write("WwmiMod: ns='%ls' excluded auxiliary ranged override '%ls' (hash=%08x != primary %08x)",
+                            ns.c_str(), c.tail.c_str(), c.ib_hash, primary_hash);
+                    }
                 }
             }
             out.comps.swap(kept);

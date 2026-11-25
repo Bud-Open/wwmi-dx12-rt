@@ -25,7 +25,7 @@ struct Blob {
 std::wstring lower(std::wstring value){for(auto &c:value)c=wchar_t(towlower(c));return value;}
 NativeMeshIntent read_intent(const Blob &blob,const WWMI_RtModCatalog_v1 &h,const WWMI_RtMod_v1 &mod){
     NativeMeshIntent out;out.load_generation=h.load_generation;out.mod_key=mod.key;out.mod_revision=mod.revision;
-    out.object_guid=mod.object_guid;out.enabled=(mod.flags&WWMI_RT_MOD_ENABLED)!=0;
+    out.object_guid=mod.object_guid;out.enabled=(mod.flags&WWMI_RT_MOD_ENABLED)!=0;out.skip_only=(mod.flags&WWMI_RT_MOD_SKIP_ONLY)!=0;
     if(!out.object_guid||!mod.component_count||mod.component_count>4096)throw std::runtime_error("parsed Mod native intent bounds");
     const auto components=blob.array<WWMI_RtModComponent_v1>(mod.components_offset,mod.component_count);std::set<unsigned> ids;
     for(const auto &c:components){
@@ -173,10 +173,11 @@ PackCatalog PackSource::refresh(const PackCatalog &old) const {
     if(h.load_generation==old.load_generation&&h.revision==old.revision&&native_state->revision==old.native_revision)return old;
     PackCatalog next;next.load_generation=h.load_generation;next.revision=h.revision;next.native_revision=native_state->revision;
     const auto mods=blob.array<WWMI_RtMod_v1>(h.mods_offset,h.mod_count);std::set<unsigned> ambiguous;
-    for(const auto &m:mods)if(m.flags&WWMI_RT_MOD_ENABLED)if(std::count_if(mods.begin(),mods.end(),[&](const auto &v){return (v.flags&WWMI_RT_MOD_ENABLED)&&v.object_guid==m.object_guid;})>1)ambiguous.insert(m.object_guid);
+    for(const auto &m:mods)if((m.flags&WWMI_RT_MOD_ENABLED)&&!(m.flags&WWMI_RT_MOD_SKIP_ONLY))if(std::count_if(mods.begin(),mods.end(),[&](const auto &v){return (v.flags&WWMI_RT_MOD_ENABLED)&&!(v.flags&WWMI_RT_MOD_SKIP_ONLY)&&v.object_guid==m.object_guid;})>1)ambiguous.insert(m.object_guid);
     for(const auto &mod:mods){const auto name=blob.string(mod.namespace_offset,mod.namespace_bytes);std::string reason;
         try{next.intents.push_back(read_intent(blob,h,mod));}catch(const std::exception &e){reason=e.what();}
         if(!(mod.flags&WWMI_RT_MOD_ENABLED))reason="Mod geometry disabled";
+        else if(mod.flags&WWMI_RT_MOD_SKIP_ONLY)reason="auxiliary skip-only mesh";
         else if(ambiguous.contains(mod.object_guid))reason="native fallback: multiple enabled Mods claim this game object";
         else if(reason.empty()){const auto native=NativeProfileRegistry::resolve(native_state,next.intents.back());
             if(native.match==NativeProfileRegistry::Match::ambiguous)reason="native fallback: game-object native mesh signature ambiguous";

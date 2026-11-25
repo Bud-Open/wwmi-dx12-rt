@@ -112,6 +112,25 @@ class InputCollector {
     };
     std::vector<ProvedMeshIb> proved_mesh_ibs_;
     std::set<std::pair<std::uint32_t,unsigned>> synth_diag_logged_;
+    struct AuxSkinWriter {
+        ResourceKey output;std::uint64_t output_base=0,output_offset=0,output_bytes=0;
+        ResourceKey rest;std::uint64_t rest_offset=0,rest_bytes=0;
+        unsigned first=0,count=0;Recording recording{};
+        std::uint64_t order=0;bool forwarded=false;unsigned submissions=0;
+    };
+    struct AuxRestProbeTarget {
+        ResourceKey rest;std::uint64_t rest_offset=0,rest_bytes=0,max_end_bytes=0;
+        std::vector<std::uint64_t> tried_bytes;
+        unsigned cancel_retries=0;
+    };
+    struct AuxRestHash {
+        ResourceKey rest;std::uint64_t rest_offset=0,rest_bytes=0;std::uint32_t content_hash=0;
+    };
+    bool has_skip_intents_=false;
+    std::vector<AuxSkinWriter> aux_skin_writers_;
+    std::vector<AuxRestProbeTarget> aux_probe_targets_;
+    std::vector<AuxRestHash> aux_rest_hashes_;
+    void record_aux_rest_hash_locked(const NativeRange &range,std::uint32_t content_hash);
     bool author_history_=false;
     struct View {Resource resource;api::resource_view_desc desc;};
     bool view(std::uint64_t table,unsigned binding,View &out);
@@ -165,7 +184,12 @@ public:
     void enable_author_history(){author_history_=true;} // before this device's Runtime is published
     std::uint64_t history_revision()const noexcept{return history_revision_.load(std::memory_order_relaxed);}
     void set_packs(const std::vector<std::shared_ptr<const ModPack>> &packs){std::lock_guard lock(mutex_);packs_=packs;}
-    void set_catalog(const PackCatalog &catalog){std::lock_guard lock(mutex_);packs_=catalog.packs;intents_=catalog.intents;discovery_.set_intents(intents_);std::atomic_store(&discovery_interests_,std::make_shared<const std::vector<NativeMeshIntent>>(intents_));}
+    void set_catalog(const PackCatalog &catalog){
+        std::lock_guard lock(mutex_);packs_=catalog.packs;intents_=catalog.intents;
+        has_skip_intents_=std::any_of(intents_.begin(),intents_.end(),[](const NativeMeshIntent &i){return i.skip_only;});
+        if(!has_skip_intents_){aux_skin_writers_.clear();aux_probe_targets_.clear();aux_rest_hashes_.clear();}
+        discovery_.set_intents(intents_);std::atomic_store(&discovery_interests_,std::make_shared<const std::vector<NativeMeshIntent>>(intents_));
+    }
     // Ledger application consumes the live creation callback's VA snapshot;
     // it never queries the native object while holding collector/Runtime locks.
     void init_resource(api::resource,const api::resource_desc &,std::uint64_t creation,std::uint64_t gpu_address);
@@ -211,6 +235,7 @@ public:
     bool identify_draw_v2(const WWMI_RtPackDrawQuery_v2 &,WWMI_RtPackDrawIdentity_v2 &,void *palette,unsigned capacity,
                           NativeDrawIdentityCache::Match *match_out=nullptr,WWMI_RtDrawIdentityReceipt_v1 *receipt=nullptr,
                           bool author_snapshot=false);
+    std::uint32_t identify_aux_skip_draw(const WWMI_RtPackDrawQuery_v2 &,std::uint32_t &out_content_hash);
     struct BorrowedPalette {ComPtr<ID3D12Resource> resource;ResourceKey key;std::uint64_t offset=0,bytes=0,cbv_bytes=0,resource_bytes=0;};
     // A native upload's existing GPU read lease can cover this consumer only
     // within the same actual recording. Other recordings use an owned snapshot.

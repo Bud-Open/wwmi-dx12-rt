@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -444,6 +445,7 @@ struct CutoutMaskStats {
     uint64_t gray = 0;
     uint64_t white = 0;
     uint64_t black = 0;
+    uint64_t dark = 0;
     uint64_t mid = 0;
 };
 
@@ -454,6 +456,7 @@ inline void AccumulateCutoutTexel(CutoutMaskStats& st, uint8_t r, uint8_t g, uin
     const uint8_t mn = (std::min)({ r, g, b });
     const uint8_t mx = (std::max)({ r, g, b });
     if (static_cast<uint32_t>(mx - mn) <= 8u) ++st.gray;
+    if (mx <= 48) ++st.dark;
     if (mn >= 240)
         ++st.white;
     else if (mx <= 15)
@@ -477,6 +480,94 @@ inline bool IsBinaryCutoutMask(const CutoutMaskStats& st) noexcept
     return opaque_frac >= 0.98 && gray_frac >= 0.98 &&
         white_frac >= 0.50 && black_frac >= 0.001 && mid_frac <= 0.06;
 }
+
+// Low-mip (64x64 / 128x128) resident streaming-tail cutout mask detector.
+// Accounts for linear-space mip downsampling into sRGB (where 1-2% white bleed raises dark
+// cutout interior texels into 16..48 and widens anti-aliased edge bands proportionally).
+inline bool IsBinaryCutoutMaskLowMip(const CutoutMaskStats& st) noexcept
+{
+    if (st.total == 0) return false;
+    const double inv = 1.0 / static_cast<double>(st.total);
+    const double opaque_frac = static_cast<double>(st.opaque) * inv;
+    const double gray_frac = static_cast<double>(st.gray) * inv;
+    const double white_frac = static_cast<double>(st.white) * inv;
+    const double black_frac = static_cast<double>(st.black) * inv;
+    const double dark_frac = static_cast<double>(st.dark) * inv;
+    const double mid_frac = static_cast<double>(st.mid) * inv;
+    return opaque_frac >= 0.98 && gray_frac >= 0.98 &&
+        white_frac >= 0.50 && mid_frac <= 0.12 &&
+        (black_frac >= 0.001 || (white_frac >= 0.80 && dark_frac >= 0.001));
+}
+
+// Exact mip-chain equivalence table mapping streaming sub-mip hashes (e.g. 1024px sub1)
+// to their higher-resolution mip0 parent hash. Any sub-mip hash observed under >=2
+// unrelated root parents (e.g. blank/shared placeholder mips) is permanently marked
+// ambiguous and never aliased.
+class VisualMipParentTable {
+public:
+    static constexpr uint32_t kAmbiguous = 0xFFFFFFFFu;
+    static constexpr size_t   kMaxEntries = 32768;
+
+    uint32_t Resolve(uint32_t hash) const noexcept
+    {
+        if (!hash || hash == kAmbiguous || map_.empty()) return 0;
+        uint32_t cur = hash;
+        for (int hop = 0; hop < 4; ++hop) {
+            auto it = map_.find(cur);
+            if (it == map_.end()) break;
+            const uint32_t next = it->second;
+            if (!next || next == kAmbiguous || next == cur || next == hash)
+                return (cur != hash && next != kAmbiguous) ? cur : 0;
+            cur = next;
+        }
+        return cur != hash ? cur : 0;
+    }
+
+    bool Note(uint32_t child, uint32_t parent)
+    {
+        if (!child || !parent || child == parent || child == kAmbiguous || parent == kAmbiguous) return false;
+        const uint32_t p_root = RootOrSelf(parent);
+        if (p_root == child) return false;
+        auto it = map_.find(child);
+        if (it == map_.end()) {
+            if (map_.size() >= kMaxEntries) return false;
+            map_.emplace(child, parent);
+            return true;
+        }
+        if (it->second == parent || it->second == kAmbiguous) return false;
+        const uint32_t e_root = RootOrSelf(it->second);
+        if (e_root == p_root) {
+            if (it->second != p_root) {
+                it->second = p_root;
+                return true;
+            }
+            return false;
+        }
+        it->second = kAmbiguous;
+        return true;
+    }
+
+    template <class ParentPred>
+    std::vector<std::pair<uint32_t, uint32_t>> CollectForParents(ParentPred keep_parent) const
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> out;
+        for (const auto& kv : map_) {
+            if (kv.second == kAmbiguous) continue;
+            const uint32_t root = Resolve(kv.first);
+            if (root && keep_parent(root)) out.emplace_back(kv.first, root);
+        }
+        return out;
+    }
+
+private:
+    uint32_t RootOrSelf(uint32_t h) const noexcept
+    {
+        const uint32_t r = Resolve(h);
+        return r ? r : h;
+    }
+
+    std::unordered_map<uint32_t, uint32_t> map_;
+};
 
 // Pure opaque white neutralizer DDS detector (e.g. mod-supplied white mask clear texture).
 inline bool IsPureWhiteNeutralizer(const CutoutMaskStats& st) noexcept

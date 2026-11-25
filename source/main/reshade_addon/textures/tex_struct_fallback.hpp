@@ -55,7 +55,11 @@ bool TexLookComputeDdsSig(const wchar_t* dds_path, uint32_t* out_w, uint32_t* ou
     uint8_t* out_codec, uint8_t* out_nch, uint32_t* out_pw, uint32_t* out_ph, std::vector<uint8_t>* out_px,
     double out_rgb_mean[3], double out_rgb_std[3]);
 bool TexLookIsCutoutMask(uint32_t hash);
+void TexLookMarkCutoutMask(uint32_t hash);
 bool TexLookIsDdsPureWhite(const wchar_t* dds_path);
+uint32_t TexVisualParentOf(uint32_t hash);
+void TexNoteVisualMipParent(uint32_t child, uint32_t parent);
+std::vector<std::pair<uint32_t, uint32_t>> TexCopyVisualMipParentsFor(const std::unordered_set<uint32_t>& parents);
 
 namespace wwmi_struct_tex {
 
@@ -441,9 +445,11 @@ public:
             uint32_t w = 0;
             uint32_t h = 0;
             uint32_t hash = 0;
+            uint32_t canon_hash = 0;
             uint32_t lod = 0;
             uint32_t vis_key = 0;
             bool     vis_is_live = false;
+            bool     is_cutout = false;
             bool     resolved = false;
         };
         DrawSlot slots[8]{};
@@ -479,23 +485,34 @@ public:
             TexInfo ti{};
             if (!TexDimsOf(res_h, &ti)) continue;
             const uint32_t vfmt = static_cast<uint32_t>(PublishedViewFormat(key));
-            if (!vfmt || !IsMaterialTexDims(ti.width, ti.height)) continue;
+            const uint32_t mip_parent = hash ? TexVisualParentOf(hash) : 0;
+            const uint32_t canon_hash = mip_parent ? mip_parent : hash;
+            const bool     is_cutout = (hash && TexLookIsCutoutMask(hash)) ||
+                (mip_parent && TexLookIsCutoutMask(mip_parent));
+            if (!vfmt || (!IsMaterialTexDims(ti.width, ti.height) && !is_cutout)) continue;
 
-            const uint32_t lod = hash ? TexLodTargetOf(hash) : 0;
-            if (hash && !lod && !TexLookIsCutoutMask(hash)) {
-                if (NoteAndCheckSharedEngineTex(load, dm, comp, hash)) continue;
+            uint32_t lod = hash ? TexLodTargetOf(hash) : 0;
+            if (!lod && mip_parent) lod = TexLodTargetOf(mip_parent);
+            if (canon_hash && !lod && !is_cutout) {
+                if (NoteAndCheckSharedEngineTex(load, dm, comp, canon_hash)) continue;
             }
 
             uint32_t vis_key = 0;
             bool     vis_is_live = false;
-            if (lod && TexLookHasRef(lod)) {
-                vis_key = lod;
-            } else if (hash && TexLookHasAnySig(hash)) {
-                vis_key = hash;
-                vis_is_live = true;
+            if (!is_cutout) {
+                if (lod && TexLookHasRef(lod)) {
+                    vis_key = lod;
+                } else if (canon_hash && TexLookHasAnySig(canon_hash)) {
+                    vis_key = canon_hash;
+                    vis_is_live = true;
+                } else if (hash && TexLookHasAnySig(hash)) {
+                    vis_key = hash;
+                    vis_is_live = true;
+                }
             }
 
-            slots[nslots++] = DrawSlot{ r, b.param, b.offset, vfmt, ti.width, ti.height, hash, lod, vis_key, vis_is_live, false };
+            slots[nslots++] = DrawSlot{ r, b.param, b.offset, vfmt, ti.width, ti.height, hash, canon_hash, lod, vis_key,
+                vis_is_live, is_cutout, false };
         }
         if (!nslots) return;
 
@@ -545,28 +562,76 @@ public:
         bool added_cooccur = false;
         uint32_t draw_vis_keys[8]{};
         unsigned n_vis_keys = 0;
-        for (unsigned i = 0; i < nslots; ++i)
-            if (slots[i].vis_key) draw_vis_keys[n_vis_keys++] = slots[i].vis_key;
+        for (unsigned i = 0; i < nslots; ++i) {
+            if (slots[i].is_cutout || !slots[i].vis_key) continue;
+            const uint32_t ck = slots[i].lod ? slots[i].lod : (slots[i].canon_hash ? slots[i].canon_hash : slots[i].vis_key);
+            if (ck) draw_vis_keys[n_vis_keys++] = ck;
+        }
         if (n_vis_keys >= 2) {
             added_cooccur = RecordCooccurringKeys(load, dm, comp, draw_vis_keys, n_vis_keys);
         }
 
+        auto yield_cutout_to_unique_excl = [&](const DrawSlot& ds) -> bool {
+            unsigned vfmt_slots = 0;
+            for (unsigned j = 0; j < nslots; ++j)
+                if (slots[j].vfmt == ds.vfmt) ++vfmt_slots;
+            if (vfmt_slots != 1) return false;
+            auto it = idx->excl_by_comp_fmt.find(CompFmtKey(comp, ds.vfmt));
+            if (it == idx->excl_by_comp_fmt.end() || it->second.empty()) return false;
+            const ModTexCandidate* unique_cand = nullptr;
+            unsigned               live_cands = 0;
+            for (size_t ci : it->second) {
+                const ModTexCandidate& cand = idx->all_dds[ci];
+                if (cand.file_hash) {
+                    bool hit_exact = false;
+                    for (unsigned k = 0; k < nexact_local; ++k)
+                        if (exact_rules_local[k] == cand.file_hash) hit_exact = true;
+                    if (hit_exact || IsExactHitRule(load, dm, cand.file_hash)) continue;
+                }
+                unique_cand = &cand;
+                ++live_cands;
+            }
+            if (live_cands != 1 || !unique_cand || fq_already_used(unique_cand->fq)) return false;
+            return !IsFqOwnedByOtherHash(load, idx->fingerprint, comp, unique_cand->fq, ds.hash, ds.canon_hash);
+        };
+
         // Pass 1: Zero-touch visual & cached bindings (canonical TexLook seed, live 5-patch, or persisted hash).
         bool                      any_unresolved_vis = false;
         bool                      any_same_draw_dup = false;
+        bool                      any_same_draw_same_vfmt = false;
+        uint32_t                  resolved_non_cutout_vfmts[8]{};
+        unsigned                  n_resolved_vfmts = 0;
         std::vector<std::wstring> resolved_fqs;
         resolved_fqs.reserve(nslots);
         for (unsigned i = 0; i < nslots; ++i) {
             DrawSlot&      ds = slots[i];
-            const uint32_t lookup_key = ds.vis_key ? ds.vis_key : ds.hash;
-            if (!lookup_key) continue;
+            const uint32_t primary_key = ds.lod ? ds.lod : (ds.canon_hash ? ds.canon_hash : ds.vis_key);
+            if (!primary_key) continue;
+            VisualResolvedEntry vr;
+            uint32_t            matched_key = 0;
+            if (LookupVisualResolved(load, idx->fingerprint, dm, comp, primary_key, &vr)) {
+                matched_key = primary_key;
+            } else if (ds.vis_key && ds.vis_key != primary_key &&
+                LookupVisualResolved(load, idx->fingerprint, dm, comp, ds.vis_key, &vr)) {
+                matched_key = ds.vis_key;
+            }
+            if (matched_key) {
+                const bool is_cutout_bind = ds.is_cutout || (vr.tier == "cutout_neutralizer") ||
+                    (ds.hash && TexLookIsCutoutMask(ds.hash)) || !IsComponentDds(*idx, vr.fq);
+                if (is_cutout_bind && yield_cutout_to_unique_excl(ds)) {
+                    EraseVisualResolved(load, idx->fingerprint, comp, matched_key);
+                    if (!IsMaterialTexDims(ds.w, ds.h)) ds.resolved = true;
+                    continue;
+                }
+            }
             bool obs_changed = false;
-            if (ds.vis_key) {
+            if (ds.vis_key && (!matched_key || matched_key == ds.vis_key)) {
                 const uint32_t dim = (std::max)(ds.w, ds.h);
                 obs_changed = RecordObservedLod(load, dm, comp, ds.vis_key, ds.vfmt, dim);
             }
-            VisualResolvedEntry vr;
-            if (LookupVisualResolved(load, idx->fingerprint, dm, comp, lookup_key, &vr)) {
+            if (matched_key) {
+                if (ds.hash && ds.canon_hash && ds.hash != ds.canon_hash)
+                    NoteMipAliasForDiskCache(ds.hash, ds.canon_hash);
                 // Track every resolved FQ (even while deferred DDS upload is still in flight) so
                 // same-draw duplicates are never missed on the draw that first records co-occurrence.
                 for (const auto& rfq : resolved_fqs) {
@@ -576,8 +641,21 @@ public:
                     }
                 }
                 resolved_fqs.push_back(vr.fq);
-                const bool is_cutout_bind = (vr.tier == "cutout_neutralizer") ||
+                const bool is_cutout_bind = ds.is_cutout || (vr.tier == "cutout_neutralizer") ||
                     (ds.hash && TexLookIsCutoutMask(ds.hash)) || !IsComponentDds(*idx, vr.fq);
+                if (is_cutout_bind) {
+                    if (ds.hash) TexLookMarkCutoutMask(ds.hash);
+                    if (ds.canon_hash && ds.canon_hash != ds.hash) TexLookMarkCutoutMask(ds.canon_hash);
+                }
+                if (!is_cutout_bind && ds.vfmt) {
+                    for (unsigned vi = 0; vi < n_resolved_vfmts; ++vi) {
+                        if (resolved_non_cutout_vfmts[vi] == ds.vfmt) {
+                            any_same_draw_same_vfmt = true;
+                            break;
+                        }
+                    }
+                    if (n_resolved_vfmts < 8) resolved_non_cutout_vfmts[n_resolved_vfmts++] = ds.vfmt;
+                }
                 const char* act = is_cutout_bind
                     ? "bind_cutout_clear"
                     : (ds.vis_key ? (ds.vis_is_live ? "bind_visual_live" : "bind_visual_auto") : "bind_visual_cached");
@@ -597,16 +675,24 @@ public:
                 if (obs_changed) need_enqueue = true;
             }
         }
-        if (added_cooccur && (any_unresolved_vis || any_same_draw_dup)) need_enqueue = true;
+        if (added_cooccur && (any_unresolved_vis || any_same_draw_dup || any_same_draw_same_vfmt)) need_enqueue = true;
         if (need_enqueue) EnqueueCompAdapt(load, dm, comp, idx);
 
         // Pass 1b: Binary cutout-mask neutralization (universal: detects white-with-black-cutout
-        // visibility/alpha masks at upload time and neutralizes them with the mod's own verified
-        // pure-white [TextureOverride] DDS when its HD hash shifted on DX12/UHD).
+        // visibility/alpha masks at upload time — including 64x64/128x128 resident mip tails —
+        // and neutralizes them with the mod's own verified pure-white [TextureOverride] DDS
+        // when its HD hash shifted on DX12/UHD).
         for (unsigned i = 0; i < nslots; ++i) {
             DrawSlot& ds = slots[i];
-            if (ds.resolved || !ds.hash || ds.w < 1024 || ds.h < 1024 || !IsBcRgbaFormat(ds.vfmt)) continue;
-            if (!TexLookIsCutoutMask(ds.hash)) continue;
+            if (ds.resolved || !ds.hash || ds.w < 64 || ds.h < 64 || !IsBcRgbaFormat(ds.vfmt)) continue;
+            if (!ds.is_cutout && !TexLookIsCutoutMask(ds.hash)) continue;
+            // If this is the sole slot of its format and the component owns a unique unclaimed
+            // exclusive DDS of that exact format (e.g. a grayscale/binary eye/eyelash mask),
+            // yield to Pass 2 `bind_unique` instead of blanking it with the pure-white neutralizer.
+            if (yield_cutout_to_unique_excl(ds)) {
+                if (!IsMaterialTexDims(ds.w, ds.h)) ds.resolved = true;
+                continue;
+            }
             // Never let Pass 1.5 or Pass 2 bind a diffuse/normal texture onto a binary cutout mask.
             ds.resolved = true;
             if (idx->extra_override_dds.empty()) continue;
@@ -644,7 +730,13 @@ public:
 
             const VisualResolvedEntry vr{ ns.fq, ns.name, 1.f, "cutout_neutralizer" };
             if (bind_resource(ds, vr.fq, vr.name, "bind_cutout_clear")) {
-                RecordCutoutNeutralized(load, idx->fingerprint, dm, comp, ds.hash, guid, vr);
+                const uint32_t rec_hash = ds.canon_hash ? ds.canon_hash : ds.hash;
+                if (ds.hash) TexLookMarkCutoutMask(ds.hash);
+                if (rec_hash && rec_hash != ds.hash) {
+                    TexLookMarkCutoutMask(rec_hash);
+                    NoteMipAliasForDiskCache(ds.hash, rec_hash);
+                }
+                RecordCutoutNeutralized(load, idx->fingerprint, dm, comp, rec_hash, guid, vr);
             }
         }
 
@@ -820,6 +912,7 @@ private:
     std::unordered_map<DiskKey, std::string, DiskKeyHash>    disk_cache_; // persisted across runs: key -> fq (utf8)
     std::unordered_map<DiskSlotKey, std::string, DiskSlotKeyHash> disk_slot_cache_; // persisted unambiguous (fp,comp,shader_key,reg,vfmt) -> fq
     std::unordered_set<DiskSlotKey, DiskSlotKeyHash>         ambiguous_disk_slots_; // slots observed with >1 distinct fq
+    std::unordered_set<uint64_t>                             persisted_mip_aliases_; // (child<<32)|parent persisted in disk cache
     bool                                                     disk_loaded_ = false;
     bool                                                     disk_dirty_ = false;
     std::set<std::tuple<unsigned, int, int, unsigned, uint32_t, std::string>> logged_;
@@ -849,6 +942,21 @@ private:
         return g_data_dir + L"\\cache\\mod_tex_adapt.cache";
     }
 
+    void NoteMipAliasForDiskCache(uint32_t child, uint32_t parent)
+    {
+        if (!child || !parent || child == parent) return;
+        const uint64_t key = (static_cast<uint64_t>(child) << 32) | parent;
+        bool           need_flush = false;
+        {
+            std::lock_guard l(mtx_);
+            if (persisted_mip_aliases_.insert(key).second) {
+                disk_dirty_ = true;
+                need_flush = true;
+            }
+        }
+        if (need_flush) RequestDiskFlush();
+    }
+
     void EnsureDiskCacheLoadedLocked()
     {
         if (disk_loaded_) return;
@@ -861,6 +969,7 @@ private:
         std::string line;
         size_t      loaded = 0;
         size_t      loaded_slots = 0;
+        size_t      loaded_mips = 0;
         bool        header_checked = false;
         bool        version_ok = false;
         while (fgets(buf, sizeof(buf), f)) {
@@ -869,14 +978,30 @@ private:
             while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
             if (!header_checked) {
                 header_checked = true;
-                version_ok = (line.find("(v5)") != std::string::npos);
+                version_ok = (line.find("(v6)") != std::string::npos);
                 if (!version_ok) {
-                    logger::probe("TEX-AUTO-ADAPT discarding legacy mod_tex_adapt.cache (upgrading to v5)");
+                    logger::probe("TEX-AUTO-ADAPT discarding legacy mod_tex_adapt.cache (upgrading to v6)");
                     disk_dirty_ = true;
                     break;
                 }
             }
             if (line.empty() || line[0] == ';') {
+                line.clear();
+                continue;
+            }
+            if (line.size() > 2 && line[0] == 'M' && line[1] == '\t') {
+                // Format: M\t<child_hex>\t<parent_hex>
+                size_t t1 = 1;
+                size_t t2 = line.find('\t', t1 + 1);
+                if (t2 != std::string::npos) {
+                    const uint32_t child = static_cast<uint32_t>(strtoul(line.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 16));
+                    const uint32_t parent = static_cast<uint32_t>(strtoul(line.substr(t2 + 1).c_str(), nullptr, 16));
+                    if (child && parent && child != parent) {
+                        TexNoteVisualMipParent(child, parent);
+                        persisted_mip_aliases_.insert((static_cast<uint64_t>(child) << 32) | parent);
+                        ++loaded_mips;
+                    }
+                }
                 line.clear();
                 continue;
             }
@@ -921,32 +1046,51 @@ private:
             line.clear();
         }
         fclose(f);
-        if (loaded || loaded_slots)
-            logger::probe("TEX-AUTO-ADAPT loaded %zu visual + %zu proven-slot persisted binding(s) from mod_tex_adapt.cache",
-                loaded, loaded_slots);
+        if (loaded || loaded_slots || loaded_mips)
+            logger::probe("TEX-AUTO-ADAPT loaded %zu visual + %zu proven-slot + %zu mip-alias persisted binding(s) from mod_tex_adapt.cache",
+                loaded, loaded_slots, loaded_mips);
     }
 
     void FlushDiskCache()
     {
         std::vector<std::tuple<uint64_t, int, uint32_t, std::string>> rows;
         std::vector<std::tuple<uint64_t, int, uint64_t, unsigned, uint32_t, std::string>> slot_rows;
+        std::unordered_set<uint32_t> parent_hashes;
+        std::vector<std::pair<uint32_t, uint32_t>> mip_rows;
         {
             std::lock_guard l(mtx_);
             if (!disk_dirty_) return;
             rows.reserve(disk_cache_.size());
-            for (const auto& kv : disk_cache_)
+            for (const auto& kv : disk_cache_) {
                 rows.emplace_back(kv.first.fp, kv.first.comp, kv.first.lod, kv.second);
+                parent_hashes.insert(kv.first.lod);
+            }
             slot_rows.reserve(disk_slot_cache_.size());
             for (const auto& kv : disk_slot_cache_)
                 slot_rows.emplace_back(kv.first.fp, kv.first.comp, kv.first.ps_hash, kv.first.reg, kv.first.vfmt, kv.second);
+            for (uint64_t packed : persisted_mip_aliases_) {
+                const uint32_t child = static_cast<uint32_t>(packed >> 32);
+                const uint32_t parent = static_cast<uint32_t>(packed & 0xffffffffu);
+                if (child && parent && parent_hashes.count(parent))
+                    mip_rows.emplace_back(child, parent);
+            }
             disk_dirty_ = false;
         }
+        const auto live_mips = TexCopyVisualMipParentsFor(parent_hashes);
+        if (!live_mips.empty()) {
+            mip_rows.insert(mip_rows.end(), live_mips.begin(), live_mips.end());
+            std::lock_guard l(mtx_);
+            for (const auto& mp : live_mips)
+                persisted_mip_aliases_.insert((static_cast<uint64_t>(mp.first) << 32) | mp.second);
+        }
+        std::sort(mip_rows.begin(), mip_rows.end());
+        mip_rows.erase(std::unique(mip_rows.begin(), mip_rows.end()), mip_rows.end());
         const std::wstring p = DiskCachePath();
         if (p.empty()) return;
         const std::wstring tmp = p + L".tmp";
         FILE*              f = _wfsopen(tmp.c_str(), L"w", _SH_DENYNO);
         if (!f) return;
-        fputs("; wwmi-dx12-rt Layer 3 auto-adapted visual texture bindings (v5)\n", f);
+        fputs("; wwmi-dx12-rt Layer 3 auto-adapted visual texture bindings (v6)\n", f);
         std::sort(rows.begin(), rows.end());
         std::sort(slot_rows.begin(), slot_rows.end());
         bool ok = true;
@@ -969,6 +1113,14 @@ private:
                         std::get<3>(s),
                         std::get<4>(s),
                         std::get<5>(s).c_str()) < 0) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if (ok) {
+            for (const auto& m : mip_rows) {
+                if (fprintf(f, "M\t%08x\t%08x\n", m.first, m.second) < 0) {
                     ok = false;
                     break;
                 }
@@ -1098,6 +1250,43 @@ private:
             }
         }
         return false;
+    }
+
+    bool IsFqOwnedByOtherHash(unsigned load, uint64_t fp, int comp, const std::wstring& fq,
+        uint32_t self_hash, uint32_t self_canon)
+    {
+        if (!fp || fq.empty()) return false;
+        const std::string fq_u8 = WideToUtf8(fq);
+        std::lock_guard   l(mtx_);
+        ResetIfNeededLocked(load);
+        for (const auto& kv : visual_resolved_) {
+            if (kv.first.fp != fp || kv.first.comp != comp) continue;
+            if (kv.first.lod == self_hash || kv.first.lod == self_canon) continue;
+            if (_wcsicmp(kv.second.fq.c_str(), fq.c_str()) == 0) return true;
+        }
+        for (const auto& kv : disk_cache_) {
+            if (kv.first.fp != fp || kv.first.comp != comp) continue;
+            if (kv.first.lod == self_hash || kv.first.lod == self_canon) continue;
+            if (_stricmp(kv.second.c_str(), fq_u8.c_str()) == 0) return true;
+        }
+        return false;
+    }
+
+    void EraseVisualResolved(unsigned load, uint64_t fp, int comp, uint32_t lod)
+    {
+        if (!fp || !lod) return;
+        bool need_flush = false;
+        {
+            std::lock_guard l(mtx_);
+            ResetIfNeededLocked(load);
+            const DiskKey dk{ fp, comp, lod };
+            visual_resolved_.erase(dk);
+            if (disk_cache_.erase(dk)) {
+                disk_dirty_ = true;
+                need_flush = true;
+            }
+        }
+        if (need_flush) RequestDiskFlush();
     }
 
     bool LookupVisualResolved(unsigned load, uint64_t fp, int dm, int comp, uint32_t lod, VisualResolvedEntry* out)
@@ -1570,11 +1759,37 @@ private:
             for (const auto& e : obs) {
                 auto dit = disk_cache_.find(DiskKey{ job.idx->fingerprint, job.comp, e.lod });
                 if (dit != disk_cache_.end()) persisted_fqs.emplace(e.lod, Utf8ToWide(dit->second));
+                const uint32_t parent = TexVisualParentOf(e.lod);
+                if (parent && parent != e.lod) {
+                    const DiskKey pdk{ job.idx->fingerprint, job.comp, parent };
+                    auto          pvit = visual_resolved_.find(pdk);
+                    if (pvit != visual_resolved_.end()) {
+                        persisted_fqs.emplace(parent, pvit->second.fq);
+                    } else {
+                        auto pdit = disk_cache_.find(pdk);
+                        if (pdit != disk_cache_.end()) persisted_fqs.emplace(parent, Utf8ToWide(pdit->second));
+                    }
+                }
             }
         }
         if (!shared_hashes.empty()) {
             obs.erase(std::remove_if(obs.begin(), obs.end(),
                           [&](const ObsLod& e) { return shared_hashes.count(e.lod) != 0; }),
+                obs.end());
+            if (obs.empty()) return;
+        }
+        // Collapse streaming sub-mip observations whose proven mip0 parent is already present
+        // in obs or already resolved, so a lower mip never competes against its own parent
+        // and scrambles twin assignments.
+        {
+            std::unordered_set<uint32_t> obs_keys;
+            obs_keys.reserve(obs.size());
+            for (const auto& e : obs) obs_keys.insert(e.lod);
+            obs.erase(std::remove_if(obs.begin(), obs.end(), [&](const ObsLod& e) {
+                const uint32_t parent = TexVisualParentOf(e.lod);
+                if (!parent || parent == e.lod) return false;
+                return obs_keys.count(parent) != 0 || persisted_fqs.count(parent) != 0;
+            }),
                 obs.end());
             if (obs.empty()) return;
         }

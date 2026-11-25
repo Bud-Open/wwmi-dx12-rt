@@ -215,6 +215,7 @@ public:
     void submission_started(Recording rec){for(auto &p:bytes_)if(p->recording==rec&&p->submissions)p->valid=false;}
     void unknown(){for(auto &p:bytes_)p->valid=false;writers_.clear();rest_candidates_.clear();builds_.clear();}
     ResourceKey resource_of(std::uint64_t id)const{for(const auto &p:bytes_)if(p->id==id&&p->valid)return p->range.resource;return {};}
+    std::optional<NativeRange> range_of(std::uint64_t id)const{for(const auto &p:bytes_)if(p->id==id&&p->valid)return p->range;return std::nullopt;}
     bool provide_cpu(std::uint64_t,std::vector<unsigned char>);
     void cancel(std::uint64_t id){for(auto &p:bytes_)if(p->id==id)p->valid=false;}
     void submitted(Recording,std::uint64_t,std::uint64_t);
@@ -517,10 +518,24 @@ inline bool NativeDiscovery::resolve(Build &b,const NativeMeshIntent &intent,Nat
     }
     std::sort(out.components.begin(),out.components.end(),[](const auto &a,const auto &v){return a.first<v.first;});
     unsigned next=0;
-    for(std::size_t i=0;i<out.components.size();++i){const auto &c=out.components[i];if(c.first!=next)return reject(Failure::component_cover);next+=c.count;
+    bool exact_cover=true;
+    for(std::size_t i=0;i<out.components.size();++i){const auto &c=out.components[i];
+        if(intent.skip_only){
+            if(c.first<next||c.first>n||c.count>n-c.first)return reject(Failure::component_cover);
+            if(c.first!=next)exact_cover=false;
+            next=c.first+c.count;
+        }else{
+            if(c.first!=next)return reject(Failure::component_cover);
+            next+=c.count;
+        }
         for(std::size_t j=0;j<i;++j)if(out.components[j].component==c.component)return reject(Failure::component_cover);
     }
-    if(next!=n)return reject(Failure::component_cover);return true;
+    if(next!=n){
+        if(!intent.skip_only)return reject(Failure::component_cover);
+        exact_cover=false;
+    }
+    out.partial=!exact_cover;
+    return true;
 }
 inline void NativeDiscovery::publish(){
     for(auto &b:builds_)if(!b->published&&!b->discarded&&b->forwarded&&b->submissions==1){

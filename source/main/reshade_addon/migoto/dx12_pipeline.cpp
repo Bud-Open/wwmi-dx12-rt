@@ -19,6 +19,8 @@
 #include "../instrumentation/tex_timing.h"
 #include "dx12_wrap.h"
 #include "dx12_context.h"
+#include "mod_ui_shield.h"
+#include "port_api.h"
 #include "port_toggles.h" // g_blend_write_all_rt, g_inherit_game_viewport, g_uav_barrier
 #include "port_keygate.h"
 #include "../../src/gpu_progress.h"
@@ -2244,7 +2246,25 @@ bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
         b.cl->DrawInstanced(count, instances ? instances : 1, start, start_instance);
     HotPath::GpuBracketEnd(b.cl, hp);
     g_gpu_timer.End(b.cl, gt);
-    if (b.own_list) g_own_list_draws.fetch_add(1, std::memory_order_relaxed);
+    if (b.own_list) {
+        g_own_list_draws.fetch_add(1, std::memory_order_relaxed);
+        const bool vs_iniparams = std::any_of(want.begin(), want.end(),
+            [](const RootBind& rb) { return rb.stage == 'v' && rb.kind == 't' && rb.reg == 120; });
+        if (!indexed && b.back_buffer && probe_rt0 == b.back_buffer && probe_vp_mode == 1 && vs_iniparams &&
+            ((st.topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && count == 4) ||
+             (st.topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST && count == 6))) {
+            const D3D12_RESOURCE_DESC bb_desc = b.back_buffer->GetDesc();
+            const uint32_t            bb_w = static_cast<uint32_t>(bb_desc.Width);
+            const uint32_t            bb_h = bb_desc.Height;
+            float                     p87[4] = {};
+            if (bb_w > 0 && bb_h > 0 && PortApi::GetIniParam(87, p87))
+                ModUiNoteBackbufferQuad(p87[0], p87[1], p87[2], p87[3],
+                    probe_vp.TopLeftX, probe_vp.TopLeftY, probe_vp.Width, probe_vp.Height,
+                    static_cast<float>(probe_sc.left), static_cast<float>(probe_sc.top),
+                    static_cast<float>(probe_sc.right), static_cast<float>(probe_sc.bottom),
+                    bb_w, bb_h);
+        }
+    }
 
     if (b.restore_game_state) b.restore_game_state(b.restore_user);
     return true;

@@ -475,7 +475,7 @@ public:
     }
     void CheckCutoutMask(uint32_t hash, uint32_t w, uint32_t h, uint32_t fmt, const uint8_t* bc, size_t bc_bytes)
     {
-        if (!g_tex_struct_fallback || !hash || !bc || w != h || w < 1024 || !pow2(w)) return;
+        if (!g_tex_struct_fallback || !hash || !bc || w != h || w < 64 || !pow2(w)) return;
         const Codec c = codec_of(fmt);
         if (c.id != 1 && c.id != 3 && c.id != 7) return;
         const uint32_t bb = DxgiBcBlockBytes(fmt);
@@ -489,6 +489,7 @@ public:
         }
 
         // Stage 1: ultra-fast 4x4 block pre-filter (exits in ~1 us on non-binary textures).
+        const uint8_t                    dark_max = (w <= 128) ? 48u : 15u;
         wwmi_struct_tex::CutoutMaskStats s1{};
         uint64_t                         bad1 = 0;
         bool                             pass1 = true;
@@ -507,7 +508,7 @@ public:
                     wwmi_struct_tex::AccumulateCutoutTexel(s1, r, g, b, a);
                     const uint8_t mn = (std::min)({ r, g, b });
                     const uint8_t mx = (std::max)({ r, g, b });
-                    if (a < 245 || static_cast<uint32_t>(mx - mn) > 8u || (mn < 240 && mx > 15)) ++bad1;
+                    if (a < 245 || static_cast<uint32_t>(mx - mn) > 8u || (mn < 240 && mx > dark_max)) ++bad1;
                 }
                 if (bad1 > 64) {
                     pass1 = false;
@@ -519,13 +520,14 @@ public:
         bool                             is_cutout = false;
         wwmi_struct_tex::CutoutMaskStats s2{};
         if (pass1 && s1.white >= 64) {
-            // Stage 2: uniform 64x64 strided BC block scan (4,096 blocks = 65,536 texels)
-            // so even small 0.2%-1% UV cutouts (masks, sleeves, decals) are reliably captured.
-            constexpr uint32_t kGrid = 64;
-            for (uint32_t gy = 0; gy < kGrid; ++gy) {
-                const uint32_t by = ((gy * 2 + 1) * nby) / (kGrid * 2);
-                for (uint32_t gx = 0; gx < kGrid; ++gx) {
-                    const uint32_t bx = ((gx * 2 + 1) * nbx) / (kGrid * 2);
+            // Stage 2: uniform BC block scan (full coverage for <=256px, 64x64 strided grid =
+            // 4,096 blocks = 65,536 texels for >=512px) so even small 0.2%-1% UV cutouts
+            // (masks, sleeves, decals) are reliably captured at any streaming mip level.
+            const uint32_t grid = (std::min)(64u, nbx);
+            for (uint32_t gy = 0; gy < grid; ++gy) {
+                const uint32_t by = (grid == nby) ? gy : (((gy * 2 + 1) * nby) / (grid * 2));
+                for (uint32_t gx = 0; gx < grid; ++gx) {
+                    const uint32_t bx = (grid == nbx) ? gx : (((gx * 2 + 1) * nbx) / (grid * 2));
                     const uint8_t* blk = bc + static_cast<size_t>(by) * row_bytes + static_cast<size_t>(bx) * bb;
                     uint8_t        rgba[64];
                     decode_block(c.id, blk, rgba);
@@ -533,7 +535,8 @@ public:
                         wwmi_struct_tex::AccumulateCutoutTexel(s2, rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2], rgba[i * 4 + 3]);
                 }
             }
-            is_cutout = wwmi_struct_tex::IsBinaryCutoutMask(s2);
+            is_cutout = (w <= 128) ? wwmi_struct_tex::IsBinaryCutoutMaskLowMip(s2)
+                                   : wwmi_struct_tex::IsBinaryCutoutMask(s2);
         }
 
         bool inserted = false;
@@ -557,6 +560,15 @@ public:
         std::shared_lock l(mtx_);
         auto             it = cutout_masks_.find(hash);
         return it != cutout_masks_.end() && it->second;
+    }
+    void MarkCutoutMask(uint32_t hash)
+    {
+        if (!hash) return;
+        {
+            std::unique_lock l(mtx_);
+            cutout_masks_[hash] = true;
+        }
+        has_cutout_mask_.store(true, std::memory_order_release);
     }
 
 private:
@@ -1275,6 +1287,11 @@ void TexLookCheckCutoutMask(uint32_t hash, uint32_t w, uint32_t h, uint32_t fmt,
 bool TexLookIsCutoutMask(uint32_t hash)
 {
     return g_look.IsCutoutMask(hash);
+}
+
+void TexLookMarkCutoutMask(uint32_t hash)
+{
+    g_look.MarkCutoutMask(hash);
 }
 
 // Fast strided-grid check (<=16 KB I/O even on an 8K DDS) verifying whether a DDS texture is

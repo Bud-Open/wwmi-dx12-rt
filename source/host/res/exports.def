@@ -493,6 +493,7 @@ EXPORTS
 	GetKeyState = HookGetKeyState PRIVATE
 	GetKeyboardState = HookGetKeyboardState PRIVATE
 	GetRawInputBuffer = HookGetRawInputBuffer PRIVATE
+	GetRawInputData = HookGetRawInputData PRIVATE
 	SetWindowsHookExA = HookSetWindowsHookExA PRIVATE
 	SetWindowsHookExW = HookSetWindowsHookExW PRIVATE
 	UnhookWindowsHookEx = HookUnhookWindowsHookEx PRIVATE
@@ -519,3 +520,5 @@ EXPORTS
 	WWMI_DescriptorPublish_Control_v1 @608
 	WWMI_RtCurrentNativeStateObject_v1 @609
 	WWMI_DescriptorCopyInvokeTimed_v1 @607
+	WWMI_ModUiSetShieldRects_v1 @610
+	WWMI_ModUiSetInputBypass_v1 @611

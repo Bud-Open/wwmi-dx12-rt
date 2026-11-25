@@ -2747,6 +2747,17 @@ extern "C" __declspec(dllexport) std::uint32_t WWMI_RtPackIdentifyDrawReceipt_v1
     *receipt={};receipt->struct_size=sizeof(*receipt);receipt->abi_version=1;
     return identify_draw(query,query_size,out,out_size,nullptr,0,receipt,__func__);
 }
+extern "C" __declspec(dllexport) std::uint32_t WWMI_RtPackIdentifyAuxSkipDraw_v1(const WWMI_RtPackDrawQuery_v2 *query,std::uint32_t query_size,
+    std::uint32_t *out_content_hash){
+    if(out_content_hash)*out_content_hash=0;
+    if(!query||query_size!=sizeof(*query)||query->struct_size!=sizeof(*query)||query->abi_version!=2||!out_content_hash)return 0;
+    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[d,r]:devices)if(d->get_native()==query->device){found=r;break;}}
+    if(!found)return 0;
+    RuntimeCall call(*found,__func__);
+    if(!found->active||!found->frame_device)return 0;
+    found->collect();
+    return found->inputs.identify_aux_skip_draw(*query,*out_content_hash);
+}
 extern "C" __declspec(dllexport) std::uint32_t WWMI_RtPackAcquireGraphicsGeometry_v1(const WWMI_RtGraphicsGeometryRequest_v1 *request,std::uint32_t request_size,
     WWMI_RtGraphicsGeometry_v1 *out,std::uint32_t out_size){
     if(!out||out_size!=sizeof(*out))return WWMI_RT_GEOMETRY_BAD_INPUT;*out={};

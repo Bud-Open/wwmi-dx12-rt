@@ -316,6 +316,7 @@ void ForEachTextureOverride(void (*cb)(uint32_t hash, const wchar_t* fq_section,
     void* user);
 
 void ForEachSkipTextureOverride(void (*cb)(uint32_t hash, const wchar_t* fq_section, void* user), void* user);
+bool IsSkipOnlyTextureOverride(const wchar_t* fq_section);
 
 float GetVar(const wchar_t* fq_name, float def);
 float GetVarNs(const wchar_t* ns, const wchar_t* name, float def);

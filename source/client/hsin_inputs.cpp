@@ -249,6 +249,9 @@ void InputCollector::destroyed(ResourceKey key){
         if(ib.allocation==key||ib.content==key)return true;
         return std::any_of(ib.components.begin(),ib.components.end(),[&](const ProvedComponentIb &c){return c.indices==key;});
     });
+    std::erase_if(aux_skin_writers_,[&](const AuxSkinWriter &w){return w.output==key||w.rest==key;});
+    std::erase_if(aux_probe_targets_,[&](const AuxRestProbeTarget &t){return t.rest==key;});
+    std::erase_if(aux_rest_hashes_,[&](const AuxRestHash &h){return h.rest==key;});
     changed|=invalidate_pose_owners([&](PoseInputs &poses){poses.destroyed(key);});
     if(changed)history_changed();
 }
@@ -265,6 +268,7 @@ ResourceKey InputCollector::key_of(api::resource r){
 }
 void InputCollector::init_list(api::command_list *c){
     std::lock_guard lock(mutex_);auto &list=lists_[id(c)];shape_evidence_.reset(list.epoch);if(native_receipts_)discovery_.reset(list.epoch);if(identity_cache_)identity_cache_->reset(list.epoch);
+    std::erase_if(aux_skin_writers_,[&](const AuxSkinWriter &w){return w.recording==list.epoch&&w.submissions==0;});
     retain_submitted_poses(list);
     list.epoch={id(c),++serial_,1};list.poses.reset(list.epoch);if(stamp_)stamp_(list.epoch.list,list.epoch.creation,list.epoch.generation);
 }
@@ -295,6 +299,7 @@ void InputCollector::reset_list(api::command_list *c){
     std::lock_guard lock(mutex_);auto p=lists_.find(id(c));if(p==lists_.end())return;
     shape_evidence_.reset(p->second.epoch);
     if(native_receipts_)discovery_.reset(p->second.epoch);
+    std::erase_if(aux_skin_writers_,[&](const AuxSkinWriter &w){return w.recording==p->second.epoch&&w.submissions==0;});
     if(std::erase_if(content_,[&](const Content &v){return v.producer==p->second.epoch&&!v.submitted;}))history_changed();
     if(identity_cache_)identity_cache_->reset(p->second.epoch);
     retain_submitted_poses(p->second);
@@ -404,6 +409,16 @@ void InputCollector::written(ResourceKey r,std::uint64_t offset,std::uint64_t by
             return c.indices==r&&identity::overlaps(c.index_offset,std::uint64_t(c.index_stride)*c.index_count,offset,bytes);
         });
     });
+    std::erase_if(aux_skin_writers_,[&](const AuxSkinWriter &w){
+        return (w.output==r&&identity::overlaps(w.output_offset,w.output_bytes,offset,bytes))||
+               (w.rest==r&&identity::overlaps(w.rest_offset,w.rest_bytes,offset,bytes));
+    });
+    std::erase_if(aux_probe_targets_,[&](const AuxRestProbeTarget &t){
+        return t.rest==r&&identity::overlaps(t.rest_offset,t.rest_bytes,offset,bytes);
+    });
+    std::erase_if(aux_rest_hashes_,[&](const AuxRestHash &h){
+        return h.rest==r&&identity::overlaps(h.rest_offset,h.rest_bytes,offset,bytes);
+    });
     changed|=invalidate_pose_owners([&](PoseInputs &poses){poses.written(r,offset,bytes);});
     if(changed)history_changed();
 }
@@ -498,6 +513,22 @@ void InputCollector::submitted(Recording recording,std::uint64_t native_queue){
             for(auto &f:submitted_skin_fences_)if(f.recording==recording)f.invalidated=true;
         }
     }
+    if(has_skip_intents_&&!aux_skin_writers_.empty()){
+        std::vector<AuxSkinWriter> newly_submitted;
+        std::erase_if(aux_skin_writers_,[&](AuxSkinWriter &w){
+            if(w.recording!=recording)return false;
+            if(!w.forwarded)return true;
+            if(++w.submissions>1)return true;
+            newly_submitted.push_back(w);
+            return false;
+        });
+        for(const auto &nw:newly_submitted){
+            std::erase_if(aux_skin_writers_,[&](const AuxSkinWriter &old){
+                return old.submissions==1&&old.order<nw.order&&old.output==nw.output&&
+                       identity::overlaps(old.output_offset,old.output_bytes,nw.output_offset,nw.output_bytes);
+            });
+        }
+    }
     std::erase_if(content_,[&](Content &proof){
         if(proof.producer!=recording)return false;
         changed=true;
@@ -570,6 +601,50 @@ InputCollector::DispatchWrite InputCollector::dispatch(api::command_list *c,bool
     fact.rest={rest.resource.key,offset,4ull*rest.desc.buffer.size,rest.resource.base};fact.first=first;fact.count=count;fact.extra=extra;
     std::uint64_t discovery_writer_id=0;
     if(native_receipts_&&discovery_.interested())discovery_writer_id=discovery_.skin(fact);
+    if(has_skip_intents_&&fact.rest.bytes>=12){
+        std::erase_if(aux_skin_writers_,[&](const AuxSkinWriter &w){
+            return w.recording==list->second.epoch&&w.submissions==0&&
+                   w.output==output.resource.key&&identity::overlaps(w.output_offset,w.output_bytes,span.offset,span.bytes);
+        });
+        if(aux_skin_writers_.size()>=512)aux_skin_writers_.erase(aux_skin_writers_.begin());
+        const std::uint64_t aux_order=++order_;
+        aux_skin_writers_.push_back({output.resource.key,output.resource.base,span.offset,span.bytes,
+            rest.resource.key,offset,fact.rest.bytes,first,count,list->second.epoch,aux_order,false,0});
+        if(native_receipts_){
+            auto pt=std::find_if(aux_probe_targets_.begin(),aux_probe_targets_.end(),[&](const AuxRestProbeTarget &t){
+                return t.rest==rest.resource.key&&t.rest_offset==offset;
+            });
+            if(pt!=aux_probe_targets_.end()){
+                const std::uint64_t end_bytes=12ull*(std::uint64_t(first)+count);
+                if(end_bytes>pt->max_end_bytes&&end_bytes<=fact.rest.bytes)pt->max_end_bytes=end_bytes;
+                for(const auto &w:aux_skin_writers_){
+                    if(w.rest==rest.resource.key&&w.rest_offset==offset){
+                        const std::uint64_t we=12ull*(std::uint64_t(w.first)+w.count);
+                        if(we>pt->max_end_bytes&&we<=fact.rest.bytes)pt->max_end_bytes=we;
+                    }
+                }
+                constexpr std::size_t kMaxTriedSizes=8;
+                auto add_cand=[&](std::vector<std::uint64_t> &cands,std::uint64_t sz){
+                    if(sz<12||sz>fact.rest.bytes||sz>NativeDiscovery::max_probe_bytes||(sz%4)!=0)return;
+                    if(pt->tried_bytes.size()+cands.size()>=kMaxTriedSizes)return;
+                    if(std::find(pt->tried_bytes.begin(),pt->tried_bytes.end(),sz)!=pt->tried_bytes.end())return;
+                    if(std::find(cands.begin(),cands.end(),sz)!=cands.end())return;
+                    const bool hashed=std::any_of(aux_rest_hashes_.begin(),aux_rest_hashes_.end(),[&](const AuxRestHash &h){
+                        return h.rest==rest.resource.key&&h.rest_offset==offset&&h.rest_bytes==sz;
+                    });
+                    if(!hashed)cands.push_back(sz);
+                };
+                std::vector<std::uint64_t> cands;
+                add_cand(cands,pt->max_end_bytes);
+                add_cand(cands,end_bytes);
+                add_cand(cands,fact.rest.bytes);
+                if(!cands.empty()){
+                    discovery_.request_known_rest(fact,discovery_writer_id,cands);
+                    for(const auto sz:cands)pt->tried_bytes.push_back(sz);
+                }
+            }
+        }
+    }
     unsigned component=UINT32_MAX;
     auto proof=content_.end();
     for(auto it=content_.begin();it!=content_.end();++it)if(it->submitted&&it->resource==rest.resource.key&&it->offset==offset&&rest.desc.buffer.size>=it->profile->bytes()/4)
@@ -1314,7 +1389,20 @@ void InputCollector::native_copy(api::command_list *c,api::resource source,std::
 }
 void InputCollector::native_written(api::resource r,std::uint64_t offset,std::uint64_t bytes){std::lock_guard lock(mutex_);const auto it=resources_.find(r.handle);if(it!=resources_.end())written(it->second.key,offset,bytes);}
 void InputCollector::native_unknown(){std::lock_guard lock(mutex_);discovery_.unknown();for(const auto &[_,r]:resources_)written(r.key,0,r.bytes);}
-void InputCollector::native_skin_forwarded(api::command_list *c,bool forwarded){std::lock_guard lock(mutex_);const auto list=lists_.find(id(c));if(list!=lists_.end())discovery_.skin_forwarded(list->second.epoch,forwarded);}
+void InputCollector::native_skin_forwarded(api::command_list *c,bool forwarded){
+    std::lock_guard lock(mutex_);const auto list=lists_.find(id(c));
+    if(list==lists_.end())return;
+    discovery_.skin_forwarded(list->second.epoch,forwarded);
+    if(has_skip_intents_){
+        for(auto it=aux_skin_writers_.rbegin();it!=aux_skin_writers_.rend();++it){
+            if(it->recording==list->second.epoch&&!it->forwarded){
+                if(forwarded)it->forwarded=true;
+                else aux_skin_writers_.erase(std::next(it).base());
+                break;
+            }
+        }
+    }
+}
 void InputCollector::native_blas(api::command_list *c,const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC &desc,bool recorded){
     std::lock_guard lock(mutex_);const auto list=lists_.find(id(c));if(list==lists_.end())return;
     if(recorded){discovery_.build_forwarded(list->second.epoch,desc.DestAccelerationStructureData);return;}
@@ -1343,12 +1431,126 @@ bool InputCollector::native_request_input(const NativeDiscovery::Bytes &p,std::u
 }
 bool InputCollector::native_request_cpu(const NativeDiscovery::Bytes &p){
     std::lock_guard lock(mutex_);const auto it=resources_.find(p.range.resource.object);if(it==resources_.end()||it->second.key!=p.range.resource||!p.valid)return false;
-    std::vector<unsigned char> data(static_cast<std::size_t>(p.range.bytes));return read(it->second,p.range.offset,p.range.bytes,data.data())&&discovery_.provide_cpu(p.id,std::move(data));
+    std::vector<unsigned char> data(static_cast<std::size_t>(p.range.bytes));
+    if(!read(it->second,p.range.offset,p.range.bytes,data.data()))return false;
+    const std::uint32_t aux_hash=(has_skip_intents_&&data.size()>=12)?native_mesh_content_hash(data):0u;
+    if(!discovery_.provide_cpu(p.id,std::move(data)))return false;
+    if(aux_hash)record_aux_rest_hash_locked(p.range,aux_hash);
+    return true;
 }
-void InputCollector::native_request_cancel(std::uint64_t id){std::lock_guard lock(mutex_);discovery_.cancel(id);}
+void InputCollector::native_request_cancel(std::uint64_t id){
+    std::lock_guard lock(mutex_);
+    if(has_skip_intents_){
+        if(const auto rng=discovery_.range_of(id)){
+            for(auto &t:aux_probe_targets_){
+                if(t.rest==rng->resource&&t.rest_offset==rng->offset&&t.cancel_retries<4){
+                    if(std::erase(t.tried_bytes,rng->bytes)>0)++t.cancel_retries;
+                    break;
+                }
+            }
+        }
+    }
+    discovery_.cancel(id);
+}
 void InputCollector::native_submission_started(Recording rec){std::lock_guard lock(mutex_);discovery_.submission_started(rec);}
 void InputCollector::native_signalled(std::uint64_t id,std::uint64_t queue,std::uint64_t fence,std::uint64_t value){std::lock_guard lock(mutex_);discovery_.signalled(id,queue,fence,value);}
-bool InputCollector::native_completed(std::uint64_t id,std::uint64_t fence,std::uint64_t value,std::vector<unsigned char> data){std::lock_guard lock(mutex_);const auto key=discovery_.resource_of(id);return key&&live_key(key)&&discovery_.completed(id,fence,value,std::move(data));}
+bool InputCollector::native_completed(std::uint64_t id,std::uint64_t fence,std::uint64_t value,std::vector<unsigned char> data){
+    std::lock_guard lock(mutex_);const auto key=discovery_.resource_of(id);
+    if(!key||!live_key(key))return false;
+    const auto rng=has_skip_intents_?discovery_.range_of(id):std::optional<NativeRange>{};
+    const std::uint32_t aux_hash=(rng&&data.size()>=12)?native_mesh_content_hash(data):0u;
+    if(!discovery_.completed(id,fence,value,std::move(data)))return false;
+    if(rng&&aux_hash)record_aux_rest_hash_locked(*rng,aux_hash);
+    return true;
+}
+void InputCollector::record_aux_rest_hash_locked(const NativeRange &range,std::uint32_t content_hash){
+    if(!content_hash)return;
+    const bool known=std::any_of(aux_rest_hashes_.begin(),aux_rest_hashes_.end(),[&](const AuxRestHash &h){
+        return h.rest==range.resource&&h.rest_offset==range.offset&&h.rest_bytes==range.bytes&&h.content_hash==content_hash;
+    });
+    if(!known){
+        if(aux_rest_hashes_.size()>=256)aux_rest_hashes_.erase(aux_rest_hashes_.begin());
+        aux_rest_hashes_.push_back({range.resource,range.offset,range.bytes,content_hash});
+    }
+    const bool matches_skip=std::any_of(intents_.begin(),intents_.end(),[&](const NativeMeshIntent &i){
+        return i.skip_only&&i.content_hash==content_hash;
+    });
+    if(matches_skip){
+        std::erase_if(aux_probe_targets_,[&](const AuxRestProbeTarget &t){
+            return t.rest==range.resource&&t.rest_offset==range.offset;
+        });
+    }else{
+        std::erase_if(aux_probe_targets_,[&](const AuxRestProbeTarget &t){
+            return t.rest==range.resource&&t.rest_offset==range.offset&&t.tried_bytes.size()>=8;
+        });
+    }
+}
+std::uint32_t InputCollector::identify_aux_skip_draw(const WWMI_RtPackDrawQuery_v2 &q,std::uint32_t &out_content_hash){
+    out_content_hash=0;
+    std::lock_guard lock(mutex_);
+    if(!has_skip_intents_||!q.vertex_buffer_gpu_va||!q.vertex_buffer_bytes||q.base_vertex!=0||q.vertex_stride!=12)return 0;
+    const auto draw_list=lists_.find(q.list);
+    if(draw_list==lists_.end())return 0;
+    const Resource *vb=locate(q.vertex_buffer_gpu_va,q.vertex_buffer_bytes);
+    if(!vb)return 0;
+    const AuxSkinWriter *same_rec_match=nullptr;
+    const AuxSkinWriter *submitted_match=nullptr;
+    for(const auto &w:aux_skin_writers_){
+        if(!w.forwarded||w.output!=vb->key||!w.count)continue;
+        if(w.output_base>UINT64_MAX-w.output_offset)continue;
+        const std::uint64_t w_va=w.output_base+w.output_offset;
+        if(w_va<q.vertex_buffer_gpu_va||w.output_bytes>q.vertex_buffer_bytes)continue;
+        const std::uint64_t delta=w_va-q.vertex_buffer_gpu_va;
+        if(delta>q.vertex_buffer_bytes-w.output_bytes)continue;
+        const bool aligned=(delta==12ull*w.first)||(delta==0&&q.vertex_buffer_bytes==w.output_bytes);
+        if(!aligned)continue;
+        if(w.recording==draw_list->second.epoch){
+            if(!same_rec_match||w.order>same_rec_match->order)same_rec_match=&w;
+        }else if(w.submissions==1){
+            if(!submitted_match||w.order>submitted_match->order)submitted_match=&w;
+        }
+    }
+    const AuxSkinWriter *matched=same_rec_match?same_rec_match:submitted_match;
+    if(!matched)return 0;
+    std::size_t hash_count_for_rest=0;
+    for(const auto &h:aux_rest_hashes_){
+        if(h.rest!=matched->rest||h.rest_offset!=matched->rest_offset)continue;
+        ++hash_count_for_rest;
+        const bool want=std::any_of(intents_.begin(),intents_.end(),[&](const NativeMeshIntent &i){
+            if(!i.skip_only||!i.enabled||i.content_hash!=h.content_hash)return false;
+            return std::any_of(i.components.begin(),i.components.end(),[&](const NativeIndexWindow &c){
+                return c.first==q.first_index&&c.count==q.index_count;
+            });
+        });
+        if(want){out_content_hash=h.content_hash;return 2;}
+    }
+    if(hash_count_for_rest>=8)return 1;
+    std::uint64_t cur_max_end=12ull*(std::uint64_t(matched->first)+matched->count);
+    for(const auto &w:aux_skin_writers_){
+        if(!w.forwarded||w.rest!=matched->rest||w.rest_offset!=matched->rest_offset)continue;
+        if(w.recording!=draw_list->second.epoch&&w.submissions!=1)continue;
+        const std::uint64_t we=12ull*(std::uint64_t(w.first)+w.count);
+        if(we>cur_max_end&&we<=matched->rest_bytes)cur_max_end=we;
+    }
+    auto has_hashed_size=[&](std::uint64_t sz){
+        return std::any_of(aux_rest_hashes_.begin(),aux_rest_hashes_.end(),[&](const AuxRestHash &h){
+            return h.rest==matched->rest&&h.rest_offset==matched->rest_offset&&h.rest_bytes==sz;
+        });
+    };
+    const bool need_probe=(cur_max_end>=12&&!has_hashed_size(cur_max_end))||(matched->rest_bytes>=12&&!has_hashed_size(matched->rest_bytes));
+    if(need_probe){
+        auto pt=std::find_if(aux_probe_targets_.begin(),aux_probe_targets_.end(),[&](const AuxRestProbeTarget &t){
+            return t.rest==matched->rest&&t.rest_offset==matched->rest_offset;
+        });
+        if(pt!=aux_probe_targets_.end()){
+            if(cur_max_end>pt->max_end_bytes)pt->max_end_bytes=cur_max_end;
+        }else{
+            if(aux_probe_targets_.size()>=64)aux_probe_targets_.erase(aux_probe_targets_.begin());
+            aux_probe_targets_.push_back({matched->rest,matched->rest_offset,matched->rest_bytes,cur_max_end,{}});
+        }
+    }
+    return 1;
+}
 void InputCollector::publish_discovery(){
     std::lock_guard lock(mutex_);discovery_.publish();
     for(auto &[bytes,profile]:discovery_.content_bindings())if(live_key(bytes->range.resource)&&std::none_of(content_.begin(),content_.end(),[&](const auto &p){return p.resource==bytes->range.resource&&p.offset==bytes->range.offset&&p.profile==profile;}))

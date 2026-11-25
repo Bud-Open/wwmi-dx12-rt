@@ -26,6 +26,8 @@
 #include "draw/draw_parts.h"
 #include "rt_native_palette.h"
 #include "mods/layout_registry.h"
+#include "mods/ib_hash.h"
+#include "mods/port_section.h"
 #include "migoto/port_api.h"
 namespace PortApi { void RunSiblingHashMarkers(unsigned ib_hash); }
 #include <vector>
@@ -37,6 +39,7 @@ namespace PortApi { void RunSiblingHashMarkers(unsigned ib_hash); }
 #include "mods/claim_state.h"
 #include "hooks/pipeline_hooks.h"
 #include "hooks/descriptor_shadow.h"
+#include "published_descriptor.h"
 #include "observation/binding_client/wwmi_binding_client.hpp"
 #include <map>
 #include <optional>
@@ -72,6 +75,7 @@ struct Reader {
     HMODULE module{};
     WWMI_RtPackIdentifyDrawFn_v2 identify{};
     WWMI_RtPackIdentifyDrawReceiptFn_v1 identify_receipt{};
+    WWMI_RtPackIdentifyAuxSkipDrawFn_v1 identify_aux_skip{};
     WWMI_RtPackAcquireNativePaletteFn_v1 palette{};
     WWMI_RtPackAcquireDrawFrameFn_v1 frame{};
     WWMI_RtPackAcquireDrawFrameFn_v2 frame2{};
@@ -167,6 +171,7 @@ bool RtRasterAttach(){
     if(!GetModuleHandleExW(0,L"zz_wwmi_rt_pack.addon64",&r->module))return false;
     r->identify=reinterpret_cast<WWMI_RtPackIdentifyDrawFn_v2>(GetProcAddress(r->module,"WWMI_RtPackIdentifyDraw_v2"));
     r->identify_receipt=reinterpret_cast<WWMI_RtPackIdentifyDrawReceiptFn_v1>(GetProcAddress(r->module,"WWMI_RtPackIdentifyDrawReceipt_v1"));
+    r->identify_aux_skip=reinterpret_cast<WWMI_RtPackIdentifyAuxSkipDrawFn_v1>(GetProcAddress(r->module,"WWMI_RtPackIdentifyAuxSkipDraw_v1"));
     r->palette=reinterpret_cast<decltype(r->palette)>(GetProcAddress(r->module,"WWMI_RtPackAcquireNativePalette_v1"));
     r->frame=reinterpret_cast<decltype(r->frame)>(GetProcAddress(r->module,"WWMI_RtPackAcquireDrawFrame_v1"));
     r->frame2=reinterpret_cast<decltype(r->frame2)>(GetProcAddress(r->module,"WWMI_RtPackAcquireDrawFrame_v2"));
@@ -368,6 +373,86 @@ static bool RtPreviousVaryingUnobservable(const RtProgramPsoContract* contract,c
         rt.valid&&(rt.rtv_count==1||rt.rtv_count==2)&&rt.rtv[0]&&(rt.rtv_count==1||rt.rtv[1])&&contract->target_count==rt.rtv_count&&
         effects.stream_output==RtEffect::Absent&&effects.uav==RtEffect::Absent;
 }
+static bool RtEvalAuxSkipForHash(reshade::api::command_list* list,uint64_t fc_key,int head_hint,uint32_t ib_hash,
+    uint32_t first,uint32_t count,uint32_t instances,uint32_t first_instance,uint64_t gfx_pso,const char* src_tag){
+    if(!ib_hash)return false;
+    bool any_skip=false;
+    PortApi::EngineScope engine;
+    uint16_t pushed_ps=0;
+    if(list){
+        const uint64_t layh=CmdGfxLayout(list);
+        RegBind t_ps[kSectionTexRegs]{};
+        bool has_layout=false;
+        {
+            std::lock_guard l(g_layout_regmap_mtx);
+            auto it=g_layout_regmap.find(layh);
+            if(it!=g_layout_regmap.end()&&it->second.built){
+                memcpy(t_ps,it->second.t_ps,sizeof t_ps);
+                has_layout=true;
+            }
+        }
+        if(has_layout){
+            reshade::api::device* dev=list->get_device();
+            const auto& root=CmdGfx(list).root;
+            for(unsigned r=0;r<kSectionTexRegs;++r){
+                const RegBind& b=t_ps[r];
+                if(b.param==0xFF||b.param>=64||!b.is_table)continue;
+                const TableStart ts=TableStartOf(dev,root[b.param].table);
+                if(!ts)continue;
+                const HeapKey key{ts.heap,ts.base+b.offset};
+                ResInfo ri{};
+                if(!ReadPublishedDescriptor(key,ri)||!ri.res)continue;
+                const uint32_t resident=TexHashOf(reinterpret_cast<uint64_t>(ri.res));
+                const uint32_t hash=(!resident||PortApi::TextureHashHasSections(resident))?resident:TexLodTargetOf(resident);
+                const unsigned fmt=unsigned(PublishedViewFormat(key));
+                PortApi::PushGameTexture('p',r,ri.res,hash?hash:resident,fmt);
+                pushed_ps|=uint16_t(1u<<r);
+            }
+        }
+    }
+    struct UnpushPsGuard {
+        uint16_t mask;
+        ~UnpushPsGuard(){
+            for(unsigned r=0;r<kSectionTexRegs;++r)
+                if(mask&(1u<<r))PortApi::UnpushGameTexture('p',r);
+        }
+    } unpush_ps{pushed_ps};
+    auto eval_slot=[&](int idx){
+        const auto &mc=g_merged_comps[idx];
+        if(mc.mod_id<0||mc.mod_id>=int(g_geomods.size())||mc.vanilla||mc.hide)return;
+        const auto &gm=g_geomods[mc.mod_id];
+        if(!gm.aux_skip_only||!gm.geom_enabled)return;
+        const auto *wc=WmodComp(mc.mod_id,mc.comp_idx);
+        if(!wc||wc->ib_hash!=ib_hash)return;
+        const std::wstring fq=PortComponentSection(mc.mod_id,wc->index,wc->tail,gm.wcl_ns);
+        if(fq.empty())return;
+        PortApi::DrawInfo di{};
+        di.index_count=count;
+        di.instance_count=instances;
+        di.first_index=first;
+        di.first_instance=first_instance;
+        di.indexed=true;
+        di.pso=gfx_pso;
+        PortApi::RunSectionThenPost(fq.c_str(),&di);
+        if(di.skip){
+            any_skip=true;
+            if(auto *mc_cnt=RtGateCountFor(mc.mod_id))
+                mc_cnt->ok_hid.fetch_add(1,std::memory_order_relaxed);
+            static std::atomic<uint32_t> s_aux_log{0};
+            if(s_aux_log.fetch_add(1,std::memory_order_relaxed)<16)
+                logger::probe("RT-AUX-SKIP src=%s mod=%d ns='%ls' tail='%ls' hash=%08x first=%u count=%u",
+                    src_tag,mc.mod_id,gm.wcl_ns.c_str(),wc->tail.c_str(),ib_hash,first,count);
+        }else if(auto *mc_cnt=RtGateCountFor(mc.mod_id)){
+            mc_cnt->native_pass.fetch_add(1,std::memory_order_relaxed);
+        }
+    };
+    if(const auto sh=g_first_to_shared.find(fc_key);sh!=g_first_to_shared.end()){
+        for(const int cand:sh->second)eval_slot(cand);
+    }else{
+        eval_slot(head_hint);
+    }
+    return any_skip;
+}
 static RtDrawOutcome RtSelectGpuSkinDraw(reshade::api::command_list *list,uint32_t count,uint32_t instances,uint32_t first,int32_t base,uint32_t first_instance){
     extern std::atomic<bool> g_rt_user_disabled;
     if(!g_rt_blocked||g_faulted||g_rt_user_disabled.load(std::memory_order_acquire)||!g_is_dx12||!g_merged_loaded||!g_port_draw_list||!g_wcl_draw||!list||
@@ -418,6 +503,40 @@ static RtDrawOutcome RtSelectGpuSkinDraw(reshade::api::command_list *list,uint32
         (receipt&&r->identify_receipt)?r->identify_receipt(&q,sizeof(q),&id,sizeof(id),receipt,sizeof(*receipt)):
         r->identify(&q,sizeof(q),&id,sizeof(id),nullptr,0);
     if(!identified){
+        bool has_aux_skip=false;
+        auto check_aux=[&](int idx){
+            const auto &mc=g_merged_comps[idx];
+            if(mc.mod_id<0||mc.mod_id>=int(g_geomods.size())||mc.vanilla||mc.hide)return;
+            const auto &gm=g_geomods[mc.mod_id];
+            if(gm.aux_skip_only&&gm.geom_enabled)has_aux_skip=true;
+        };
+        if(const auto sh=g_first_to_shared.find(fc_key);sh!=g_first_to_shared.end()){
+            for(const int cand:sh->second)check_aux(cand);
+        }else{
+            check_aux(slot->second);
+        }
+        if(has_aux_skip){
+            uint32_t aux_hash=0;
+            const uint32_t aux_state=r->identify_aux_skip?r->identify_aux_skip(&q,sizeof(q),&aux_hash):0u;
+            if(aux_state==2u&&aux_hash){
+                const bool skipped=RtEvalAuxSkipForHash(list,fc_key,slot->second,aux_hash,first,count,instances,first_instance,g.gfx_pso,"skincache");
+                return RtDrawOutcome{skipped?RtDrawExecution::HiddenSelected:RtDrawExecution::NativeSelected,false};
+            }
+            if(aux_state==0u&&g.ib.res&&g.vb[0].res&&g.vb[0].stride){
+                const uint64_t ib_base=g.ib.res->GetGPUVirtualAddress();
+                const uint64_t vb_base=g.vb[0].res->GetGPUVirtualAddress();
+                if(g.ib.va>=ib_base&&g.vb[0].va>=vb_base&&(g.ib.va-ib_base)<=UINT32_MAX&&(g.vb[0].va-vb_base)<=UINT32_MAX){
+                    const uint32_t idxb=g.ib.index_bytes?g.ib.index_bytes:uint32_t(ib_stride);
+                    const uint32_t full_ib_bytes=idxb?uint32_t((uint64_t(ia.ib.SizeInBytes)/idxb)*idxb):0u;
+                    const uint32_t ib_hash=full_ib_bytes?IbHash::Lookup(g.ib.res,uint32_t(g.ib.va-ib_base),full_ib_bytes,idxb,
+                        g.vb[0].res,uint32_t(g.vb[0].va-vb_base),g.vb[0].stride,false):0u;
+                    if(ib_hash){
+                        const bool skipped=RtEvalAuxSkipForHash(list,fc_key,slot->second,ib_hash,first,count,instances,first_instance,g.gfx_pso,"ibhash");
+                        if(skipped)return RtDrawOutcome{RtDrawExecution::HiddenSelected,false};
+                    }
+                }
+            }
+        }
         if(hint_counts){
             hint_counts->id_fail.fetch_add(1,std::memory_order_relaxed);
             const unsigned rsn=receipt->reason<12?receipt->reason:11u;
@@ -458,6 +577,11 @@ static RtDrawOutcome RtSelectGpuSkinDraw(reshade::api::command_list *list,uint32
         }
     }
     auto& head=g_merged_comps[head_slot];
+    if(section_matches(head_slot)&&g_geomods[head.mod_id].aux_skip_only){
+        const bool skipped=RtEvalAuxSkipForHash(list,fc_key,head_slot,target.content_hash,first,count,instances,first_instance,g.gfx_pso,"blas");
+        field.key.path=skipped?7:6;
+        return RtDrawOutcome{skipped?RtDrawExecution::HiddenSelected:RtDrawExecution::NativeSelected,false};
+    }
     const auto for_each_head_slot=[&](auto&& fn){
         if(head.run_order.empty())fn(head_slot);
         else for(auto i:head.run_order)fn(i);

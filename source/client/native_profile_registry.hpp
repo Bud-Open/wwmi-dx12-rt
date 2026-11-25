@@ -17,9 +17,11 @@ struct NativeMeshIntent {
     std::uint64_t load_generation=0,mod_key=0,mod_revision=0;
     unsigned object_guid=0,content_hash=0;
     bool enabled=false;
+    bool skip_only=false;
     std::vector<NativeIndexWindow> components;
     bool matches(const NativeProfile &p) const {
         if(object_guid!=p.object_guid||content_hash!=p.content_hash||components.size()!=p.components.size())return false;
+        if(p.partial&&!skip_only)return false;
         for(const auto &n:p.components)
             if(std::none_of(components.begin(),components.end(),[&](const auto &c){return c.component==n.component&&c.first==n.index_first&&c.count==n.index_count;}))return false;
         return true;
@@ -65,7 +67,7 @@ public:
     }
 };
 inline bool NativeProfileRegistry::same(const NativeProfile &a,const NativeProfile &b) {
-    if(a.object_guid!=b.object_guid||a.content_hash!=b.content_hash||a.vertices!=b.vertices||a.components.size()!=b.components.size())return false;
+    if(a.object_guid!=b.object_guid||a.content_hash!=b.content_hash||a.vertices!=b.vertices||a.partial!=b.partial||a.components.size()!=b.components.size())return false;
     for(std::size_t i=0;i<a.components.size();++i){const auto &x=a.components[i],&y=b.components[i];
         if(x.component!=y.component||x.first!=y.first||x.count!=y.count||x.index_first!=y.index_first||x.index_count!=y.index_count)return false;
     }
@@ -76,13 +78,13 @@ inline void NativeProfileRegistry::validate(const NativeProfile &p) {
         throw std::runtime_error("RT native registry profile bounds");
     unsigned next=0;
     for(std::size_t i=0;i<p.components.size();++i){const auto &n=p.components[i];
-        if(n.first!=next||!n.count||n.first>p.vertices||n.count>p.vertices-n.first||!n.index_count||n.index_count%3||n.index_first>UINT32_MAX-n.index_count)
+        if((p.partial?(n.first<next):(n.first!=next))||!n.count||n.first>p.vertices||n.count>p.vertices-n.first||!n.index_count||n.index_count%3||n.index_first>UINT32_MAX-n.index_count)
             throw std::runtime_error("RT native registry component windows invalid");
         for(std::size_t j=0;j<i;++j)if(p.components[j].component==n.component)
             throw std::runtime_error("RT native registry component identity duplicate");
-        next+=n.count;
+        next=n.first+n.count;
     }
-    if(next!=p.vertices)throw std::runtime_error("RT native registry profile incomplete");
+    if(!p.partial&&next!=p.vertices)throw std::runtime_error("RT native registry profile incomplete");
 }
 inline NativeProfileRegistry::Publication NativeProfileRegistry::publish(const NativeProfile &value) {
     // Never retain a caller's potentially mutable shared object.

@@ -93,6 +93,7 @@ static void RtAliasBaseSkinPositionTargets(unsigned gen) {
 
     for(size_t mi=0; mi<g_geomods.size(); ++mi) {
         const GeoMod& gm=g_geomods[mi];
+        if(gm.aux_skip_only) continue;
         const WwmiMod::Resource* pos=WwmiMod::Find(gm.mod,L"ResourcePositionBuffer");
         if(!pos || pos->fq.empty()) continue;
 
@@ -191,5 +192,6 @@ static void RtPackWorldFrame(command_queue* queue,swapchain* sc,bool at_present)
         WWMI_RtModPublish_v1();
     }
     DrainTexReadback();
+    IbHash::DrainQueue();
     ++g_frame_id;
 }

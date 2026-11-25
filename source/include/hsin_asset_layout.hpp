@@ -8,6 +8,7 @@ namespace hsin_rt {
 struct NativeComponent {unsigned component=0,first=0,count=0,index_first=0,index_count=0;};
 struct NativeProfile {
     unsigned object_guid=0,content_hash=0,vertices=0;
+    bool partial=false;
     std::vector<NativeComponent> components;
     std::uint64_t bytes() const {return 12ull*vertices;}
 };

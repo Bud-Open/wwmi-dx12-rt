@@ -140,7 +140,8 @@ void WWMI_RtModPublish_v1(){
             for(size_t i=0;i<g_geomods.size();++i){const auto &gm=g_geomods[i];ModCopy m;
                 m.key=i+1;m.ns=gm.wcl_ns;m.dir=gm.mod.dir;m.guid=gm.mod.object_guid;m.vertices=gm.mod.mesh_vertex_count;
                 m.shape_vertices=uint32_t(PortApi::GetVarNs(m.ns.c_str(),L"shapekey_vertex_count",0.f));
-                m.flags=(!g_rt_user_disabled.load(std::memory_order_acquire)&&ModGeomEnabled(int(i)))?WWMI_RT_MOD_ENABLED:0;
+                m.flags=((!g_rt_user_disabled.load(std::memory_order_acquire)&&ModGeomEnabled(int(i)))?WWMI_RT_MOD_ENABLED:0) |
+                    (gm.aux_skip_only?WWMI_RT_MOD_SKIP_ONLY:0);
                 for(const auto &c:gm.mod.comps)m.components.push_back({c.index,c.ib_hash,c.match_first_index,c.match_index_count,c.vg_offset,c.vg_count,false,{}});
                 for(const auto &r:gm.mod.resources){if(!relevant(r.name))continue;ResourceCopy copy;copy.name=r.name;copy.stride=r.stride;copy.format=parsed_format(r.fq);
                     PortApi::BufferResourceInfo bi{};
@@ -178,7 +179,8 @@ void WWMI_RtModPublish_v1(){
             ++revision;++geometry_revision;dirty=true;
             logger::probe("WWMI-LOAD phase=catalog-published generation=%llu rows=%zu",
                 (unsigned long long)generation,mods.size());
-        }else for(size_t i=0;i<mods.size();++i){auto &m=mods[i];const uint32_t flags=(!g_rt_user_disabled.load(std::memory_order_acquire)&&ModGeomEnabled(int(i)))?WWMI_RT_MOD_ENABLED:0;
+        }else for(size_t i=0;i<mods.size();++i){auto &m=mods[i];const uint32_t flags=((!g_rt_user_disabled.load(std::memory_order_acquire)&&ModGeomEnabled(int(i)))?WWMI_RT_MOD_ENABLED:0) |
+            (g_geomods[i].aux_skip_only?WWMI_RT_MOD_SKIP_ONLY:0);
             if(flags==m.flags)continue;m.flags=flags;for(auto &c:m.components){c.known=false;c.draws.clear();clear_plan(c,true);}std::erase_if(plans,[&](const auto &p){return p.second.key==m.key;});++m.revision;++revision;++m.geometry_revision;++geometry_revision;dirty=true;
         }
     }catch(...){std::lock_guard lock(source_mutex);mods.clear();pending.clear();plans.clear();recordings.clear();++revision;++geometry_revision;dirty=true;}

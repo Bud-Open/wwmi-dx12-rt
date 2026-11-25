@@ -154,6 +154,33 @@ void LoadGeometryMods()
                     mc.remap_size = 0;
                     g_merged_comps.push_back(mc);
                 }
+                const auto         aux_meshes = g_geomods[mod_id].mod.aux_skip_meshes;
+                const std::wstring parent_ns = g_geomods[mod_id].wcl_ns;
+                const std::wstring parent_dir = g_geomods[mod_id].mod.dir;
+                for (const auto& am : aux_meshes) {
+                    if (!am.ib_hash || am.comps.empty()) continue;
+                    g_geomods.emplace_back();
+                    GeoMod&   agm = g_geomods.back();
+                    const int aux_id = (int)g_geomods.size() - 1;
+                    agm.wcl_ns = parent_ns;
+                    agm.aux_skip_only = true;
+                    agm.aux_parent_mod = mod_id;
+                    agm.mod.dir = parent_dir;
+                    agm.mod.object_guid = (int)(0x40000000u | (am.ib_hash & 0x3FFFFFFFu));
+                    agm.mod.mesh_vertex_count = 0;
+                    agm.mod.comps = am.comps;
+                    for (const auto& c : agm.mod.comps) {
+                        MergedComp mc;
+                        mc.mod_id = aux_id;
+                        mc.comp_idx = c.index;
+                        mc.first_index = c.match_first_index;
+                        mc.match_count = c.match_index_count;
+                        mc.remap_size = 0;
+                        g_merged_comps.push_back(mc);
+                    }
+                    logger::write("WwmiGeom: auxiliary skip-only unit #%d parent=#%d ns='%ls' hash=%08x guid=%d (%zu comps)",
+                        aux_id, mod_id, agm.wcl_ns.c_str(), am.ib_hash, agm.mod.object_guid, agm.mod.comps.size());
+                }
                 g_first_to_comp.clear();
                 g_first_to_shared.clear();
                 for (size_t i = 0; i < g_merged_comps.size(); ++i) {

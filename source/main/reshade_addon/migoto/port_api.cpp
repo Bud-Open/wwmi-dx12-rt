@@ -27,6 +27,7 @@
 #include "dx12_context.h"
 #include "dx12_pipeline.h"
 #include "dx12_wrap.h"
+#include "mod_ui_shield.h"
 #include "../../src/log.h"
 
 #include <mutex>
@@ -297,7 +298,11 @@ void PresentPre()
     }
     if (!HaveCommandList("[Present] pre")) {
         std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-        if (g_loaded) FrameDriverConfig();
+        if (g_loaded) {
+            const bool track_mod_ui = MigotoPort::GetDx12Bridge().back_buffer != nullptr;
+            MigotoPort::ModUiFrameBegin(track_mod_ui);
+            FrameDriverConfig();
+        }
         return;
     }
     MigotoPort::UploadFrameTick(); // releases retired resources the GPU has passed (src/gpu_progress.h)
@@ -310,6 +315,8 @@ void PresentPre()
     MigotoPort::SweepSelectionVars();
     g_step_inputs.Take();
     g_step_inputs_taken = true;
+    const bool track_mod_ui = MigotoPort::GetDx12Bridge().back_buffer != nullptr;
+    MigotoPort::ModUiFrameBegin(track_mod_ui);
     RunCommandList(&g_dev, &g_ctx, &G->present_command_list, nullptr, false);
     RunSkelCopyUpdates();
     FrameDriverConfig();
@@ -318,10 +325,15 @@ void PresentPre()
 
 void PresentPost()
 {
-    if (!HaveCommandList("[Present] post")) return;
+    if (!HaveCommandList("[Present] post")) {
+        std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+        if (g_loaded) MigotoPort::ModUiFrameEnd(G->hWnd);
+        return;
+    }
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     if (!g_loaded) return;
     RunCommandList(&g_dev, &g_ctx, &G->post_present_command_list, nullptr, true);
+    MigotoPort::ModUiFrameEnd(G->hWnd);
 }
 
 void PresentRedraw()
@@ -333,8 +345,11 @@ void PresentRedraw()
     before.Take();
     if (g_step_inputs_taken) g_step_inputs.PutBack();
     MigotoPort::g_present_redraw = true;
+    const bool track_mod_ui = MigotoPort::GetDx12Bridge().back_buffer != nullptr;
+    if (track_mod_ui) MigotoPort::ModUiFrameBegin(true);
     RunCommandList(&g_dev, &g_ctx, &G->present_command_list, nullptr, false);
     RunCommandList(&g_dev, &g_ctx, &G->post_present_command_list, nullptr, true);
+    if (track_mod_ui) MigotoPort::ModUiFrameEnd(G->hWnd);
     MigotoPort::g_present_redraw = false;
     before.PutBack();
     g_ctx.ResetCallCounters();
@@ -349,7 +364,10 @@ void TickInput()
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     if (!g_loaded) return;
-    DispatchInputEvents(&g_dev);
+    {
+        MigotoPort::ModUiInputBypassScope bypass;
+        DispatchInputEvents(&g_dev);
+    }
 
     CurrentTransition.UpdatePresets(&g_dev);
     CurrentTransition.UpdateTransitions(&g_dev);

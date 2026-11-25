@@ -32,6 +32,24 @@ ComPtr<ID3D12Resource>      g_rb;              // READBACK
 ID3D12Fence*                g_fence = nullptr; // the present pass's fence and the value that completes the recorded list
 UINT64                      g_fv = 0;
 
+struct CacheKey {
+    uint64_t vb_va = 0;
+    uint64_t ib_va = 0;
+    uint32_t idx_size = 0;
+    uint32_t vb_stride = 0;
+    uint32_t exact_ib_bytes = 0; // 0 for grow=true lookups; exact ib_bytes for grow=false
+    bool     operator<(const CacheKey& o) const
+    {
+        return std::tie(vb_va, ib_va, idx_size, vb_stride, exact_ib_bytes) <
+               std::tie(o.vb_va, o.ib_va, o.idx_size, o.vb_stride, o.exact_ib_bytes);
+    }
+    bool operator==(const CacheKey& o) const
+    {
+        return vb_va == o.vb_va && ib_va == o.ib_va && idx_size == o.idx_size &&
+               vb_stride == o.vb_stride && exact_ib_bytes == o.exact_ib_bytes;
+    }
+};
+
 struct Job {
     ID3D12Resource* ib;
     ID3D12Resource* vb;
@@ -41,25 +59,27 @@ struct Job {
     uint32_t        vb_off;
     uint32_t        vb_stride;
     uint64_t        vb_va;
+    uint64_t        ib_va;
+    CacheKey        key;
 };
 std::vector<Job> g_pending;
 struct Cached {
     uint32_t hash;
     uint32_t ib_bytes; // the index extent the hash was taken over
 };
-std::map<uint64_t, Cached> g_cache;
+std::map<CacheKey, Cached> g_cache;
 std::atomic<uint32_t>      g_cache_gen{ 1 };
 struct LookupMemo {
-    uint64_t vb_va;
+    CacheKey key;
     uint32_t hash;
     uint32_t ib_bytes;
     uint32_t gen;
 };
 thread_local LookupMemo t_memo[1024] = {};
 
-void StoreLocked(uint64_t vb_va, const Cached& c)
+void StoreLocked(const CacheKey& key, const Cached& c)
 {
-    if (!g_cache.insert_or_assign(vb_va, c).second) g_cache_gen.fetch_add(1, std::memory_order_acq_rel);
+    if (!g_cache.insert_or_assign(key, c).second) g_cache_gen.fetch_add(1, std::memory_order_acq_rel);
 }
 // one hash in flight at a time (NON-BLOCKING: dispatch, read the result a later present -- never stall).
 bool                  g_inflight = false;
@@ -212,26 +232,29 @@ uint32_t Lookup(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes, uint
 {
     if (!ib_res || !vb_res || !ib_bytes || !idx_size || !vb_stride) return 0;
     if (!Init(g_d3d12_device)) return 0;
-    uint64_t       vb_va = vb_res->GetGPUVirtualAddress() + vb_off; // UNIQUE per char (pooled VBs)
-    LookupMemo&    m = t_memo[((vb_va >> 8) ^ (vb_va >> 20)) & 1023];
+    const uint64_t vb_va = vb_res->GetGPUVirtualAddress() + vb_off;
+    const uint64_t ib_va = ib_res->GetGPUVirtualAddress() + ib_off;
+    const CacheKey key{ vb_va, ib_va, idx_size, vb_stride, grow ? 0u : ib_bytes };
+    const size_t   slot = ((vb_va >> 8) ^ (vb_va >> 20) ^ (ib_va >> 10) ^ (key.exact_ib_bytes >> 2)) & 1023u;
+    LookupMemo&    m = t_memo[slot];
     const uint32_t gen = g_cache_gen.load(std::memory_order_acquire);
-    if (m.vb_va == vb_va && m.gen == gen && !(grow && m.hash && ib_bytes > m.ib_bytes)) return m.hash;
+    if (m.key == key && m.gen == gen && !(grow && m.hash && ib_bytes > m.ib_bytes)) return m.hash;
     uint32_t meanwhile = 0;
     {
         std::shared_lock l(g_mtx); // the hot path: a cached hash, read in parallel
-        auto             it = g_cache.find(vb_va);
+        auto             it = g_cache.find(key);
         const bool       further = grow && it != g_cache.end() && it->second.hash && ib_bytes > it->second.ib_bytes;
         if (it != g_cache.end() && !further) {
-            m = LookupMemo{ vb_va, it->second.hash, it->second.ib_bytes, gen };
+            m = LookupMemo{ key, it->second.hash, it->second.ib_bytes, gen };
             return it->second.hash;
         }
         meanwhile = further ? it->second.hash : 0;
-        if (g_inflight && g_inflight_job.vb_va == vb_va) return meanwhile; // being computed
+        if (g_inflight && g_inflight_job.key == key) return meanwhile; // being computed
     }
     std::unique_lock l(g_mtx);
-    if (g_inflight && g_inflight_job.vb_va == vb_va) return meanwhile;
+    if (g_inflight && g_inflight_job.key == key) return meanwhile;
     for (auto& j : g_pending) {
-        if (j.vb_va == vb_va) { // dedup pending; a queued job may still widen
+        if (j.key == key) { // dedup pending; a queued job may still widen
             if (grow && ib_bytes > j.ib_bytes) j.ib_bytes = ib_bytes;
             return meanwhile;
         }
@@ -239,7 +262,7 @@ uint32_t Lookup(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes, uint
     if (g_pending.size() < 32) {
         ib_res->AddRef();
         vb_res->AddRef();
-        g_pending.push_back({ ib_res, vb_res, ib_off, ib_bytes, idx_size, vb_off, vb_stride, vb_va });
+        g_pending.push_back({ ib_res, vb_res, ib_off, ib_bytes, idx_size, vb_off, vb_stride, vb_va, ib_va, key });
     }
     return meanwhile;
 }
@@ -249,32 +272,59 @@ bool ReadCompleted(uint64_t vb_va, uint32_t& hash, uint32_t& index_bytes)
     hash = 0;
     index_bytes = 0;
     std::shared_lock l(g_mtx);
-    const auto it = g_cache.find(vb_va);
-    if (it == g_cache.end() || !it->second.hash) return false;
-    hash = it->second.hash;
-    index_bytes = it->second.ib_bytes;
-    return true;
+    bool             found = false;
+    for (auto it = g_cache.lower_bound(CacheKey{ vb_va, 0, 0, 0, 0 });
+         it != g_cache.end() && it->first.vb_va == vb_va; ++it) {
+        if (!it->second.hash) continue;
+        if (!found || it->second.ib_bytes > index_bytes) {
+            hash = it->second.hash;
+            index_bytes = it->second.ib_bytes;
+            found = true;
+        }
+    }
+    return found;
 }
 
 void ForgetRange(uint64_t va, uint64_t bytes)
 {
     if (!va || !bytes) return;
+    const uint64_t end = (va <= UINT64_MAX - bytes) ? (va + bytes) : UINT64_MAX;
+    auto           in_range = [&](uint64_t addr) { return addr >= va && addr < end; };
+    auto           overlaps = [&](uint64_t base, uint64_t len) {
+        if (!len) return in_range(base);
+        const uint64_t b_end = (base <= UINT64_MAX - len) ? (base + len) : UINT64_MAX;
+        return base < end && va < b_end;
+    };
     {
         std::shared_lock l(g_mtx);
-        bool             hit = g_cache.lower_bound(va) != g_cache.lower_bound(va + bytes) ||
-            (g_inflight && g_inflight_job.vb_va >= va && g_inflight_job.vb_va < va + bytes);
+        bool             hit = g_cache.lower_bound(CacheKey{ va, 0, 0, 0, 0 }) != g_cache.lower_bound(CacheKey{ end, 0, 0, 0, 0 }) ||
+            (g_inflight && (in_range(g_inflight_job.vb_va) || overlaps(g_inflight_job.ib_va, g_inflight_job.ib_bytes)));
+        if (!hit) {
+            for (const auto& kv : g_cache) {
+                if (overlaps(kv.first.ib_va, kv.second.ib_bytes)) {
+                    hit = true;
+                    break;
+                }
+            }
+        }
         for (size_t i = 0; i < g_pending.size() && !hit; ++i)
-            hit = g_pending[i].vb_va >= va && g_pending[i].vb_va < va + bytes;
+            hit = in_range(g_pending[i].vb_va) || overlaps(g_pending[i].ib_va, g_pending[i].ib_bytes);
         if (!hit) return;
     }
     std::vector<Job> dropped;
     {
         std::unique_lock l(g_mtx);
-        g_cache.erase(g_cache.lower_bound(va), g_cache.lower_bound(va + bytes));
+        g_cache.erase(g_cache.lower_bound(CacheKey{ va, 0, 0, 0, 0 }), g_cache.lower_bound(CacheKey{ end, 0, 0, 0, 0 }));
+        for (auto it = g_cache.begin(); it != g_cache.end();) {
+            if (overlaps(it->first.ib_va, it->second.ib_bytes))
+                it = g_cache.erase(it);
+            else
+                ++it;
+        }
         g_cache_gen.fetch_add(1, std::memory_order_acq_rel);
-        if (g_inflight && g_inflight_job.vb_va >= va && g_inflight_job.vb_va < va + bytes) g_inflight_stale = true;
+        if (g_inflight && (in_range(g_inflight_job.vb_va) || overlaps(g_inflight_job.ib_va, g_inflight_job.ib_bytes))) g_inflight_stale = true;
         for (size_t i = 0; i < g_pending.size();) {
-            if (g_pending[i].vb_va >= va && g_pending[i].vb_va < va + bytes) {
+            if (in_range(g_pending[i].vb_va) || overlaps(g_pending[i].ib_va, g_pending[i].ib_bytes)) {
                 dropped.push_back(g_pending[i]);
                 g_pending.erase(g_pending.begin() + i);
             } else {
@@ -345,7 +395,7 @@ void DrainQueue()
         {
             std::unique_lock l(g_mtx);
             if (vbBytes && !g_inflight_stale) {
-                StoreLocked(g_inflight_job.vb_va, Cached{ full, g_inflight_job.ib_bytes }); // 0 bytes: not run, the next draw requeues
+                StoreLocked(g_inflight_job.key, Cached{ full, g_inflight_job.ib_bytes }); // 0 bytes: not run, the next draw requeues
             }
             done = g_inflight_job;
             g_inflight = false;
@@ -379,7 +429,7 @@ bool Record(ID3D12GraphicsCommandList* cl)
     if ((uint64_t)j.ib_off + j.ib_bytes > ibW || j.vb_off >= vbW) { // bad range -> cache 0, skip
         {
             std::unique_lock l(g_mtx);
-            StoreLocked(j.vb_va, Cached{ 0, j.ib_bytes });
+            StoreLocked(j.key, Cached{ 0, j.ib_bytes });
         }
         j.ib->Release();
         j.vb->Release();
@@ -392,7 +442,7 @@ bool Record(ID3D12GraphicsCommandList* cl)
                 (unsigned long long)(vbW - j.vb_off));
         {
             std::unique_lock l(g_mtx);
-            StoreLocked(j.vb_va, Cached{ 0, j.ib_bytes });
+            StoreLocked(j.key, Cached{ 0, j.ib_bytes });
         }
         j.ib->Release();
         j.vb->Release();

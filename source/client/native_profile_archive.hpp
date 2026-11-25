@@ -40,7 +40,7 @@ public:
     std::string append(const NativeProfileRegistry::SnapshotRef &snapshot){
         if(path_.empty()||!snapshot)return {};
         std::lock_guard owner(mutex_);if(last_attempt_==snapshot->revision)return {};last_attempt_=snapshot->revision;std::vector<std::shared_ptr<const NativeProfile>> fresh;
-        for(const auto &p:snapshot->profiles)if(std::find(stored_.begin(),stored_.end(),p)==stored_.end())fresh.push_back(p);
+        for(const auto &p:snapshot->profiles)if(!p->partial&&std::find(stored_.begin(),stored_.end(),p)==stored_.end())fresh.push_back(p);
         if(fresh.empty())return {};
         std::lock_guard file(file_mutex_);
         std::error_code error;const bool exists=std::filesystem::exists(path_,error);if(error)return "native profile archive existence check failed";

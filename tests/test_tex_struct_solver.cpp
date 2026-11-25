@@ -226,6 +226,49 @@ static void CutoutMaskClassifier()
     assert(!IsBinaryCutoutMask(make_stats(0, 10000, 0, 0, 0)));
     assert(!IsBinaryCutoutMask(CutoutMaskStats{}));
     assert(!IsPureWhiteNeutralizer(CutoutMaskStats{}));
+
+    // Low-mip (64x64 / 128x128) resident streaming-tail cutout mask cases
+    assert(IsBinaryCutoutMaskLowMip(make_stats(4046, 20, 30, 0, 0)));
+    CutoutMaskStats srgb_downsampled{};
+    for (int i = 0; i < 4046; ++i) AccumulateCutoutTexel(srgb_downsampled, 255, 255, 255, 255);
+    for (int i = 0; i < 20; ++i) AccumulateCutoutTexel(srgb_downsampled, 32, 32, 32, 255); // sRGB linear-mip bleed
+    for (int i = 0; i < 30; ++i) AccumulateCutoutTexel(srgb_downsampled, 140, 140, 140, 255);
+    assert(!IsBinaryCutoutMask(srgb_downsampled));
+    assert(IsBinaryCutoutMaskLowMip(srgb_downsampled));
+    // Pure white / mid-gray FX / smooth gradient / colorful textures must still reject low-mip classifier
+    assert(!IsBinaryCutoutMaskLowMip(pure_white));
+    assert(!IsBinaryCutoutMaskLowMip(fx_near_white));
+    assert(!IsBinaryCutoutMaskLowMip(make_stats(6000, 2000, 2000, 0, 0)));
+    assert(!IsBinaryCutoutMaskLowMip(make_stats(9000, 500, 0, 500, 0)));
+    assert(!IsBinaryCutoutMaskLowMip(CutoutMaskStats{}));
+}
+
+static void VisualMipParentEquivalence()
+{
+    VisualMipParentTable t;
+    assert(t.Resolve(0xacba6531u) == 0);
+    // Unique sub-mip -> parent (1024px sub1 -> 2048px mip0)
+    assert(t.Note(0xacba6531u, 0x32be8842u));
+    assert(t.Resolve(0xacba6531u) == 0x32be8842u);
+    // Multi-level consistent chain (512px -> 1024px -> 2048px, then direct 512px -> 2048px)
+    assert(t.Note(0xe24c1905u, 0xacba6531u));
+    assert(t.Resolve(0xe24c1905u) == 0x32be8842u);
+    assert(t.Note(0xe24c1905u, 0x32be8842u));
+    assert(t.Resolve(0xe24c1905u) == 0x32be8842u);
+    // Cycle guard: reversing an existing chain must be ignored
+    assert(!t.Note(0x32be8842u, 0xacba6531u));
+    assert(t.Resolve(0x32be8842u) == 0);
+    assert(t.Resolve(0xacba6531u) == 0x32be8842u);
+    // Shared/placeholder sub-mip seen under two distinct parents -> permanently ambiguous
+    assert(t.Note(0x86e6d9e1u, 0x9394fba6u));
+    assert(t.Resolve(0x86e6d9e1u) == 0x9394fba6u);
+    assert(t.Note(0x86e6d9e1u, 0x925af8a7u));
+    assert(t.Resolve(0x86e6d9e1u) == 0);
+    assert(!t.Note(0x86e6d9e1u, 0x9394fba6u));
+    assert(t.Resolve(0x86e6d9e1u) == 0);
+    // CollectForParents exports only unambiguous children of persisted parents
+    const auto exported = t.CollectForParents([](uint32_t p) { return p == 0x32be8842u; });
+    assert(exported.size() == 2);
 }
 
 static void SlotShaderKeySeparation()
@@ -253,5 +296,6 @@ int main(int argc, char* argv[])
     else if (scenario == "cluster") TransitiveCluster();
     else if (scenario == "cutout") CutoutMaskClassifier();
     else if (scenario == "slotkey") SlotShaderKeySeparation();
+    else if (scenario == "mipparent") VisualMipParentEquivalence();
     else return 1;
 }

@@ -44,3 +44,6 @@ class TexStructSolverTests(unittest.TestCase):
 
     def test_slot_shader_key_separates_ps_decl_masks(self):
         subprocess.run([self.binary, "slotkey"], check=True, timeout=5)
+
+    def test_visual_mip_parent_equivalence(self):
+        subprocess.run([self.binary, "mipparent"], check=True, timeout=5)

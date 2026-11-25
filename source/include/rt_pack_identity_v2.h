@@ -24,6 +24,14 @@ typedef uint32_t (*WWMI_RtPackIdentifyDrawFn_v2)(const WWMI_RtPackDrawQuery_v2 *
     WWMI_RtPackDrawIdentity_v2 *out,uint32_t out_size,void *palette,uint32_t palette_capacity);
 uint32_t WWMI_RtPackIdentifyDraw_v2(const WWMI_RtPackDrawQuery_v2 *query,uint32_t query_size,
     WWMI_RtPackDrawIdentity_v2 *out,uint32_t out_size,void *palette,uint32_t palette_capacity);
+// Identifies a SkinCache-skinned draw for an auxiliary skip-only mesh that has no
+// RT BLAS profile: returns 2 when rest content hash is proved (*out_content_hash),
+// 1 when output matches a SkinCache write and a rest-position probe is pending,
+// or 0 when VB0 is not a tracked SkinCache output (caller may fall back to IB hash).
+typedef uint32_t (*WWMI_RtPackIdentifyAuxSkipDrawFn_v1)(const WWMI_RtPackDrawQuery_v2 *query,uint32_t query_size,
+    uint32_t *out_content_hash);
+uint32_t WWMI_RtPackIdentifyAuxSkipDraw_v1(const WWMI_RtPackDrawQuery_v2 *query,uint32_t query_size,
+    uint32_t *out_content_hash);
 #ifdef __cplusplus
 }
 #endif

@@ -5,6 +5,7 @@
 #include "CommandList.h"
 #include "u1_isolation.h"
 #include "rt_author_position_origin.hpp"
+#include "mod_ui_shield.h"
 
 #include <DDSTextureLoader.h>
 #include <algorithm>
@@ -3977,18 +3978,23 @@ float CommandListOperand::evaluate(CommandListState *state, HackerDevice *device
 			UpdateCursorInfo(state);
 			return !!(state->cursor_info.flags & CURSOR_SHOWING);
 		case ParamOverrideType::CURSOR_SCREEN_X:
+			MigotoPort::ModUiNoteCursorQuery();
 			UpdateCursorInfo(state);
 			return (float)state->cursor_info.ptScreenPos.x;
 		case ParamOverrideType::CURSOR_SCREEN_Y:
+			MigotoPort::ModUiNoteCursorQuery();
 			UpdateCursorInfo(state);
 			return (float)state->cursor_info.ptScreenPos.y;
 		case ParamOverrideType::CURSOR_WINDOW_X:
+			MigotoPort::ModUiNoteCursorQuery();
 			UpdateCursorInfo(state);
 			return (float)state->cursor_window_coords.x;
 		case ParamOverrideType::CURSOR_WINDOW_Y:
+			MigotoPort::ModUiNoteCursorQuery();
 			UpdateCursorInfo(state);
 			return (float)state->cursor_window_coords.y;
 		case ParamOverrideType::CURSOR_X:
+			MigotoPort::ModUiNoteCursorQuery();
 			UpdateCursorInfo(state);
 			ftemp = HeuristicGetWindowWidth(state);
 			// Try to get cursor X from cursor_window_coords
@@ -4004,6 +4010,7 @@ float CommandListOperand::evaluate(CommandListState *state, HackerDevice *device
 			// All methods failed, return zero
 			return 0;
 		case ParamOverrideType::CURSOR_Y:
+			MigotoPort::ModUiNoteCursorQuery();
 			UpdateCursorInfo(state);
 			ftemp = HeuristicGetWindowHeight(state);
 			// Try to get cursor Y from cursor_window_coords
@@ -5935,6 +5942,14 @@ void ParamOverride::run(CommandListState *state)
 	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
 
 	*dest = expression.evaluate(state);
+	if (param_idx == 87) {
+		unsigned mask = 0;
+		if (param_component == &DirectX::XMFLOAT4::x) mask = 1u << 0;
+		else if (param_component == &DirectX::XMFLOAT4::y) mask = 1u << 1;
+		else if (param_component == &DirectX::XMFLOAT4::z) mask = 1u << 2;
+		else if (param_component == &DirectX::XMFLOAT4::w) mask = 1u << 3;
+		MigotoPort::ModUiNoteIniParamWrite(87, mask);
+	}
 
 	COMMAND_LIST_LOG(state, "  ini param override = %f\n", *dest);
 

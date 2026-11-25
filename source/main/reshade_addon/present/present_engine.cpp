@@ -367,6 +367,7 @@ void EngineFrameTick(command_queue* queue, swapchain* sc, bool bind_back_buffer)
         const bool             cp_on = logger::enabled(1) && (g_frame_id % 300u == 2u);
         if (cp_on) {
             for (const GeoMod& gm : g_geomods) {
+                if (gm.aux_skip_only) continue;
                 const std::wstring& uns = gm.wcl_ns;
                 if (uns.empty()) continue;
                 if (PortApi::GetVarNs(uns.c_str(), L"mod_enabled", -1.f) != 1.f) continue;
@@ -453,13 +454,14 @@ void EngineFrameTick(command_queue* queue, swapchain* sc, bool bind_back_buffer)
             if (focused) PortApi::TickInput();
             bool on_screen = false;
             for (GeoMod& gm : g_geomods) {
+                if (gm.aux_skip_only) continue;
                 gm.det_at_keys = gm.wcl_ns.empty() ? -1.f : PortApi::GetVarNs(gm.wcl_ns.c_str(), L"object_detected", -1.f);
                 on_screen |= gm.det_at_keys > 0.f;
             }
             if (g_frame_id % 600u == 300u) TexPlacementReport();
             if (g_frame_id % 10u == 0u)
                 for (GeoMod& gm : g_geomods)
-                    if (gm.det_at_keys > 0.f) TexSnapshotSelections(gm.wcl_ns.c_str());
+                    if (!gm.aux_skip_only && gm.det_at_keys > 0.f) TexSnapshotSelections(gm.wcl_ns.c_str());
             static uint32_t s_held_retry_frame = 0;
             if (on_screen && g_frame_id - s_held_retry_frame >= 30) {
                 s_held_retry_frame = g_frame_id;
@@ -476,6 +478,7 @@ void EngineFrameTick(command_queue* queue, swapchain* sc, bool bind_back_buffer)
             for (GeoMod& gm : g_geomods) {
                 const bool was = gm.geom_enabled;
                 gm.geom_enabled = gm.wcl_ns.empty() || PortApi::GetVarNs(gm.wcl_ns.c_str(), L"mod_enabled", 1.f) != 0.f;
+                if (gm.aux_skip_only) continue;
                 switched_on |= !was && gm.geom_enabled;
                 if (was && !gm.geom_enabled) {
                     TexUnstampSwitchedOff(gm.wcl_ns.c_str());

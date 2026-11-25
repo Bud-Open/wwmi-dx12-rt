@@ -25,6 +25,7 @@
 #include "textures/tex_gc.h"
 #include "textures/tex_replace.h"
 #include "migoto/dx12_wrap.h" // BackBufferForget
+#include "migoto/mod_ui_shield.h"
 #include "migoto/port_toggles.h" // g_buffers_in_vram
 #include "instrumentation/removal_pin.h"
 #include "instrumentation/hot_path.h"
@@ -85,6 +86,7 @@ static void on_destroy_swapchain(swapchain*, bool resize)
         MigotoPort::BackBufferForget();
         return;
     }
+    MigotoPort::ModUiClearShield();
     MigotoPort::BackBufferForget();
     ::logger::write("Exit: swapchain destroyed -- stopping the watchdogs and saving the persistent settings");
     FrameEndForgetSwapchain();
@@ -942,6 +944,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE ww
 
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE)
 {
+    MigotoPort::ModUiClearShield();
     StopDescriptorPublisher();
     if (s_infoq1) {
         if (s_infoq1_cookie) s_infoq1->UnregisterMessageCallback(s_infoq1_cookie);
