@@ -1,0 +1,80 @@
+name: CI Build & Release Verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  linux-tests-and-preload:
+    name: Linux Unit Tests & Preload Shim
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure & build Linux UTF-8 locale shim via CMake
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target wine-filename-utf8 --parallel
+          test -s build/wine-filename-utf8.so
+
+      - name: Run Python unit test suite & bootstrap dry-run check
+        run: |
+          python3 -m unittest discover -s tests -v
+          python3 scripts/bootstrap_deps.py --dry-run
+
+  windows-full-build:
+    name: Windows x64 Full Source Build (Host + Addons + Setup)
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ninja
+        run: python -m pip install --upgrade pip ninja
+
+      - name: Initialize MSVC x64 developer environment with ClangCL
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Bootstrap pinned upstream sources & DXC into third_party/
+        run: python scripts/bootstrap_deps.py
+
+      - name: Build all runtime DLLs/Addons & Win32 Setup from source via CMake + Ninja
+        shell: pwsh
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        run: |
+          python scripts/build.py
+
+      - name: Assemble portable Windows release package
+        shell: pwsh
+        run: python scripts/package_release.py --target win64
+
+      - name: Exercise the released Windows setup and run Python tests
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -Path "dist/release-*/WWMI-DX12-RT-win64.zip" -File)
+          if ($archives.Count -ne 1 -or $archives[0].Length -eq 0) {
+            throw "Expected one nonempty WWMI-DX12-RT-win64.zip"
+          }
+          python tests/smoke_win_setup.py $archives[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -v
+
+      - name: Upload Windows portable release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: WWMI-DX12-RT-win64
+          path: dist/release-*/WWMI-DX12-RT-win64.zip
+          if-no-files-found: error

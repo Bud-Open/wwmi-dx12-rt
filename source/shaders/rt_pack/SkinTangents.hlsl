@@ -1,0 +1,26 @@
+// Same normalized U16 blend/canonical-row convention as SkinPositions.
+ByteAddressBuffer RestVectors : register(t0);
+ByteAddressBuffer Blends : register(t1);
+StructuredBuffer<float4> CanonicalRows : register(t2);
+RWStructuredBuffer<float4> SkinnedVectors : register(u0);
+cbuffer SkinRange : register(b0) { uint VertexCount;uint FirstVertex;uint OutputFirstVertex;float PositionScale; };
+uint U16(uint4 w,uint s){return (w[s>>1]>>((s&1)*16))&65535;}
+float S8(uint w,uint shift){int v=int(w<<(24-shift))>>24;return max(-1.0,float(v)/127.0);}
+float4 Decode(uint w){return float4(S8(w,0),S8(w,8),S8(w,16),S8(w,24));}
+float3 Unit(float3 v){float n=dot(v,v);return n>0?v*rsqrt(n):0;}
+[numthreads(64,1,1)]
+void main(uint3 id:SV_DispatchThreadID){
+    if(id.x>=VertexCount)return;uint vertex=FirstVertex+id.x;
+    uint4 ids=Blends.Load4(vertex*32),weights=Blends.Load4(vertex*32+16);
+    precise float4 r0=0,r1=0,r2=0;
+    [unroll]for(uint i=0;i<8;++i){uint row=U16(ids,i)*3;float w=float(U16(weights,i))/65535.0;
+        r0+=CanonicalRows[row]*w;r1+=CanonicalRows[row+1]*w;r2+=CanonicalRows[row+2]*w;
+    }
+    float4 t=Decode(RestVectors.Load(vertex*8)),n=Decode(RestVectors.Load(vertex*8+4));
+    float handedScale=PositionScale<0?-1.0:1.0;
+    float3 st=Unit(float3(dot(r0.xyz,t.xyz),dot(r1.xyz,t.xyz),dot(r2.xyz,t.xyz)))*handedScale;
+    float3 sn=Unit(float3(dot(r0.xyz,n.xyz),dot(r1.xyz,n.xyz),dot(r2.xyz,n.xyz)))*handedScale;
+    uint target=(OutputFirstVertex+id.x)*2;
+    SkinnedVectors[target]=float4(st,t.w);
+    SkinnedVectors[target+1]=float4(sn,n.w*handedScale);
+}
