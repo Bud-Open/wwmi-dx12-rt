@@ -55,6 +55,21 @@
 
 > **兼容范围声明**：本项目采用 100% 通用渲染架构（无任何单角色/单皮肤硬编码），但受限于人力，**目前我们仅实机测试过以下皮肤**（测试环境：DX12 + 硬件光线追踪 + 4K UHD `-krqlv=uhd`，按需共用唯一一份 `RabbitFX`，覆盖 `WWMI 1.1.0` 与 `WWMI 1.2.2`），**无法保证社区所有皮肤均 100% 正常**。
 
+#### 实测参考环境与启动命令行（Linux / Proton）
+
+- **系统 / 显卡 / 驱动**：CachyOS Linux，NVIDIA GeForce RTX 5090 D（驱动 `620.70.06`）
+- **兼容层**：`dwproton-11.0-16-x86_64` + `Steam Linux Runtime 4.0`
+- **参考启动命令行 / Steam 启动选项**（DX12 + 硬件光追 + 4K UHD + 中文路径 UTF-8 护航 + 可选 NVIDIA DLSS 多帧生成）：
+  ```bash
+  SteamOS=1 PROTON_ENABLE_NGX_UPDATER=1 \
+  DXVK_NVAPI_DRS_SETTINGS="NGX_DLSS_FG_OVERRIDE=on,NGX_DLSSG_MODE=dynamic,NGX_DLSSG_DYNAMIC_TARGET_FRAME_RATE=240,NGX_DLSSG_DYNAMIC_MULTI_FRAME_COUNT_MAX=5" \
+  WINEDLLOVERRIDES="dxgi=n,b" HOST_LC_ALL=C.UTF-8 \
+  LD_PRELOAD="/path/to/WWMI-DX12-RT/lib/wine-filename-utf8.so" \
+  %command% -krqlv=uhd
+  ```
+  - 加载 Mod 必需：`WINEDLLOVERRIDES="dxgi=n,b"`（含中文/非 ASCII 文件夹名皮肤时加上 `HOST_LC_ALL=C.UTF-8` 与 `LD_PRELOAD=...`）。
+  - 可选项：`PROTON_ENABLE_NGX_UPDATER=1` 与 `DXVK_NVAPI_DRS_SETTINGS=...` 为 NVIDIA 动态多帧生成参考配置（按需删改）；若客户端安装的是 HD 包则去掉 `-krqlv=uhd`。
+
 当前已实测运行正常的皮肤：
 - `Chisa Shrine Maiden NSFW`
 - `Hiyuki - Mist of Morning Glory`

@@ -57,6 +57,21 @@ Before installing, make sure you have:
 
 > **Disclaimer**: Our runtime architecture is completely generic (zero per-character or per-skin hardcoding), **however we have only directly tested the community skins listed below** (under DX12 + Hardware Ray Tracing + 4K UHD `-krqlv=uhd`, alongside a single shared `RabbitFX` where required, on both `WWMI 1.1.0` and `WWMI 1.2.2`). We **cannot guarantee** that every community mod works out of the box.
 
+#### Reference Tested Environment (Linux / Proton)
+
+- **OS / GPU / Driver**: CachyOS Linux, NVIDIA GeForce RTX 5090 D (driver `620.70.06`)
+- **Compatibility Layer**: `dwproton-11.0-16-x86_64` + `Steam Linux Runtime 4.0`
+- **Reference Launch Command / Steam Launch Options** (DX12 + Hardware RT + 4K UHD + UTF-8 mod path guard + optional NVIDIA DLSS Multi-Frame Generation):
+  ```bash
+  SteamOS=1 PROTON_ENABLE_NGX_UPDATER=1 \
+  DXVK_NVAPI_DRS_SETTINGS="NGX_DLSS_FG_OVERRIDE=on,NGX_DLSSG_MODE=dynamic,NGX_DLSSG_DYNAMIC_TARGET_FRAME_RATE=240,NGX_DLSSG_DYNAMIC_MULTI_FRAME_COUNT_MAX=5" \
+  WINEDLLOVERRIDES="dxgi=n,b" HOST_LC_ALL=C.UTF-8 \
+  LD_PRELOAD="/path/to/WWMI-DX12-RT/lib/wine-filename-utf8.so" \
+  %command% -krqlv=uhd
+  ```
+  - Required for mod loading: `WINEDLLOVERRIDES="dxgi=n,b"` (plus `HOST_LC_ALL=C.UTF-8` and `LD_PRELOAD=...` if you have non-ASCII mod folder names).
+  - Optional (NVIDIA RTX 50 / DLSS-G users): `PROTON_ENABLE_NGX_UPDATER=1` and `DXVK_NVAPI_DRS_SETTINGS=...` (omit if not using dynamic multi-frame generation; omit `-krqlv=uhd` if your client uses the HD pack).
+
 Verified working in our test environment:
 - `Chisa Shrine Maiden NSFW`
 - `Hiyuki - Mist of Morning Glory`
