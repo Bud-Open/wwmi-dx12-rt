@@ -19,7 +19,7 @@ import zipfile
 from pathlib import Path
 
 from bootstrap_deps import (
-    DXC_COMMIT, DXC_RELEASE_URL, DXC_URL, MIGOTO_COMMIT, MIGOTO_URL, PINNED_GIT, git_output,
+    DXC_COMMIT, DXC_RELEASE_URL, DXC_URL, PINNED_GIT, git_output,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -185,8 +185,6 @@ def build_provenance(manifest: dict | None) -> dict:
         "working_tree_dirty": dirty,
         "upstreams": [
             *({"name": name, "url": url, "commit": sha} for name, url, sha in PINNED_GIT),
-            {"name": "3Dmigoto", "url": MIGOTO_URL, "commit": MIGOTO_COMMIT,
-             "via": "wwmi-dx12/third_party/3Dmigoto"},
             {"name": "DirectXShaderCompiler", "url": DXC_URL, "commit": DXC_COMMIT,
              "release_asset": DXC_RELEASE_URL},
         ],

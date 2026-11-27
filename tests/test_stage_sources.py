@@ -25,11 +25,19 @@ class TestStageSources(unittest.TestCase):
         header.parent.mkdir(parents=True)
         header.touch()
         (up / "wwmi-dx12/reshade_addon").mkdir(parents=True)
-        (up / "wwmi-dx12/third_party/3Dmigoto/DirectX11").mkdir(parents=True)
+        legacy = up / "wwmi-dx12/third_party/3Dmigoto/DirectX11"
+        legacy.mkdir(parents=True)
+        (legacy / "CommandList.cpp").touch()
+        with self.assertRaisesRegex(FileNotFoundError, r"Missing upstream 3Dmigoto.*bootstrap_deps\.py"):
+            stage_sources.stage_all(r, up, staged)
+
+        migoto = up / "3Dmigoto/DirectX11"
+        migoto.mkdir(parents=True)
         names = re.search(r"tdm_subset = \((.*?)\n    \)", SCRIPT.read_text(encoding="utf-8"), re.S)
         self.assertIsNotNone(names)
         for name in re.findall(r'"([^"]+)"', names[1]):
-            (up / "wwmi-dx12/third_party/3Dmigoto/DirectX11" / name).touch()
+            (migoto / name).touch()
+        (migoto / "CommandList.cpp").write_text("standalone", encoding="utf-8")
 
         overlay = r / "source/host"
         overlay.mkdir(parents=True)
@@ -38,6 +46,7 @@ class TestStageSources(unittest.TestCase):
         fake_home = root / "home"
         with patch.object(Path, "home", return_value=fake_home):
             stage_sources.stage_all(r, up, staged)
+            self.assertEqual((staged / "3dm_src/CommandList.cpp").read_text(encoding="utf-8"), "standalone")
             live = staged / "reshade"
             keep = live / "keep.cpp"
             before = keep.stat().st_mtime_ns

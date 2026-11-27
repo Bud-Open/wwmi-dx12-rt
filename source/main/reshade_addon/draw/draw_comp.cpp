@@ -289,9 +289,12 @@ static void PublishDrawShaders(reshade::api::command_list* cmd_list, uint64_t vs
     if (!g_publish_shader_state) return;
     uint64_t ps_hash = 0;
     cmd_list->get_private_data(s_iid_ps_hash, &ps_hash);
+    const uint64_t vs = AliasShaderHash(vs_hash);
     const uint64_t ps = AliasShaderHash(ps_hash);
-    PortApi::SetBoundShader('v', AliasShaderHash(vs_hash));
+    PortApi::SetBoundShader('v', vs);
     PortApi::SetBoundShader('p', ps);
+    const DxilSrvRegs ps_regs = PipelineSrvRegs(CmdGfx(cmd_list).gfx_pso, 'p');
+    PortApi::SetPixelShaderTextures(ps, ps_regs.lo, ps_regs.hi, ps_regs.parsed && !ps_regs.unbounded, ps_regs.kind);
     if (!g_rfx_patch || !ps || PortApi::ShaderRegexLinked(ps) || !PortApi::ShaderRegexGroupLoaded(kRfxNamespace, kRfxRegexGroup)) return;
     unsigned ps_max = 0;
     bool     has_glow = false;
@@ -483,10 +486,11 @@ static uint16_t PublishSectionTextures(reshade::api::command_list* cmd_list, int
     uint64_t          ps_hash = 0;
     cmd_list->get_private_data(s_iid_ps_hash, &ps_hash);
     const uint64_t pass = TexLookPlaceOf(g_geomods[dm].wcl_ns.c_str(), comp, ps_hash);
-    const bool     every_slot = g_geomods[dm].mod.queries_ps_slots;
+    const bool queries_slots = g_geomods[dm].mod.queries_ps_slots;
+    const bool publish_all = queries_slots || PortApi::HasLoadedFilters();
     // A section can inspect ps-t1->Format to choose what it writes to t0.
     // The pixel shader need not sample t1 for that INI condition to be live.
-    const bool query_bound = every_slot && RtHasPrivateSection();
+    const bool query_bound = queries_slots && RtHasPrivateSection();
     unsigned sampled_formats[kSectionTexRegs]{};
     ForEachPsTexture(cmd_list, g_debug || query_bound, ps_regs, [](unsigned) { return true; }, [&](const PsTexture& t) {
         const unsigned    r = t.reg;
@@ -507,9 +511,9 @@ static uint16_t PublishSectionTextures(reshade::api::command_list* cmd_list, int
             ? resident
             : TexLodTargetOf(resident);
         const bool known = hash && PortApi::TextureHashHasSections(hash);
-        if (!known && !(every_slot && read)) return;
+        if (!known && !(publish_all && read)) return;
         if (read) {
-            const unsigned fmt = every_slot ? unsigned(PublishedViewFormat({ts.heap,ts.base+t.offset})) : 0u;
+            const unsigned fmt = publish_all ? unsigned(PublishedViewFormat({ts.heap,ts.base+t.offset})) : 0u;
             if(query_bound && !ri.is_buffer && !ri.swapped)sampled_formats[r]=fmt;
             PortApi::PushGameTexture('p', r, ri.res, known ? hash : resident, fmt);
             pushed |= (uint16_t)(1u << r);
@@ -539,7 +543,7 @@ static uint16_t PublishSectionTextures(reshade::api::command_list* cmd_list, int
     },query_bound);
     if(query_bound && ps_regs.parsed)
         RtCarryPrivatePsFormats(CmdGen(cmd_list),unsigned(PipelinePsReadMask(CmdGfx(cmd_list).gfx_pso)),sampled_formats,kSectionTexRegs);
-    if (every_slot && !query_bound) pushed |= PublishCarriedTextures(cmd_list, dm, comp, ps_regs, pushed, ps_hash);
+    if (queries_slots && !query_bound) pushed |= PublishCarriedTextures(cmd_list, dm, comp, ps_regs, pushed, ps_hash);
     return pushed;
 }
 

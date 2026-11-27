@@ -134,7 +134,9 @@ def main() -> int:
     args = ap.parse_args()
 
     upstream = args.upstream_root.resolve()
-    if not (upstream / "reshade/include/reshade.hpp").is_file() or not (upstream / "wwmi-dx12/reshade_addon").is_dir():
+    if (not (upstream / "reshade/include/reshade.hpp").is_file()
+            or not (upstream / "wwmi-dx12/reshade_addon").is_dir()
+            or not (upstream / "3Dmigoto/DirectX11/CommandList.cpp").is_file()):
         print(
             f"ERROR: Missing upstream dependencies under {upstream}.\n"
             f"Run `python3 scripts/bootstrap_deps.py` first to populate third_party/.",

@@ -6,7 +6,7 @@ with ZERO dependency on legacy local build trees.
 Pinned baselines:
   - crosire/reshade          @ 05c95f4ac083d1c4c1ab846ffe65bf4b775d3bf9 (BSD-3-Clause)
   - lekarsenten/wwmi-dx12    @ ec837ef8ab798b7c251105a7448efeceb526a2c9 (GPL-3.0)
-    + SpectrumQT/3Dmigoto    @ a7847eae (submodule, GPL-3.0)
+  - SpectrumQT/3Dmigoto      @ 8bd31f74727f033b3d9049509e19da3563c8b98c (v1.3.3, GPL-3.0)
   - DirectXShaderCompiler    @ v1.8.2502 (dxc_2025_02_20.zip -> dxcompiler.dll, dxil.dll, dxc.exe)
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ WWMI_DX12_URL = "https://github.com/lekarsenten/wwmi-dx12.git"
 WWMI_DX12_COMMIT = "ec837ef8ab798b7c251105a7448efeceb526a2c9"
 
 MIGOTO_URL = "https://github.com/SpectrumQT/3Dmigoto.git"
-MIGOTO_COMMIT = "a7847eae82aaac32175c9a7d199673d5c9323bcd"
+MIGOTO_COMMIT = "8bd31f74727f033b3d9049509e19da3563c8b98c"
 DXC_URL = "https://github.com/microsoft/DirectXShaderCompiler.git"
 DXC_COMMIT = "b4711839eb9a87da7c3436d9b212e0492359fbbd"
 DXC_RELEASE_URL = (
@@ -44,6 +44,7 @@ DXC_FILES = ("dxcompiler.dll", "dxil.dll", "dxc.exe")
 PINNED_GIT = (
     ("reshade", RESHADE_URL, RESHADE_COMMIT),
     ("wwmi-dx12", WWMI_DX12_URL, WWMI_DX12_COMMIT),
+    ("3Dmigoto", MIGOTO_URL, MIGOTO_COMMIT),
 )
 
 
@@ -161,12 +162,13 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="Print actions without performing network/disk writes")
     ap.add_argument("--seed-reshade", type=Path, help="Optional local ReShade baseline directory for offline builds")
     ap.add_argument("--seed-wwmi", type=Path, help="Optional local wwmi-dx12 baseline directory for offline builds")
+    ap.add_argument("--seed-migoto", type=Path, help="Optional local 3Dmigoto v1.3.3 checkout for offline builds")
     ap.add_argument("--seed-dxc", type=Path, help="Local DXC seed: dxcompiler.dll, dxil.dll, and dxc.exe on Windows")
     args = ap.parse_args()
 
     print(f"Target third_party root: {THIRD_PARTY}")
     archive = Archive("wwmi-incomplete-deps")
-    for (name, url, commit), seed in zip(PINNED_GIT, (args.seed_reshade, args.seed_wwmi)):
+    for (name, url, commit), seed in zip(PINNED_GIT, (args.seed_reshade, args.seed_wwmi, args.seed_migoto)):
         fetch_pinned_git(name, url, commit, args.dry_run, archive, seed)
     fetch_dxc(args.dry_run, archive, args.seed_dxc)
 

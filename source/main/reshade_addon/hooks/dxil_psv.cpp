@@ -93,13 +93,20 @@ static bool DxilShaderBindingRegs(const void* code, size_t size, DxilSrvRegs& ou
                 out.unbounded = true;
                 continue;
             }
+            uint8_t resolved_kind = (uint8_t)(kind > 255 ? 0 : kind);
+            if (resolved_kind == 0) {
+                if (type == 4)
+                    resolved_kind = 11; // SRVRaw -> RawBuffer
+                else if (type == 5)
+                    resolved_kind = 12; // SRVStructured -> StructuredBuffer
+            }
             for (uint32_t t = lo; t <= hi && t < 128; ++t) {
                 if (strict && out.has(t)) return false;
                 if (t < 64)
                     out.lo |= (1ull << t);
                 else
                     out.hi |= (1ull << (t - 64));
-                out.kind[t] = (uint8_t)(kind > 255 ? 0 : kind);
+                out.kind[t] = resolved_kind;
             }
         }
         out.parsed = true;

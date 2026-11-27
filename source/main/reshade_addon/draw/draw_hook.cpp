@@ -6,6 +6,8 @@
 #include "../mods/claim_state.h"
 #include "../mods/skeleton.h"
 #include "../mods/layout_registry.h"
+#include "../hooks/pipeline_hooks.h"
+#include "../mods/shader_alias.h"
 #include "draw_ctx.h"
 #include "draw_parts.h"
 #include "../instrumentation/hot_path.h"
@@ -22,6 +24,7 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
 {
     PROF(PROF_DrawIndexed);
     if (g_faulted || !g_is_dx12) return false;
+    PortApi::NextDrawCall();
     if (g_addon_disabled)
         return RtTryGpuSkinDraw(cmd_list,index_count,instance_count,first_index,vertex_offset,first_instance);
     MigotoPort::FrameAnalysisDrawScope fa_scope;
@@ -72,6 +75,19 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
             PortApi::RunPendingPost();
         }
     } post_after_draw;
+    if (g_shader_override_dispatch && g_publish_shader_state) {
+        uint64_t ps_h = 0;
+        uint64_t gs_h = 0;
+        cmd_list->get_private_data(s_iid_ps_hash, &ps_h);
+        cmd_list->get_private_data(s_iid_gs_hash, &gs_h);
+        const uint64_t vs_ini = AliasShaderHash(vs_hash);
+        const uint64_t ps_ini = AliasShaderHash(ps_h);
+        const uint64_t gs_ini = AliasShaderHash(gs_h);
+        if (ps_ini && (PortApi::ShaderOverrideMatches(vs_ini) || PortApi::ShaderOverrideMatches(ps_ini) || PortApi::ShaderOverrideMatches(gs_ini))) {
+            const DxilSrvRegs ps_regs = PipelineSrvRegs(CmdGfx(cmd_list).gfx_pso, 'p');
+            PortApi::SetPixelShaderTextures(ps_ini, ps_regs.lo, ps_regs.hi, ps_regs.parsed && !ps_regs.unbounded, ps_regs.kind);
+        }
+    }
     if (RunDrawShaderOverrides(args)) return true;
 
     DrawClaim claim;

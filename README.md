@@ -18,6 +18,7 @@ Built on [`lekarsenten/wwmi-dx12`](https://github.com/lekarsenten/wwmi-dx12) (`G
 
 - **Native DX12 + Hardware Ray Tracing + Frame Generation**: Character mods render cleanly across hybrid raster passes and DXR ray-traced reflections/GI while keeping DLSS Frame Generation and 4K UHD intact—no downgrade to HD and no fallback to DX11.
 - **Compatible with Existing WWMI Mods**: Directly loads standard `WWMI` trees (`d3dx.ini`, `Core/WWMI/`, `Mods/RabbitFX/`, `Mods/*/`, and nested mod collections managed by `XXMI Launcher` or `IMM`) without converting mod files.
+- **Native texture filters (A23, on by default)**: 3Dmigoto v1.3.3 `[Filter]` / `dHash` matching and WWMI 1.2.2 Core's `Helpers.ini` `ps->srv_*` queries work in both DX12 Raster and DX12 RT.
 - **Live Controls That Actually Work in RT Mode**:
   - **`F10`**: Hot-reload all mods and `.ini` files in-game without restarting.
   - **`F6`**: Live toggle between modded and vanilla rendering across both hybrid raster and DXR reflections.
@@ -148,7 +149,7 @@ Download the latest portable archive from **[GitHub Releases](https://github.com
   - **Important**: WWMI-DX12-RT requires its paired `dxgi.dll` (`ReShade64-game-forward.dll`) to expose DX12+RT hooks—never swap it for stock ReShade `dxgi.dll`.
   - To load third-party ReShade add-ons (such as RenoDX) alongside WWMI-DX12-RT, either copy their `*.addon64` files into `<ExternalFolder>/reshade-addons/`, or set `LoadGameDirAddons=1` (or `ExtraAddonPaths=<dir1>,<dir2>`) under `[ADDON]` in `<ExternalFolder>/ReShade.ini` (UTF-8). Custom settings in `<ExternalFolder>/ReShade.ini` are preserved on upgrades. If mods fail during gameplay, temporarily disable third-party add-ons to rule out hook conflicts.
 - **WWMI Core version compatibility (`1.1.0` & `1.2.2+`)**
-  - Both legacy `WWMI 1.1.0` and newer `WWMI 1.2.2+` core packages work out of the box. The DX11-only `XXMI DLL v1.3.3+` dHash banner is suppressed automatically (not applicable to DX12-RT), while genuine mod version warnings remain dismissible with **`X`**.
+  - Both legacy `WWMI 1.1.0` and newer `WWMI 1.2.2+` core packages work out of the box. Native texture filters replace the DX11-only `XXMI DLL v1.3.3+` requirement in DX12, while genuine mod version warnings remain dismissible with **`X`**.
 - **Legacy Hash Mod textures mis-match on 4K UHD (`-krqlv=uhd`)**
   - Route 3 automatically learns and caches matches online; for stubborn legacy mods, use the offline hash-free migrator and seed tools documented in [`tools/README.md`](./tools/README.md).
 - **Where are runtime logs and caches stored?**

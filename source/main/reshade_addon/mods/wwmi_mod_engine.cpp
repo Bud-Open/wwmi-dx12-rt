@@ -109,6 +109,10 @@ bool IsIniParam(const wchar_t* k)
 bool QueriesPsSlot(const wchar_t* line)
 {
     if (!line) return false;
+    for (const wchar_t* p = line; *p; ++p) {
+        if (!_wcsnicmp(p, L"ps->srv_", 8) || !_wcsnicmp(p, L"IterateTextureSlots", 19)) return true;
+        if (AfterPsSlot(p) && p[4] == L'[') return true;
+    }
     while (*line == L' ' || *line == L'\t') ++line;
     if (!_wcsnicmp(line, L"if ", 3) || !_wcsnicmp(line, L"elif ", 5) || !_wcsnicmp(line, L"else if ", 8))
         return NamesPsSlot(line, false);
@@ -463,6 +467,11 @@ int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
         [](const wchar_t* fq, void* user) {
             bool* hit = (bool*)user;
             if (*hit) return;
+            // The parser puts the section prefix before the namespace: Filter\<ns>\<suffix>.
+            if (_wcsnicmp(fq, L"Filter", 6) == 0) {
+                *hit = true;
+                return;
+            }
             PortApi::ForEachSectionLine(
                 fq,
                 [](const wchar_t* line, void* u) {

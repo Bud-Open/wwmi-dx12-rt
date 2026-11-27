@@ -11,7 +11,7 @@ option(WWMI_BUILD_RUNTIME   "Build ReShade host + wwmi_dx12 + zz_wwmi_rt_pack wh
 option(WWMI_BUILD_LINUX_UTF8_PRELOAD "Build Linux Wine UTF-8 filename locale shim (.so)" ON)
 
 set(WWMI_UPSTREAM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party" CACHE PATH
-    "Path to fetched upstream ReShade / wwmi-dx12 / dxc dependencies (populated via scripts/bootstrap_deps.py)")
+    "Path to fetched upstream ReShade / wwmi-dx12 / 3Dmigoto / dxc dependencies (populated via scripts/bootstrap_deps.py)")
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
@@ -74,7 +74,8 @@ endif()
 # ---------------------------------------------------------------------------
 if(WIN32 AND WWMI_BUILD_RUNTIME
    AND EXISTS "${WWMI_UPSTREAM_ROOT}/reshade/include/reshade.hpp"
-   AND EXISTS "${WWMI_UPSTREAM_ROOT}/wwmi-dx12/reshade_addon")
+   AND EXISTS "${WWMI_UPSTREAM_ROOT}/wwmi-dx12/reshade_addon"
+   AND EXISTS "${WWMI_UPSTREAM_ROOT}/3Dmigoto/DirectX11/CommandList.cpp")
 
     set(_WWMI_STAGE_DIR "${CMAKE_BINARY_DIR}/_staged")
     # Add/remove and content edits in either overlay regenerate CMake before
@@ -103,6 +104,7 @@ if(WIN32 AND WWMI_BUILD_RUNTIME
     set(_STAGED_RESHADE "${_WWMI_STAGE_DIR}/reshade")
     set(_STAGED_WWMI    "${_WWMI_STAGE_DIR}/wwmi-dx12")
     set(_STAGED_3DM     "${_WWMI_STAGE_DIR}/3dm_src")
+    set(_MIGOTO_DIRECTXTK "${WWMI_UPSTREAM_ROOT}/3Dmigoto/DirectXTK")
     set(_SHARED_INC     "${CMAKE_CURRENT_SOURCE_DIR}/source/include")
 
     # ---- 3A. Paired ReShade Host (ReShade64.dll) ----
@@ -171,9 +173,9 @@ if(WIN32 AND WWMI_BUILD_RUNTIME
 
     add_library(migoto_engine STATIC
         ${_MIGOTO_ENGINE_SRCS}
-        "${_STAGED_WWMI}/third_party/3Dmigoto/DirectXTK/Src/DDSTextureLoader.cpp"
-        "${_STAGED_WWMI}/third_party/3Dmigoto/DirectXTK/Src/WICTextureLoader.cpp"
-        "${_STAGED_WWMI}/third_party/3Dmigoto/DirectXTK/Src/ScreenGrab.cpp"
+        "${_MIGOTO_DIRECTXTK}/Src/DDSTextureLoader.cpp"
+        "${_MIGOTO_DIRECTXTK}/Src/WICTextureLoader.cpp"
+        "${_MIGOTO_DIRECTXTK}/Src/ScreenGrab.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/source/client/crc32c.cpp"
     )
     set_target_properties(migoto_engine PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
@@ -194,8 +196,8 @@ if(WIN32 AND WWMI_BUILD_RUNTIME
         "${_STAGED_WWMI}/third_party/3Dmigoto"
         "${_STAGED_WWMI}/third_party/3Dmigoto/HLSLDecompiler"
         "${_STAGED_WWMI}/third_party/3Dmigoto/D3D_Shaders"
-        "${_STAGED_WWMI}/third_party/3Dmigoto/DirectXTK/Inc"
-        "${_STAGED_WWMI}/third_party/3Dmigoto/DirectXTK/Src"
+        "${_MIGOTO_DIRECTXTK}/Inc"
+        "${_MIGOTO_DIRECTXTK}/Src"
         "${_STAGED_WWMI}/third_party/3Dmigoto/crc32c-hw-1.0.5/include"
         "${_STAGED_WWMI}/third_party/3Dmigoto/crc32c-hw-1.0.5/src"
         "${_STAGED_WWMI}/third_party/3Dmigoto/pcre2"
@@ -255,6 +257,8 @@ if(WIN32 AND WWMI_BUILD_RUNTIME
         "${_STAGED_WWMI}/reshade_addon/textures/texture_module.cpp"
         "${_STAGED_WWMI}/reshade_addon/textures/tex_lod.cpp"
         "${_STAGED_WWMI}/reshade_addon/textures/tex_look.cpp"
+        "${_STAGED_WWMI}/reshade_addon/textures/tex_dhash.cpp"
+        "${_STAGED_WWMI}/reshade_addon/textures/tex_dhash_table.cpp"
         "${_STAGED_WWMI}/reshade_addon/textures/tex_crawl.cpp"
         "${_STAGED_WWMI}/reshade_addon/textures/tex_defer.cpp"
         "${_STAGED_WWMI}/reshade_addon/textures/tex_replace.cpp"

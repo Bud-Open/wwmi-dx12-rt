@@ -522,3 +522,4 @@ EXPORTS
 	WWMI_DescriptorCopyInvokeTimed_v1 @607
 	WWMI_ModUiSetShieldRects_v1 @610
 	WWMI_ModUiSetInputBypass_v1 @611
+	WWMI_CurrentUploadFootprint_v1 @612

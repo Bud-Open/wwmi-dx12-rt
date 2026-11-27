@@ -1,4 +1,5 @@
 // port_api: their override sections and command lists, run for a draw the addon hands in.
+#include "lock.h"
 #include "port_api_internal.h"
 #include "globals.h"
 #include "IniHandler.h"
@@ -60,6 +61,7 @@ bool ReplayExpr(const CommandListEvaluatable* e, std::vector<const float*>& vars
             vars.push_back(o->var_ftarget);
             return true;
         }
+        // RESOURCE_FILTER (@Filter) is deliberately outside this allowlist.
         if (o->type != ParamOverrideType::TEXTURE) return false;
         const ResourceCopyTarget& t = o->texture_filter_target;
         if (t.type != ResourceCopyTargetType::CUSTOM_RESOURCE || t.custom_resource_pool ||
@@ -81,6 +83,12 @@ bool ReplayList(CommandList* cl, bool post, std::vector<const float*>& vars, std
     for (const auto& cmd : cl->commands) {
         CommandListCommand* c = MigotoPort::UnwrapObserved(cmd.get());
         if (c == cmd.get()) return false;
+        if (const auto* copy = dynamic_cast<const ResourceCopyOperation*>(c)) {
+            if (copy->dst.slot_filter || copy->src.slot_filter) return false;
+        }
+        if (dynamic_cast<const ResourceFilterCopyOperation*>(c) ||
+            dynamic_cast<const SnapshotInitialTexturesOperation*>(c) ||
+            dynamic_cast<const RestoreInitialTexturesOperation*>(c)) return false;
         auto* ic = dynamic_cast<IfCommand*>(c);
         if (!ic) continue;
         if (!ic->expression.evaluatable || !ReplayExpr(ic->expression.evaluatable.get(), vars, ress)) return false;
@@ -427,6 +435,7 @@ void RegisterShaderHash(uint64_t ini_hash)
     if (it != ShaderTokens().end()) return; // already registered: no write, no rehash
     uint64_t& slot = ShaderTokens()[ini_hash];
     slot = ini_hash; // content is for debugging; the ADDRESS is the key
+    CriticalSectionGuard(&G->mCriticalSection);
     G->mShaders[reinterpret_cast<ID3D11DeviceChild*>(&slot)] = ini_hash;
 }
 
@@ -437,9 +446,12 @@ void SetBoundShader(char stage, uint64_t ini_hash)
     ID3D11DeviceChild* handle = nullptr;
     if (ini_hash) {
         std::lock_guard<std::mutex> lk(g_shader_state_mutex);
-        auto                        it = ShaderTokens().find(ini_hash);
-        if (it != ShaderTokens().end())
-            handle = reinterpret_cast<ID3D11DeviceChild*>(&it->second);
+        auto [it, inserted] = ShaderTokens().emplace(ini_hash, ini_hash);
+        if (inserted) {
+            CriticalSectionGuard(&G->mCriticalSection);
+            G->mShaders[reinterpret_cast<ID3D11DeviceChild*>(&it->second)] = ini_hash;
+        }
+        handle = reinterpret_cast<ID3D11DeviceChild*>(&it->second);
     }
 
     switch (stage) {
@@ -513,11 +525,16 @@ float BoundShaderFilter(char stage, uint64_t* out_hash, int* out_have_handle, in
     if (out_have_handle) *out_have_handle = 1;
 
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    ShaderMap::iterator                   si = G->mShaders.find(handle);
-    if (si == G->mShaders.end()) return 0.0f;
+    uint64_t                              shader_hash = 0;
+    {
+        CriticalSectionGuard(&G->mCriticalSection);
+        ShaderMap::iterator si = G->mShaders.find(handle);
+        if (si == G->mShaders.end()) return 0.0f;
+        shader_hash = si->second;
+    }
     if (out_in_mshaders) *out_in_mshaders = 1;
 
-    ShaderOverrideMap::iterator ov = lookup_shaderoverride(si->second);
+    ShaderOverrideMap::iterator ov = lookup_shaderoverride(shader_hash);
     if (ov == G->mShaderOverrideMap.end()) return 0.0f;
     if (ov->second.filter_index != FLT_MAX) return ov->second.filter_index;
     return 1.0f; // matched, but the section declares no filter_index

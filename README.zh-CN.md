@@ -18,6 +18,7 @@
 
 - **原生 DX12 + 硬件光追 + 多帧生成全兼容**：开启游戏内光线追踪反射 / 全局光照与 DLSS 帧生成时，角色皮肤 Mod 同时正常参与混合光栅渲染与 DXR 光追反射，不降画质、不退回 DX11。
 - **兼容现有 WWMI 社区 Mod 生态**：直接读取标准 `WWMI` 目录（`d3dx.ini`、`Core/WWMI/`、`Mods/RabbitFX/`、`Mods/*/` 及 `XXMI Launcher` / `IMM` 嵌套管理的皮肤包），无需转换 Mod 文件。
+- **原生贴图过滤（A23，默认开启）**：DX12 光栅和 DX12 光追模式均支持 3Dmigoto v1.3.3 的 `[Filter]` / `dHash` 匹配，以及 WWMI 1.2.2 Core 的 `Helpers.ini` 中的 `ps->srv_*` 查询。
 - **光追模式全功能实时控制**：
   - **`F10`**：游戏内在线热重载全部 Mod 与 `.ini` 配置（无需重启游戏）。
   - **`F6`**：实时开启 / 关闭 Mod 渲染（同时覆盖混合光栅与 DXR 光追反射，秒切对比原版）。
@@ -146,7 +147,7 @@
   - **注意**：WWMI-DX12-RT 必须使用本包配对的 `dxgi.dll`（`ReShade64-game-forward.dll`）才能提供 DX12+RT 挂钩，切勿替换为原版 ReShade `dxgi.dll`。
   - 如需同时加载 RenoDX 等第三方 ReShade 插件，可将对应 `*.addon64` 复制到 `<外部目录>/reshade-addons/`，或在 `<外部目录>/ReShade.ini`（UTF-8）的 `[ADDON]` 下设置 `LoadGameDirAddons=1`（或 `ExtraAddonPaths=<目录1>,<目录2>`）；后续升级重装会自动保留你的外部 `ReShade.ini` 自定义项。若游戏内 Mod 异常，请先临时停用第三方插件排查冲突。
 - **WWMI 核心版本兼容（`1.1.0` 与 `1.2.2+`）**
-  - 同时兼容旧版 `WWMI 1.1.0` 与新版 `WWMI 1.2.2+` 核心包：自动屏蔽仅面向 DX11 XXMI DLL 的 `v1.3.3+` dHash 误报提示，同时放行 **`X`** 键正常关闭真实 Mod 提示框。
+  - 同时兼容旧版 `WWMI 1.1.0` 与新版 `WWMI 1.2.2+` 核心包：DX12 原生贴图过滤无需 DX11 XXMI DLL `v1.3.3+`，仍可通过 **`X`** 键正常关闭真实 Mod 提示框。
 - **部分老旧 Hash Mod 在 4K UHD（`-krqlv=uhd`）下贴图错位**
   - 运行时 Route 3 会自动学习并缓存；若需批量转为跨画质、跨补丁的 Hash-Free 格式，可使用 [`tools/README.md`](./tools/README.md) 中的离线迁移与种子管理工具。
 - **日志与缓存在哪里？**

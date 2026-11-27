@@ -203,6 +203,8 @@ static void RtBridgePsFilterForActiveSection(){
     uint64_t ps_hash=0;
     list->get_private_data(s_iid_ps_hash,&ps_hash);
     if(!gs.gfx_pso&&!ps_hash)return;
+    const DxilSrvRegs ps_regs=PipelineSrvRegs(gs.gfx_pso,'p');
+    const bool ps_known=ps_regs.parsed&&!ps_regs.unbounded;
 
     struct Decision { uint64_t dx11_so=0; float filter_index=0.f; };
     const auto dkey=std::make_tuple(ctx.mod,comp,gs.gfx_pso,ps_hash,rt.rtv_count);
@@ -216,13 +218,12 @@ static void RtBridgePsFilterForActiveSection(){
             if(it->second.dx11_so){
                 PortApi::RegisterShaderHash(it->second.dx11_so);
                 PortApi::SetBoundShader('p',it->second.dx11_so);
+                PortApi::SetPixelShaderTextures(it->second.dx11_so,ps_regs.lo,ps_regs.hi,ps_known,ps_regs.kind);
             }
             return;
         }
     }
 
-    const DxilSrvRegs ps_regs=PipelineSrvRegs(gs.gfx_pso,'p');
-    const bool ps_known=ps_regs.parsed&&!ps_regs.unbounded;
     const unsigned ps_decl=ps_regs.lo;
     unsigned live_vfmt[8]{}, live_w[8]{}, live_h[8]{};
     const uint64_t layh=CmdGfxLayout(list);
@@ -272,6 +273,7 @@ static void RtBridgePsFilterForActiveSection(){
         }
         PortApi::RegisterShaderHash(dx11_so);
         PortApi::SetBoundShader('p',dx11_so);
+        PortApi::SetPixelShaderTextures(dx11_so,ps_regs.lo,ps_regs.hi,ps_known,ps_regs.kind);
     }else if(slots_ready){
         std::lock_guard lk(s_dec_mtx);
         if(s_dec_gen!=load){s_dec_cache.clear();s_dec_gen=load;}

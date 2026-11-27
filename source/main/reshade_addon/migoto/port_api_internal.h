@@ -24,6 +24,11 @@ extern unsigned             g_generation; // bumped on every (re)load
 // Their engine assumes the immediate context's single thread; every call in holds this.
 std::recursive_mutex& EngineLock();
 
+// Native [Filter] bridge (port_publish.cpp).
+unsigned CallNumber();
+void FiltersParsed();
+bool TextureDHash(ID3D12Resource* res, unsigned mip, unsigned view_format, uint64_t* out);
+
 // Parse-time snapshots and indexes (port_parse_index.cpp). Rebuilt after every parse, read lock-free.
 void                                                           RebuildParseSnapshots();
 bool                                                           OverrideHashKnown(uint64_t h);

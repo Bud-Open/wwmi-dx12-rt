@@ -5,6 +5,9 @@
 // ===========================================================================
 #include "descriptor_publish_main.hpp"
 #include "texture_module.h"
+#include "tex_dhash.h"
+#include "tex_dhash_table.h"
+#include "wwmi_upload_footprint.h"
 #include "tex_lod.h"
 #include "../instrumentation/removal_pin.h"
 #include "../config.h"
@@ -1150,6 +1153,7 @@ static void PropagateRuleUpward(uint32_t seed_id, uint32_t rule)
 }
 void TexMipIdentityForget(uint64_t res)
 {
+    g_tex_dhash.Forget(res);
     {
         std::lock_guard l(g_mip_pending_mtx);
         g_mip_pending.erase(res);
@@ -1762,11 +1766,47 @@ void TexHashFromUpload(ID3D12Resource* dest, const uint8_t* src, size_t src_row_
     TexHashFromUploadDesc(dest, dest->GetDesc(), 0, src, src_row_pitch);
 }
 
-bool on_update_texture_region(device*, const subresource_data& data, resource dest, uint32_t dest_subresource, const subresource_box*)
+extern HMODULE g_wwmi_host_module;
+
+static WWMI_CurrentUploadFootprintFn_v1 ResolveUploadFootprintFn() noexcept
 {
-    if (!PassiveTexHashAllowed()) return false;
-    if (dest_subresource == 0 && dest.handle != 0) // mip0 only
-        TexHashFromUpload(reinterpret_cast<ID3D12Resource*>(dest.handle), (const uint8_t*)data.data, data.row_pitch);
+    static std::atomic<WWMI_CurrentUploadFootprintFn_v1> s_fn{ nullptr };
+    static std::atomic<bool> s_tried{ false };
+    if (!s_tried.load(std::memory_order_acquire)) {
+        HMODULE host = g_wwmi_host_module ? g_wwmi_host_module : GetModuleHandleW(L"dxgi.dll");
+        if (host) {
+            auto fn = reinterpret_cast<WWMI_CurrentUploadFootprintFn_v1>(
+                GetProcAddress(host, "WWMI_CurrentUploadFootprint_v1"));
+            s_fn.store(fn, std::memory_order_release);
+            s_tried.store(true, std::memory_order_release);
+        }
+    }
+    return s_fn.load(std::memory_order_acquire);
+}
+
+static bool FullDHashMip(const D3D12_RESOURCE_DESC& d, uint32_t sub, const subresource_box* box)
+{
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || sub >= d.MipLevels) return false;
+    if (!box) return true;
+    const uint32_t w = DHashMipSide(d.Width, sub);
+    const uint32_t h = DHashMipSide(d.Height, sub);
+    const bool bc = texdhash::IsBlockCompressed(uint32_t(d.Format));
+    const uint32_t rw = bc ? ((w + 3u) & ~3u) : w;
+    const uint32_t rh = bc ? ((h + 3u) & ~3u) : h;
+    return box->left == 0 && box->top == 0 && box->front == 0 && box->back == 1 &&
+        (box->right == w || box->right == rw) && (box->bottom == h || box->bottom == rh);
+}
+
+bool on_update_texture_region(device*, const subresource_data& data, resource dest, uint32_t dest_subresource, const subresource_box* dst_box)
+{
+    if (!PassiveTexHashAllowed() || !dest.handle) return false;
+    auto* dst = reinterpret_cast<ID3D12Resource*>(dest.handle);
+    if (FullDHashMip(dst->GetDesc(), dest_subresource, dst_box))
+        g_tex_dhash.FromData(dst, dest_subresource, static_cast<const uint8_t*>(data.data), data.row_pitch);
+    else
+        g_tex_dhash.Unknown(dest.handle, dest_subresource);
+    if (dest_subresource == 0) // legacy content hash is still mip0 only
+        TexHashFromUpload(dst, (const uint8_t*)data.data, data.row_pitch);
     return false;
 }
 
@@ -1883,12 +1923,16 @@ bool on_copy_texture_region(command_list* cl, resource source, uint32_t src_sub,
 {
     PROF(PROF_CopyTexRegion);
     if (!PassiveTexHashAllowed()) return false;
-    if (g_disable_tex || !g_texovr_ready) return false;
     if (!source.handle || !dest.handle || !cl) return false;
     auto*               dst = reinterpret_cast<ID3D12Resource*>(dest.handle);
     auto*               src = reinterpret_cast<ID3D12Resource*>(source.handle);
     D3D12_RESOURCE_DESC dd = dst->GetDesc();
     D3D12_RESOURCE_DESC sd = src->GetDesc();
+    if (FullDHashMip(sd, src_sub, src_box) && FullDHashMip(dd, dest_subresource, dst_box))
+        g_tex_dhash.Copy(source.handle, src_sub, dest.handle, dest_subresource);
+    else
+        g_tex_dhash.Unknown(dest.handle, dest_subresource);
+    if (g_disable_tex || !g_texovr_ready) return false;
     uint32_t            fmt = (uint32_t)dd.Format;
     uint32_t            w = (uint32_t)dd.Width;
     uint32_t            h = dd.Height;
@@ -2250,6 +2294,7 @@ bool on_copy_resource(command_list*, resource source, resource dest)
             return false;
         }
     }
+    if (source.handle && dest.handle) g_tex_dhash.CopyAll(source.handle, dest.handle);
     if (g_texovr_ready && source.handle && dest.handle) { // lineage for whole-resource copies too
         auto*               d = reinterpret_cast<ID3D12Resource*>(dest.handle);
         auto*               s = reinterpret_cast<ID3D12Resource*>(source.handle);
@@ -2336,18 +2381,35 @@ bool on_copy_buffer_to_texture(command_list* cl, resource source, uint64_t sourc
 {
     PROF(PROF_CopyBufToTex);
     if (!PassiveTexHashAllowed()) return false;
-    if (!dest.handle || !cl) return false;
+    if (!dest.handle || !cl || !source.handle) return false;
 
     auto*               dst = reinterpret_cast<ID3D12Resource*>(dest.handle);
+    auto*               srcRes = reinterpret_cast<ID3D12Resource*>(source.handle);
     D3D12_RESOURCE_DESC dd = dst->GetDesc();
+    if (FullDHashMip(dd, dest_subresource, dst_box)) {
+        TexDHashTable::UploadFootprint fp{};
+        const TexDHashTable::UploadFootprint* fp_ptr = nullptr;
+        if (auto fn = ResolveUploadFootprintFn()) {
+            WWMI_D3D12UploadFootprint_v1 raw{};
+            if (fn(reinterpret_cast<uint64_t>(cl), source.handle, dest.handle, dest_subresource, &raw, sizeof(raw))) {
+                fp.row_pitch = raw.row_pitch;
+                fp.footprint_height = raw.footprint_height;
+                fp.src_left = raw.src_left;
+                fp.src_top = raw.src_top;
+                fp.src_front = raw.src_front;
+                fp.has_src_box = raw.has_src_box != 0;
+                fp_ptr = &fp;
+            }
+        }
+        g_tex_dhash.FromUpload(srcRes, source_offset, dst, dest_subresource, fp_ptr);
+    } else
+        g_tex_dhash.Unknown(dest.handle, dest_subresource);
     TexAssetLayout      L;
     if (!TexAssetLayoutOf(dd, dest_subresource, L) || (!L.floor && !IsCutoutResidentTailMip(dd, L, dest_subresource))) return false;
     // a partial upload (an atlas region) is not the texture, and its source holds only the region
     if (dst_box && (dst_box->left || dst_box->top || dst_box->right != L.w || dst_box->bottom != L.h)) return false;
 
-    if (source.handle == 0) return false;
     if (dest_subresource != 0 && !g_mip_exact) return false;
-    auto*                 srcRes = reinterpret_cast<ID3D12Resource*>(source.handle);
     D3D12_HEAP_PROPERTIES hp = {};
     D3D12_HEAP_FLAGS      hf = {};
     srcRes->GetHeapProperties(&hp, &hf);

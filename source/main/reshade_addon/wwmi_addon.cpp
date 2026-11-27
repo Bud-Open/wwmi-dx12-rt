@@ -20,6 +20,7 @@
 #include "instrumentation/device_watch.h" // DredWatchdogStop
 #include "rabbitfx/pso_blend.h"           // RfxPatchWorkerStop
 #include "textures/texture_module.h"      // g_tex_lod_worker
+#include "textures/tex_dhash_table.h"
 #include "textures/tex_crawl.h"
 #include "textures/tex_defer.h"
 #include "textures/tex_gc.h"
@@ -854,6 +855,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE ww
         ::logger::write("ReShade: add-on API %u accepted, not %u -- a ReShade older than 6.8.0, which is not supported",
             g_reshade_api, (unsigned)RESHADE_API_VERSION);
 
+    PortApi::SetTextureDHash(&TexDHashLookup, &TexDHashState);
     g_dx12_debug_layer = GetPrivateProfileIntW(L"wwmi-dx12", L"dx12_debug_layer", 0, ini_path.c_str()) != 0;
     g_addon_ini_path = ini_path;
     g_decensor = GetPrivateProfileIntW(L"wwmi-dx12", L"decensor", 0, ini_path.c_str()) != 0;
@@ -868,6 +870,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE ww
     const int budget_step = (int)GetPrivateProfileIntW(L"wwmi-dx12", L"tex_mod_budget", 1, ini_path.c_str());
     g_tex_mod_budget = budget_step >= 0 && budget_step < kTexBudgetSteps ? budget_step : 1;
     g_tex_distance = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_distance", 0, ini_path.c_str()) != 0;
+    g_tex_dhash_filters = GetPrivateProfileIntW(L"wwmi-dx12", L"texture_filters", 1, ini_path.c_str()) != 0;
+    g_tex_dhash.SetEnabled(g_tex_dhash_filters);
     g_tex_struct_fallback = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_struct_fallback", 1, ini_path.c_str()) != 0;
     {
         char sf_env[16]{};
@@ -878,9 +882,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE ww
     g_tex_watch_ms = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_watch_ms", 2000, ini_path.c_str());
     g_tex_vram_cap_mb = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_vram_cap_mb", 0, ini_path.c_str());
 #endif
-    ::logger::write("Config: decensor=%d hide_uid=%d lod_resemblance=%d lod_cache=%d buffers_in_vram=%d tex_mod_budget=%s tex_distance=%d tex_struct_fallback=%d",
+    ::logger::write("Config: decensor=%d hide_uid=%d lod_resemblance=%d lod_cache=%d buffers_in_vram=%d tex_mod_budget=%s tex_distance=%d tex_struct_fallback=%d texture_filters=%d",
         (int)g_decensor, (int)g_hide_uid, (int)g_texlod_resemblance, (int)g_texlod_cache, (int)MigotoPort::g_buffers_in_vram,
-        TexBudgetName(g_tex_mod_budget), (int)g_tex_distance, (int)g_tex_struct_fallback);
+        TexBudgetName(g_tex_mod_budget), (int)g_tex_distance, (int)g_tex_struct_fallback, (int)g_tex_dhash_filters);
     g_tex_defer.Start();
     if (g_dx12_debug_layer) {
         ID3D12Debug*  dbg = nullptr;

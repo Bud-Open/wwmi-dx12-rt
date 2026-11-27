@@ -15,6 +15,29 @@
 #include "native_buffer_lease.hpp"
 namespace wwmi::rt_forward {void buffer(reshade::api::command_list *,ID3D12GraphicsCommandList *,uint32_t,uint32_t,ID3D12Resource *,ID3D12Resource *,uint64_t,uint64_t,uint64_t,const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *) noexcept;}
 #include "wwmi_binding_trace_d3d12.hpp"
+#include "wwmi_upload_footprint.h"
+
+namespace {
+thread_local const WWMI_D3D12UploadFootprint_v1 *wwmi_current_upload_footprint = nullptr;
+struct UploadFootprintNotice {
+	const WWMI_D3D12UploadFootprint_v1 *previous;
+	explicit UploadFootprintNotice(const WWMI_D3D12UploadFootprint_v1 *view) noexcept
+		: previous(wwmi_current_upload_footprint) { wwmi_current_upload_footprint = view; }
+	~UploadFootprintNotice() { wwmi_current_upload_footprint = previous; }
+};
+}
+extern "C" uint32_t __cdecl WWMI_CurrentUploadFootprint_v1(
+	uint64_t command_list, uint64_t src_resource, uint64_t dst_resource,
+	uint32_t dst_subresource, WWMI_D3D12UploadFootprint_v1 *out, uint32_t bytes)
+{
+	const auto *fp = wwmi_current_upload_footprint;
+	if (!out || bytes != sizeof(*out) || !fp ||
+		fp->command_list != command_list || fp->src_resource != src_resource ||
+		fp->dst_resource != dst_resource || fp->dst_subresource != dst_subresource)
+		return 0;
+	*out = *fp;
+	return 1;
+}
 
 using reshade::d3d12::to_handle;
 namespace wcs = wwmi::compute_state;
@@ -377,6 +400,25 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::CopyTextureRegion(const D3D12_T
 			dst_box.bottom = dst_box.top + pSrc->PlacedFootprint.Footprint.Height;
 			dst_box.back = dst_box.front + pSrc->PlacedFootprint.Footprint.Depth;
 		}
+
+		const WWMI_D3D12UploadFootprint_v1 upload_fp {
+			sizeof(WWMI_D3D12UploadFootprint_v1),
+			1u,
+			native_buffer_recording_id(this),
+			to_handle(pSrc->pResource).handle,
+			to_handle(pDst->pResource).handle,
+			pDst->SubresourceIndex,
+			pSrc->PlacedFootprint.Footprint.RowPitch,
+			pSrc->PlacedFootprint.Footprint.Width,
+			pSrc->PlacedFootprint.Footprint.Height,
+			pSrc->PlacedFootprint.Footprint.Depth,
+			pSrcBox ? pSrcBox->left : 0u,
+			pSrcBox ? pSrcBox->top : 0u,
+			pSrcBox ? pSrcBox->front : 0u,
+			pSrcBox ? 1u : 0u,
+			0u
+		};
+		const UploadFootprintNotice upload_fp_notice(&upload_fp);
 
 		if (reshade::invoke_addon_event<reshade::addon_event::copy_buffer_to_texture>(
 				this,

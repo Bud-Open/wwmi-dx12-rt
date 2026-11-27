@@ -164,6 +164,7 @@ void RebuildParseSnapshots()
 {
     RebuildOverrideHashes();
     RebuildShapeKeyIndex();
+    FiltersParsed();
 }
 
 std::unordered_map<std::wstring, TextureOverride*>& SectionIndex()
@@ -512,6 +513,14 @@ void ForEachSectionInNs(const wchar_t* ns, void (*cb)(const wchar_t* fq_section,
         if (first == std::wstring::npos || last == std::wstring::npos || last <= first || last - first - 1 != n) return;
         if (_wcsnicmp(name.c_str() + first + 1, ns, n) == 0) cb(name.c_str(), user);
     });
+    // Filters and custom shaders are in separate registries. Their names may contain backslashes.
+    std::wstring section_ns;
+    const auto visit = [&](const std::wstring& name) {
+        if (get_section_namespace(name.c_str(), &section_ns) && _wcsicmp(section_ns.c_str(), ns) == 0)
+            cb(name.c_str(), user);
+    };
+    for (const auto& kv : resourceFilters) visit(kv.first);
+    for (const auto& kv : customShaders) visit(kv.first);
 }
 
 bool ResolveSection(const wchar_t* ns, const wchar_t* ns_hint2, const wchar_t* section,

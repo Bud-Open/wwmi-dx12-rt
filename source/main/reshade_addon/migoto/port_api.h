@@ -120,6 +120,21 @@ void PushGameConstantBufferRecord(char stage, unsigned slot, ID3D12Resource* res
     unsigned long long gpu_va, unsigned dx11_byte_width);
 bool PipeStateCbBound(char stage, unsigned slot);
 
+struct TextureDHashState {
+    uint64_t resource_generation = 0;
+    uint64_t mip_generations[32] = {};
+    uint64_t cached_dhash = 0;
+    uint64_t cached_generation = 0;
+    bool     has_cached = false;
+};
+using TextureDHashFn = bool (*)(ID3D12Resource* res, unsigned mip, unsigned view_format, uint64_t* out);
+using TextureDHashStateFn = bool (*)(ID3D12Resource* res, unsigned view_format, TextureDHashState* out);
+void SetTextureDHash(TextureDHashFn fn, TextureDHashStateFn state);
+bool TextureDHashesWanted();
+bool HasLoadedFilters();
+void SetPixelShaderTextures(uint64_t ini_hash, uint64_t lo, uint64_t hi, bool known, const uint8_t* kinds = nullptr);
+void NextDrawCall();
+
 int PushGameTexture(char stage, unsigned slot, ID3D12Resource* res, unsigned content_hash, unsigned view_format = 0);
 // Clears <stage>-tN only while it still holds what PushGameTexture put there.
 void UnpushGameTexture(char stage, unsigned slot);

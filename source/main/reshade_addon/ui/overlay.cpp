@@ -9,6 +9,7 @@
 #include "../mods/skeleton.h"
 #include "../mods/claim_state.h" // ModOnScreen: the per-component isolate list shows the mods on screen
 #include "../textures/texture_module.h"
+#include "../textures/tex_dhash_table.h"
 #include "../textures/tex_lod.h"       // TexLodSetResemblance (A13), TexLodSetCache (A14)
 #include "../textures/tex_crawl.h"     // the gallery crawl (A15)
 #include "../textures/tex_replace.h"   // the replace test (C8-C10)
@@ -589,6 +590,14 @@ void DrawOverlay(effect_runtime*)
     ImGui::TextDisabled("  on = faster drawing of modded characters.\n"
                         "  off = kept in system memory, for cards short on video memory; costs frame rate with large mods.\n"
                         "  Applies at the next launch.");
+    if (NCheckbox("A23", "Mods that pick the game's textures by how they look (WWMI 1.2.2 texture filters)",
+            &g_tex_dhash_filters)) {
+        g_tex_dhash.SetEnabled(g_tex_dhash_filters);
+        if (!g_addon_ini_path.empty())
+            WritePrivateProfileStringW(L"wwmi-dx12", L"texture_filters", g_tex_dhash_filters ? L"1" : L"0",
+                g_addon_ini_path.c_str());
+    }
+    ImGui::TextDisabled("  After re-enabling, some textures may need to reload.");
     {
         int mods = 0;
         ModLoader::GetLastStats(mods);

@@ -21,6 +21,8 @@ _STAGE_CACHES = frozenset({"__pycache__"})
 def stage_all(repo_root: Path, upstream_root: Path, stage_root: Path) -> None:
     up_reshade = upstream_root / "reshade"
     up_wwmi = upstream_root / "wwmi-dx12"
+    tdm_root = upstream_root / "3Dmigoto"
+    up_3dm = tdm_root / "DirectX11"
     if not (up_reshade / "include/reshade.hpp").is_file():
         raise FileNotFoundError(
             f"Missing upstream ReShade at {up_reshade} — run `python3 scripts/bootstrap_deps.py` first."
@@ -29,13 +31,16 @@ def stage_all(repo_root: Path, upstream_root: Path, stage_root: Path) -> None:
         raise FileNotFoundError(
             f"Missing upstream wwmi-dx12 at {up_wwmi} — run `python3 scripts/bootstrap_deps.py` first."
         )
+    if not (up_3dm / "CommandList.cpp").is_file():
+        raise FileNotFoundError(
+            f"Missing upstream 3Dmigoto at {tdm_root} — run `python3 scripts/bootstrap_deps.py` first."
+        )
 
     reshade = files_under(up_reshade, _SOURCE_EXCLUDES)
     reshade.update(files_under(repo_root / "source/host", _SOURCE_EXCLUDES))
     wwmi = files_under(up_wwmi, _SOURCE_EXCLUDES)
     wwmi.update(files_under(repo_root / "source/main", _SOURCE_EXCLUDES | {"3dm_override"}))
 
-    tdm_root = up_wwmi / "third_party/3Dmigoto"
     ov_3dm = repo_root / "source/main/3dm_override"
     tdm_subset = (
         "CommandList.cpp",
@@ -83,7 +88,7 @@ def stage_all(repo_root: Path, upstream_root: Path, stage_root: Path) -> None:
     for fname in tdm_subset:
         rel = Path(fname)
         if rel not in engine:
-            for candidate in (tdm_root / "DirectX11" / fname, tdm_root / fname):
+            for candidate in (up_3dm / fname, tdm_root / fname):
                 if candidate.is_file():
                     engine[rel] = candidate
                     break

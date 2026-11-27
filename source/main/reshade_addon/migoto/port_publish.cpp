@@ -1,4 +1,5 @@
 // port_api: the game's buffers, textures and targets, published to their engine as D3D11 objects.
+#include "lock.h"
 #include "port_api_internal.h"
 #include "globals.h"
 #include "IniHandler.h"
@@ -16,6 +17,8 @@
 #include "../../src/log.h"
 #include "../../src/buffer_view_fit.h"
 
+#include <atomic>
+#include <intrin.h>
 #include <map>
 #include <mutex>
 #include <string>
@@ -90,6 +93,41 @@ struct SlotWrappers {
     }
 };
 using StageSlot = std::pair<int, unsigned>;
+
+std::atomic<unsigned> g_call_serial{0};
+thread_local unsigned t_call_number = 0;
+TextureDHashFn g_texture_dhash = nullptr;
+TextureDHashStateFn g_texture_dhash_state = nullptr;
+std::atomic<bool> g_filters_loaded{false};
+
+void TrackDHashMips(ResourceHandleInfo& info, ID3D12Resource* res, unsigned view_format)
+{
+    const UINT mips = info.desc2D.MipLevels ? info.desc2D.MipLevels : 1;
+    info.InitializeSubresourceTracking(mips, 1, false);
+    // The wrapper is reused per slot, so its previous occupant's hash is stale.
+    info.dhash = 0;
+    info.dhash_generation = 0;
+    if (!g_texture_dhash_state || info.desc2D.ArraySize != 1) return;
+    TextureDHashState st{};
+    if (!g_texture_dhash_state(res, view_format, &st) || !st.resource_generation) return;
+    if (st.has_cached) {
+        if (!G->dhash_allow_rehash || st.cached_generation == st.resource_generation) {
+            // Reuse the native resource's cached hash directly so dhash_allow_rehash=0 keeps the
+            // first match across later mip uploads without triggering GetDhash's stale-cache path.
+            info.dhash = st.cached_dhash;
+            info.resource_generation = st.cached_generation;
+            info.dhash_generation = st.cached_generation;
+            return;
+        }
+        // Preserve cached_generation (< resource_generation) so GetDhash enforces min_mip_generation
+        // when dhash_allow_rehash=1 and selects only mips from the latest upload generation.
+        info.dhash = st.cached_dhash;
+        info.dhash_generation = st.cached_generation;
+    }
+    info.resource_generation = st.resource_generation;
+    for (UINT mip = 0; mip < mips && mip < 32; ++mip)
+        info.subresource_generations[mip] = st.mip_generations[mip];
+}
 
 void ForgetOverrideCandidates(ResourceHandleInfo& info)
 {
@@ -581,7 +619,11 @@ int PushGameTexture(char stage, unsigned slot, ID3D12Resource* res, unsigned con
     BindSlot(w->dx12, res);
     if (res) w->desc = GameTexture2DDesc(res);
 
-    if (res) RegisterGameTexture2D(w, content_hash);
+    if (res) {
+        RegisterGameTexture2D(w, content_hash);
+        const unsigned eff_fmt = view_format ? view_format : unsigned(EnsureNotTypeless(w->desc.Format));
+        if (HasLoadedFilters()) TrackDHashMips(G->mResources[(ID3D11Resource*)w], res, eff_fmt);
+    }
 
     MigotoPort::WrapSRV* v = g_gametex_view.Get({ si, slot });
     v->res = res ? (ID3D11Resource*)w : nullptr;
@@ -596,6 +638,145 @@ int PushGameTexture(char stage, unsigned slot, ID3D12Resource* res, unsigned con
     tgt.slot = slot;
     SetViaTarget(tgt, res ? (ID3D11Resource*)w : nullptr, res ? (ID3D11View*)v : nullptr);
     return result;
+}
+
+static void FillShaderResourceFromDxilKind(uint8_t kind, bool fallback_2d, ShaderResource& srv)
+{
+    srv.stride = 0;
+    switch (kind) {
+    case 1: // Texture1D
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_TEXTURE1D;
+        break;
+    case 2: // Texture2D
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_TEXTURE2D;
+        break;
+    case 0: // PSV0 v0 typed SRV (unknown dimension) vs unparsed low-slot bridge fallback
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = fallback_2d ? D3D_SRV_DIMENSION_TEXTURE2D : D3D_SRV_DIMENSION_UNKNOWN;
+        break;
+    case 3: // Texture2DMS
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_TEXTURE2DMS;
+        break;
+    case 4: // Texture3D
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_TEXTURE3D;
+        break;
+    case 5: // TextureCube
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_TEXTURECUBE;
+        break;
+    case 6: // Texture1DArray
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_TEXTURE1DARRAY;
+        break;
+    case 7: // Texture2DArray
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_TEXTURE2DARRAY;
+        break;
+    case 8: // Texture2DMSArray
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_TEXTURE2DMSARRAY;
+        break;
+    case 9: // TextureCubeArray
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_TEXTURECUBEARRAY;
+        break;
+    case 10: // TypedBuffer
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_BUFFER;
+        break;
+    case 11: // RawBuffer
+    case 16: // RTAccelerationStructure (PSV0 SRVRaw)
+        srv.type = ShaderResourceType::RAW;
+        srv.dimension = D3D_SRV_DIMENSION_BUFFEREX;
+        break;
+    case 12: // StructuredBuffer
+    case 19: // StructuredBufferWithCounter
+        srv.type = ShaderResourceType::STRUCTURED;
+        srv.dimension = D3D_SRV_DIMENSION_BUFFER;
+        break;
+    default:
+        srv.type = ShaderResourceType::TYPED;
+        srv.dimension = D3D_SRV_DIMENSION_UNKNOWN;
+        break;
+    }
+}
+
+void SetPixelShaderTextures(uint64_t ini_hash, uint64_t lo, uint64_t hi, bool known, const uint8_t* kinds)
+{
+    if (!ini_hash) return;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded) return;
+    const uint64_t orig_lo = lo;
+    if (!known) {
+        // With no bounded reflection data, preserve any known bounded slots and cover the bridge's low-slot fallback.
+        lo |= (1ull << 9) - 1;
+    }
+    CriticalSectionGuard(&G->mShaderBindingsLock);
+    ShaderBindings& bindings = G->mShaderBindingsCache[ini_hash];
+    bindings.resources.fill(ShaderResource{});
+    bindings.resource_slots = ShaderSlotRange{};
+    const uint64_t halves[] = {lo, hi};
+    for (unsigned half = 0; half < 2; ++half) {
+        for (uint64_t bits = halves[half]; bits; bits &= bits - 1) {
+            unsigned long bit;
+            _BitScanForward64(&bit, bits);
+            const unsigned slot = half * 64 + bit;
+            ShaderResource& srv = bindings.resources[slot];
+            const bool fallback_2d = !known && slot < 9 && !(orig_lo & (1ull << slot));
+            FillShaderResourceFromDxilKind(kinds ? kinds[slot] : 0u, fallback_2d, srv);
+            bindings.resource_slots.include(slot);
+        }
+    }
+}
+
+void NextDrawCall()
+{
+    t_call_number = g_call_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+unsigned CallNumber()
+{
+    return t_call_number;
+}
+
+void SetTextureDHash(TextureDHashFn fn, TextureDHashStateFn state)
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    g_texture_dhash = fn;
+    g_texture_dhash_state = state;
+}
+
+void FiltersParsed()
+{
+    bool loaded = false;
+    for (const auto& kv : resourceFilters) {
+        if (!kv.second.is_empty) {
+            loaded = true;
+            break;
+        }
+    }
+    g_filters_loaded.store(loaded, std::memory_order_release);
+}
+
+bool TextureDHashesWanted()
+{
+    // Keep upload-time fingerprints active whenever A23 is enabled so F10 hot-loading
+    // the first [Filter] mod still matches textures that are already resident.
+    return true;
+}
+
+bool HasLoadedFilters()
+{
+    return g_filters_loaded.load(std::memory_order_acquire);
+}
+
+bool TextureDHash(ID3D12Resource* res, unsigned mip, unsigned view_format, uint64_t* out)
+{
+    return g_texture_dhash && res && g_texture_dhash(res, mip, view_format, out);
 }
 
 void UnpushGameTexture(char stage, unsigned slot)
