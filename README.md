@@ -53,6 +53,28 @@ Before installing, make sure you have:
 | **`SD` Pack / Low Graphics Settings** | **Partial / Limited** | (1) Community mods target **LOD0 high-poly meshes**—keep **LOD Bias / Character Detail** on **High** so models do not revert to vanilla LOD1/LOD2; (2) Auxiliary unmatched textures downscaled below `256×256` safely fall back to vanilla textures. |
 | **Graphics API** | **DirectX 12 Required** | Never pass `-dx11` or check "Launch with DX11" (use vanilla XXMI Launcher for DX11). |
 
+### Verified Mod Compatibility Scope
+
+> **Disclaimer**: Our runtime architecture is completely generic (zero per-character or per-skin hardcoding), **however we have only directly tested the community skins listed below** (under DX12 + Hardware Ray Tracing + 4K UHD `-krqlv=uhd`, alongside a single shared `RabbitFX` where required, on both `WWMI 1.1.0` and `WWMI 1.2.2`). We **cannot guarantee** that every community mod works out of the box.
+
+Verified working in our test environment:
+- `Chisa Shrine Maiden NSFW`
+- `Hiyuki - Mist of Morning Glory`
+- `hsin-Moonover Fox`
+- `Iuno Sapphire Moon`
+- `Lily Lewd Saint`
+- `Lynae - Origin Toggle`
+- `shorekeeper OL NSFW switch`
+- `Suoming-Crimson Nocturne`
+- `洛瑟菈-暗夜魅影-序列045`
+- `清宵-夏日清风-序列058`
+- `穗穗-白澜穗光-序列053`
+
+If a mod does not render properly or fails to load in your setup, please open a **[GitHub Issue](https://github.com/Bud-Open/wwmi-dx12-rt/issues)** and include:
+1. The **mod name** and **download link**;
+2. Your latest `wwmi_dx12_candidate-*.log` (from `<ExternalFolder>/runtime/logs/`);
+3. Your graphics settings (**Ray Tracing ON/OFF**, **DLSS/FSR Frame Generation**, `UHD`/`HD`/`SD` pack, and any other active ReShade add-ons).
+
 ---
 
 ## Quick Start & Uninstall
@@ -106,8 +128,12 @@ Download the latest portable archive from **[GitHub Releases](https://github.com
   - On Linux/Proton, verify `WINEDLLOVERRIDES="dxgi=n,b" %command%` is set in Steam Launch Options.
   - Press **`Home`** in-game and confirm the status panel shows green `DX12 Ray Tracing + Hybrid Raster active` and `Active mods > 0`.
   - Confirm `Core/WWMI/WuWa-Model-Importer.ini` exists inside your `WWMI` directory.
-- **Installer refuses to overwrite existing `dxgi.dll` or `ReShade.ini`**
-  - This safety check prevents clobbering third-party ReShade/OptiScaler/XXMI files or orphaned mounts. Remove the foreign DLL or run **Uninstall** from your previous WWMI-DX12-RT folder first.
+- **Installer refuses to overwrite existing `dxgi.dll` or `ReShade.ini` / Coexisting with RenoDX or other ReShade add-ons**
+  - This safety check prevents clobbering third-party ReShade/OptiScaler/XXMI files or orphaned mounts. Back up and move the pre-existing `Win64/dxgi.dll` and `Win64/ReShade.ini` (or run **Uninstall** from your previous WWMI-DX12-RT folder), then re-run **Install & Enable**.
+  - **Important**: WWMI-DX12-RT requires its paired `dxgi.dll` (`ReShade64-game-forward.dll`) to expose DX12+RT hooks—never swap it for stock ReShade `dxgi.dll`.
+  - To load third-party ReShade add-ons (such as RenoDX) alongside WWMI-DX12-RT, either copy their `*.addon64` files into `<ExternalFolder>/reshade-addons/`, or set `LoadGameDirAddons=1` (or comma/semicolon-separated extra paths in `AddonPath`) under `[ADDON]` in `<ExternalFolder>/ReShade.ini`. Custom settings in `<ExternalFolder>/ReShade.ini` are preserved on upgrades. If mods fail during gameplay, temporarily disable third-party add-ons to rule out hook conflicts.
+- **WWMI Core version compatibility (`1.1.0` & `1.2.2+`)**
+  - Both legacy `WWMI 1.1.0` and newer `WWMI 1.2.2+` core packages work out of the box. The DX11-only `XXMI DLL v1.3.3+` dHash banner is suppressed automatically (not applicable to DX12-RT), while genuine mod version warnings remain dismissible with **`X`**.
 - **Legacy Hash Mod textures mis-match on 4K UHD (`-krqlv=uhd`)**
   - Route 3 automatically learns and caches matches online; for stubborn legacy mods, use the offline hash-free migrator and seed tools documented in [`tools/README.md`](./tools/README.md).
 - **Where are runtime logs and caches stored?**

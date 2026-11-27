@@ -33,6 +33,9 @@ def make_game(root: Path) -> Path:
 
 class TestInstallerCore(unittest.TestCase):
     def setUp(self) -> None:
+        self._lang_patch = patch.dict(os.environ, {"WWMI_SETUP_LANG": "zh"})
+        self._lang_patch.start()
+        self.addCleanup(self._lang_patch.stop)
         self.case = Path(tempfile.mkdtemp(prefix="wwmi-installer-test-")).resolve()
         self.game_root = self.case / "Game/Wuthering Waves Game"
         self.win64 = make_game(self.game_root)
@@ -365,6 +368,60 @@ class TestInstallerCore(unittest.TestCase):
         with tarfile.open(out_tar, "r:gz") as tf:
             for member in tf.getmembers():
                 self.assertEqual((member.uid, member.gid, member.uname, member.gname), (0, 0, "root", "root"))
+
+    def test_reshade_ini_preserved_and_doctor_detects_wwmi_version_and_third_party_addons(self) -> None:
+        core_ini = self.wwmi / "Core/WWMI/WuWa-Model-Importer.ini"
+        core_ini.parent.mkdir(parents=True, exist_ok=True)
+        core_ini.write_text(
+            '[ResourceVersionNotification]\ndata = "WWMI 1.2.2 (PRESS F12 TO SHOW GUIDE)"\n'
+            "[Constants]\nglobal $wwmi_version = 1.22\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(core.detect_wwmi_core_version(self.wwmi), "1.2.2")
+
+        (self.win64 / "renodx-wutheringwaves.addon64").write_bytes(b"ADDON")
+        (self.win64 / "wwmi_dx12.addon64").write_bytes(b"OWN")
+        self.assertEqual(core.scan_third_party_win64_addons(self.win64), ["renodx-wutheringwaves.addon64"])
+
+        rep = core.run_doctor(self.win64, self.wwmi, self.base)
+        findings = {f.code: f for f in rep.findings}
+        self.assertIn("1.2.2", findings["wwmi_core_ok"].message)
+        self.assertIn("renodx-wutheringwaves.addon64", findings["third_party_win64_addons"].message)
+        self.assertEqual(findings["third_party_win64_addons"].level, "warn")
+
+        self.install()
+        custom_ini = (
+            "[INSTALL]\nLogging=1\n\n"
+            "[ADDON]\nAddonPath=D:\\ExtraAddons\nLoadGameDirAddons=1\n\n"
+            "[GENERAL]\nPresetPath=D:\\Presets\\MyPreset.ini\n"
+        )
+        (self.base / "ReShade.ini").write_text(custom_ini, encoding="utf-8")
+        # Reinstall must preserve user customizations while ensuring reshade-addons stays first.
+        self.install()
+        merged = (self.base / "ReShade.ini").read_text(encoding="utf-8")
+        self.assertIn("Logging=1", merged)
+        self.assertIn("LoadGameDirAddons=1", merged)
+        self.assertIn("PresetPath=D:\\Presets\\MyPreset.ini", merged)
+        self.assertIn("AddonPath=reshade-addons,D:\\ExtraAddons", merged)
+
+        # Legacy WWMI 1.1.0 version detection
+        core_ini.write_text(
+            '[ResourceVersionNotification]\ndata = "WWMI 1.1.0 (PRESS F12 TO SHOW GUIDE)"\n'
+            "[Constants]\nglobal $wwmi_version = 1.10\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(core.detect_wwmi_core_version(self.wwmi), "1.1.0")
+
+    def test_english_locale_messages(self) -> None:
+        with patch.dict(os.environ, {"WWMI_SETUP_LANG": "en"}):
+            self.assertFalse(core.is_chinese_locale())
+            (self.win64 / "dxgi.dll").write_bytes(b"FOREIGN")
+            with self.assertRaisesRegex(RuntimeError, "LoadGameDirAddons=1"):
+                self.install()
+            self.stage("dxgi.dll")
+            rep = core.run_doctor(self.win64, self.wwmi, self.base)
+            self.assertTrue(any("Not mounted in Win64" in f.message for f in rep.findings))
+            self.assertIn("No active installation ledger", self.uninstall()["message"])
 
 
 if __name__ == "__main__":

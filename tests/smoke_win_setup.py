@@ -34,9 +34,9 @@ def smoke(archive: Path, root: Path, wine: str | None = None) -> None:
     wwmi = root / "中文 WWMI"
     journal = base / "runtime/install-ledger.json"
 
-    def cli(action: str, target: Path = win64, *, rc: int = 0, reason: str = "") -> None:
+    def cli(action: str, target: Path = win64, *, rc: int = 0, reason: str = "", lang: str = "en") -> None:
         args = ([wine] if wine else []) + [
-            str(exe), "--cli", action, "--game", engine_path(target), "--wwmi", engine_path(wwmi),
+            str(exe), "--lang", lang, "--cli", action, "--game", engine_path(target), "--wwmi", engine_path(wwmi),
         ]
         result = subprocess.run(args, cwd=base, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
         output = result.stdout.decode("utf-8", errors="replace")
@@ -47,8 +47,19 @@ def smoke(archive: Path, root: Path, wine: str | None = None) -> None:
     cli("init-wwmi")
     assert (wwmi / "d3dx.ini").is_file()
     d3dx = (wwmi / "d3dx.ini").read_bytes()
-    cli("install")
-    assert {p.name for p in win64.iterdir()} == {SHIPPING, "dxgi.dll", "ReShade.ini"}
+    (win64 / "renodx-sample.addon64").write_bytes(b"ADDON")
+    cli("install", reason="renodx-sample.addon64", lang="en")
+    assert {p.name for p in win64.iterdir()} == {SHIPPING, "dxgi.dll", "ReShade.ini", "renodx-sample.addon64"}
+    ext_ini = base / "ReShade.ini"
+    ext_ini.write_text(
+        "[INSTALL]\r\nLogging=1\r\n\r\n[ADDON]\r\nAddonPath=D:\\Extra\r\nLoadGameDirAddons=1\r\n",
+        encoding="utf-8",
+    )
+    cli("install", lang="zh", reason="安装启用成功")
+    merged = ext_ini.read_text(encoding="utf-8")
+    assert "Logging=1" in merged and "LoadGameDirAddons=1" in merged and "AddonPath=reshade-addons,D:\\Extra" in merged, merged
+    cli("doctor", reason="Other ReShade add-on(s) in Win64", lang="en")
+    cli("doctor", reason="Win64 存在其他 ReShade 插件", lang="zh")
     ini = base / "wwmi_dx12.ini"
     data = ini.read_bytes()
     assert data.startswith(b"\xff\xfe")
@@ -65,25 +76,28 @@ def smoke(archive: Path, root: Path, wine: str | None = None) -> None:
         assert Path(out.value) == wwmi
 
     installed = journal.read_bytes()
-    cli("install", other, rc=1, reason="先卸载旧游戏目录")
+    cli("install", other, rc=1, reason="Uninstall the previous", lang="en")
+    cli("install", other, rc=1, reason="先卸载旧游戏目录", lang="zh")
     assert {p.name for p in other.iterdir()} == {SHIPPING}
     assert journal.read_bytes() == installed
 
     stub = win64 / "ReShade.ini"
     original = stub.read_bytes()
     stub.write_bytes(b"foreign")
-    cli("install", rc=1, reason="哈希")
+    cli("install", rc=1, reason="hash does not match", lang="en")
+    cli("install", rc=1, reason="哈希", lang="zh")
     assert stub.read_bytes() == b"foreign"
     assert journal.read_bytes() == installed
     stub.write_bytes(original)
 
     journal.write_bytes(installed + b"invalid-json")
-    cli("uninstall", rc=1, reason="账本损坏")
+    cli("uninstall", rc=1, reason="ledger is corrupted", lang="en")
+    cli("uninstall", rc=1, reason="账本损坏", lang="zh")
     assert journal.read_bytes() == installed + b"invalid-json"
     journal.write_bytes(installed)
 
-    cli("uninstall")
-    assert {p.name for p in win64.iterdir()} == {SHIPPING}
+    cli("uninstall", lang="en", reason="Uninstalled")
+    assert {p.name for p in win64.iterdir()} == {SHIPPING, "renodx-sample.addon64"}
     record = json.loads(journal.read_bytes())
     assert record["state"] == "uninstalled", record
     staged = record["staged_batch"]

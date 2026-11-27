@@ -10,6 +10,8 @@
 #include "dll_log.hpp"
 #include "ini_file.hpp"
 #include <algorithm> // std::find, std::find_if, std::remove, std::remove_if
+#include <cwctype>
+#include <unordered_set>
 #include <Windows.h>
 
 extern void register_addon_depth();
@@ -18,6 +20,7 @@ extern void unregister_addon_depth();
 extern void unregister_addon_effect_runtime_sync();
 
 extern HMODULE g_module_handle;
+extern std::filesystem::path g_target_executable_path;
 
 extern std::filesystem::path get_module_path(HMODULE module);
 
@@ -210,32 +213,95 @@ void reshade::load_addons()
 		}
 	}
 
-	// Get directory from where to load add-ons from
-	std::filesystem::path addon_search_path = g_reshade_base_path;
-	if (config.get("ADDON", "AddonPath", addon_search_path))
-		addon_search_path = g_reshade_base_path / addon_search_path;
+	// Get directories from where to load add-ons from.
+	// Supports comma-separated (native ReShade INI vector) and semicolon-separated paths,
+	// portable $(GameDir) / $GAME tokens, and opt-in [ADDON] LoadGameDirAddons=1 so external
+	// BasePath mounts can coexist cleanly with third-party add-ons in Client\Binaries\Win64.
+	// Earlier search directories always win on duplicate filenames.
+	std::vector<std::filesystem::path> search_dirs;
+	auto append_search_dir = [&search_dirs](const std::filesystem::path &raw) {
+		if (raw.empty())
+			return;
+		std::filesystem::path resolved = raw.is_absolute() ? raw : (g_reshade_base_path / raw);
+		std::error_code norm_ec;
+		std::filesystem::path canonical = std::filesystem::weakly_canonical(resolved, norm_ec);
+		if (!norm_ec && !canonical.empty())
+			resolved = std::move(canonical);
+		for (const auto &existing : search_dirs)
+		{
+			if (_wcsicmp(existing.c_str(), resolved.c_str()) == 0)
+				return;
+		}
+		search_dirs.push_back(std::move(resolved));
+	};
 
-	log::message(log::level::info, "Searching for add-ons (*.addon"
-#ifndef _WIN64
-		", *.addon32"
-#else
-		", *.addon64"
-#endif
-		") in '%s' ...", addon_search_path.u8string().c_str());
-
-	std::error_code ec;
-	std::vector<std::filesystem::path> addon_paths;
-	for (const std::filesystem::directory_entry &entry : std::filesystem::directory_iterator(addon_search_path, std::filesystem::directory_options::skip_permission_denied, ec))
+	const std::filesystem::path game_dir = g_target_executable_path.parent_path();
+	std::vector<std::string> configured_paths;
+	if (config.get("ADDON", "AddonPath", configured_paths) && !configured_paths.empty())
 	{
-		const std::filesystem::path &candidate = entry.path();
-		if (candidate.extension() != L".addon" &&
+		for (const std::string &entry : configured_paths)
+		{
+			size_t start = 0;
+			while (start <= entry.size())
+			{
+				const size_t sep = entry.find(';', start);
+				std::string token = (sep == std::string::npos) ? entry.substr(start) : entry.substr(start, sep - start);
+				while (!token.empty() && (token.front() == ' ' || token.front() == '\t'))
+					token.erase(token.begin());
+				while (!token.empty() && (token.back() == ' ' || token.back() == '\t'))
+					token.pop_back();
+				if (!token.empty())
+				{
+					if (_stricmp(token.c_str(), "$(GameDir)") == 0 || _stricmp(token.c_str(), "$GAME") == 0)
+						append_search_dir(game_dir);
+					else
+						append_search_dir(std::filesystem::u8path(token));
+				}
+				if (sep == std::string::npos)
+					break;
+				start = sep + 1;
+			}
+		}
+	}
+	if (search_dirs.empty())
+		append_search_dir(g_reshade_base_path);
+	if (config.get("ADDON", "LoadGameDirAddons") && !game_dir.empty())
+		append_search_dir(game_dir);
+
+	std::vector<std::filesystem::path> addon_paths;
+	std::unordered_set<std::wstring> seen_filenames;
+	for (const std::filesystem::path &addon_search_path : search_dirs)
+	{
+		log::message(log::level::info, "Searching for add-ons (*.addon"
 #ifndef _WIN64
-			candidate.extension() != L".addon32")
+			", *.addon32"
 #else
-			candidate.extension() != L".addon64")
+			", *.addon64"
 #endif
-			continue;
-		addon_paths.push_back(candidate);
+			") in '%s' ...", addon_search_path.u8string().c_str());
+
+		std::error_code ec;
+		for (const std::filesystem::directory_entry &entry : std::filesystem::directory_iterator(addon_search_path, std::filesystem::directory_options::skip_permission_denied, ec))
+		{
+			const std::filesystem::path &candidate = entry.path();
+			if (candidate.extension() != L".addon" &&
+#ifndef _WIN64
+				candidate.extension() != L".addon32")
+#else
+				candidate.extension() != L".addon64")
+#endif
+				continue;
+			std::wstring fname_lower = candidate.filename().wstring();
+			std::transform(fname_lower.begin(), fname_lower.end(), fname_lower.begin(), [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+			if (!seen_filenames.insert(fname_lower).second)
+			{
+				log::message(log::level::info, "Skipping duplicate add-on '%s' (already discovered in an earlier search path).", candidate.u8string().c_str());
+				continue;
+			}
+			addon_paths.push_back(candidate);
+		}
+		if (ec)
+			log::message(log::level::warning, "Failed to iterate all files in '%s' with error code %d!", addon_search_path.u8string().c_str(), ec.value());
 	}
 	std::sort(addon_paths.begin(), addon_paths.end(), [](const std::filesystem::path &a, const std::filesystem::path &b) {
 		return _wcsicmp(a.filename().c_str(), b.filename().c_str()) < 0;
@@ -337,9 +403,6 @@ void reshade::load_addons()
 		}
 #endif
 	}
-
-	if (ec)
-		log::message(log::level::warning, "Failed to iterate all files in '%s' with error code %d!", addon_search_path.u8string().c_str(), ec.value());
 }
 void reshade::unload_addons()
 {

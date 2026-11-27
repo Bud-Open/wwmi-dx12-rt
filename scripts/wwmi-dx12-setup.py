@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -71,11 +72,11 @@ def resolve_defaults(args: argparse.Namespace) -> tuple[Path | None, Path | None
 
 def print_doctor_report(rep: core.DoctorReport) -> None:
     icons = {"ok": "[OK]  ", "warn": "[WARN]", "error": "[ERR] "}
-    print("=== WWMI-DX12-RT 环境与健康自检报告 ===")
-    print(f"  游戏 Win64 目录 : {rep.win64_dir}")
-    print(f"  WWMI Mod 目录   : {rep.wwmi_dir}")
-    print(f"  外部挂载根目录  : {rep.base_root}")
-    print(f"  当前挂载状态    : {rep.mount_state}")
+    print(core.tr("=== WWMI-DX12-RT 环境与健康自检报告 ===", "=== WWMI-DX12-RT Environment & Health Check ==="))
+    print(f"  {core.tr('游戏 Win64 目录', 'Game Win64 Dir ')} : {rep.win64_dir}")
+    print(f"  {core.tr('WWMI Mod 目录  ', 'WWMI Mods Dir  ')} : {rep.wwmi_dir}")
+    print(f"  {core.tr('外部挂载根目录 ', 'External Root  ')} : {rep.base_root}")
+    print(f"  {core.tr('当前挂载状态   ', 'Mount Status   ')} : {rep.mount_state}")
     print("----------------------------------------")
     for f in rep.findings:
         print(f"  {icons.get(f.level, '[INFO]')} {f.message}")
@@ -135,19 +136,22 @@ def cmd_install(args: argparse.Namespace) -> int:
         init_missing_wwmi=init_wwmi,
     )
     if dry_run:
-        print("[dry-run] 安装计划校验通过（未写入任何文件）：")
+        print(core.tr("[dry-run] 安装计划校验通过（未写入任何文件）：", "[dry-run] Install plan verified (no files written):"))
         print(json.dumps(res, indent=2, ensure_ascii=False))
     else:
-        print("安装启用完成！")
-        print(f"  - 外部程序根：{res['base_root']}")
-        print(f"  - 关联 Mod 树：{res['wwmi_dir']}")
-        print(f"  - 游戏引导桥：{res['win64_dir']} (仅 dxgi.dll + ReShade.ini)")
+        print(core.tr("安装启用完成！", "Installed and enabled!"))
+        print(f"  - {core.tr('外部程序根', 'External root')}: {res['base_root']}")
+        print(f"  - {core.tr('关联 Mod 树', 'WWMI tree')}: {res['wwmi_dir']}")
+        print(f"  - {core.tr('游戏引导桥', 'Game Win64')}: {res['win64_dir']} ({core.tr('仅 dxgi.dll + ReShade.ini', 'dxgi.dll + ReShade.ini only')})")
         if not (Path(res["wwmi_dir"]) / "Core/WWMI/WuWa-Model-Importer.ini").is_file():
-            print("  [提示] 当前 WWMI 目录尚未放入官方 Core/WWMI 核心包，请补齐后再把皮肤解压到 Mods/（若皮肤需要 RabbitFX 请仅保留一份）。")
+            print(core.tr(
+                "  [提示] 当前 WWMI 目录尚未放入官方 Core/WWMI 核心包，请补齐后再把皮肤解压到 Mods/（若皮肤需要 RabbitFX 请仅保留一份）。",
+                "  [Note] Core/WWMI scripts not detected yet. Extract official WWMI-Package Core/ here before using skins (keep at most one RabbitFX under Mods/).",
+            ))
     if res.get("proton_launch_options"):
-        print(f"Steam → 游戏属性 → 启动选项：{res['proton_launch_options']}")
+        print(f"{core.tr('Steam → 游戏属性 → 启动选项', 'Steam -> Properties -> Launch Options')}: {res['proton_launch_options']}")
     else:
-        print("可以从 Steam 或库洛官方启动器开始游戏。")
+        print(core.tr("可以从 Steam 或库洛官方启动器开始游戏。", "You can now launch the game normally from Steam or the Kuro Launcher."))
     if res.get("proton_preload_warning"):
         print(f"[WARN] {res['proton_preload_warning']}")
     return 0
@@ -345,41 +349,53 @@ def cmd_gui(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="WWMI-DX12-RT 跨平台外部挂载安装与健康自检工具")
-    p.add_argument("--game-win64", help="指定鸣潮根目录或 Client/Binaries/Win64 路径（默认自动探测）")
-    p.add_argument("--wwmi-dir", help="指定包含 d3dx.ini 与 Mods/ 的 WWMI 目录（默认自动探测 XXMI）")
-    p.add_argument("--base-root", help="指定外部程序与缓存驻留目录（Linux 默认 ~/.local/share/wwmi-dx12-rt）")
+    p = argparse.ArgumentParser(description="WWMI-DX12-RT cross-platform external mount installer & doctor")
+    p.add_argument("--game-win64", help="Wuthering Waves root or Client/Binaries/Win64 path (auto-detected by default)")
+    p.add_argument("--wwmi-dir", help="WWMI directory containing d3dx.ini and Mods/ (auto-detected by default)")
+    p.add_argument("--base-root", help="External runtime/cache root (default ~/.local/share/wwmi-dx12-rt on Linux)")
+    p.add_argument("--lang", choices=("zh", "en"), help="Override UI/output language (zh or en)")
+
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument("--game-win64", default=argparse.SUPPRESS)
+    shared.add_argument("--wwmi-dir", default=argparse.SUPPRESS)
+    shared.add_argument("--base-root", default=argparse.SUPPRESS)
+    shared.add_argument("--lang", choices=("zh", "en"), default=argparse.SUPPRESS)
 
     sub = p.add_subparsers(dest="cmd")
 
-    p_doc = sub.add_parser("doctor", aliases=["status"], help="只读检测游戏路径、挂载状态与 RabbitFX 健康度")
-    p_doc.add_argument("--json", action="store_true", help="输出 JSON 格式报告")
+    p_doc = sub.add_parser("doctor", aliases=["status"], parents=[shared],
+                           help="Read-only health check for game path, mount state, WWMI & RabbitFX")
+    p_doc.add_argument("--json", action="store_true", help="Output report as JSON")
 
-    p_ins = sub.add_parser("install", help="部署外部目录并向游戏 Win64 写入 2 个只读引导文件")
+    p_ins = sub.add_parser("install", parents=[shared],
+                           help="Deploy external runtime and mount 2 bootstrap files into Win64")
     def add_install_options(parser: argparse.ArgumentParser, skin_default: str) -> None:
         parser.add_argument("--skin-mode", choices=("default", "base", "exact"), default=skin_default,
-                            help=f"混合光栅蒙皮策略（默认 {skin_default}）")
-        parser.add_argument("--init-missing-wwmi", action="store_true", help="找不到 WWMI 时初始化独立骨架")
-        parser.add_argument("--proton-utf8-guard", action="store_true", help="生成包含 UTF-8 护航的单游戏 Steam 启动选项")
-        parser.add_argument("--dry-run", action="store_true", help="仅做前置检查与计划预览，不写入文件")
+                            help=f"Hybrid raster skinning mode (default: {skin_default})")
+        parser.add_argument("--init-missing-wwmi", action="store_true", help="Initialize WWMI skeleton if missing")
+        parser.add_argument("--proton-utf8-guard", action="store_true", help="Print Steam Launch Options with UTF-8 guard")
+        parser.add_argument("--dry-run", action="store_true", help="Validate plan without writing files")
 
     add_install_options(p_ins, "base")
 
-    p_un = sub.add_parser("uninstall", help="按账本将 Win64 下的 2 个引导文件安全移至暂存区，恢复纯净游戏目录")
-    p_un.add_argument("--dry-run", action="store_true", help="仅预览待卸载文件，不实际移动")
+    p_un = sub.add_parser("uninstall", parents=[shared],
+                          help="Safely stage Win64 bootstrap files back out using the install ledger")
+    p_un.add_argument("--dry-run", action="store_true", help="Preview files to stage without moving them")
 
-    p_init = sub.add_parser("init-wwmi", help="在指定位置初始化标准 WWMI 目录结构")
-    p_init.add_argument("target", help="目标目录路径")
+    p_init = sub.add_parser("init-wwmi", parents=[shared], help="Initialize a standard WWMI folder skeleton")
+    p_init.add_argument("target", help="Target directory path")
 
-    p_gui = sub.add_parser("gui", help="启动图形化向导（kdialog/zenity）或终端交互菜单")
+    p_gui = sub.add_parser("gui", parents=[shared], help="Launch interactive GUI wizard (kdialog/zenity) or TUI")
     add_install_options(p_gui, "default")
-    sub.add_parser("desktop-entry", help="在 ~/.local/share/applications 创建桌面快捷方式（适配 Linux 桌面与 Steam Deck）")
+    sub.add_parser("desktop-entry", parents=[shared], help="Create a desktop menu entry in ~/.local/share/applications")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "lang", None):
+        os.environ["WWMI_SETUP_LANG"] = args.lang
     cmd = args.cmd or "doctor"
     if cmd in ("doctor", "status"):
         if not hasattr(args, "json"):

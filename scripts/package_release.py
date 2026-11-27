@@ -53,6 +53,14 @@ WINDOWS_GUIDE = """\
      `runtime\\install-ledger.json`) and re-run [Install & Enable], OR click
      [Uninstall / Restore] in the old folder before moving to a new directory.
    - Click [Uninstall / Restore] at any time to cleanly remove the 2 bootstrap files from Win64.
+5. Coexisting with Existing ReShade / Third-Party Add-ons (e.g. RenoDX):
+   - WWMI-DX12-RT requires its paired `dxgi.dll` (do NOT replace it with stock ReShade `dxgi.dll`).
+   - If you already had ReShade in Win64, back up/move the old `dxgi.dll` and `ReShade.ini` first,
+     then run [Install & Enable].
+   - To load other ReShade add-ons (e.g. RenoDX), either copy their `*.addon64` into
+     `<ExternalFolder>\\reshade-addons\\`, OR add `LoadGameDirAddons=1` under `[ADDON]` in
+     `<ExternalFolder>\\ReShade.ini` (your external `ReShade.ini` customizations are preserved on upgrades).
+   - If mods stop working in-game, temporarily disable third-party add-ons to rule out hook conflicts.
 
 ========================================================================
   WWMI-DX12-RT (Windows 便携版 — 支持库洛官方启动器 / Steam)
@@ -74,6 +82,11 @@ WINDOWS_GUIDE = """\
 4. 升级与彻底卸载：
    - 升级新版时，直接解压覆盖原外部目录（保留 `runtime\\install-ledger.json`）后重跑【一键安装启用】，或先在旧目录点击【一键卸载还原】再迁移新目录。
    - 随时点击【一键卸载还原】，即可安全清除 Win64 中的 2 个引导文件恢复纯净原厂目录。
+5. 与现有 ReShade / 第三方插件（如 RenoDX）共存：
+   - WWMI-DX12-RT 必须使用本包配对的 `dxgi.dll`（切勿用官方原版 ReShade `dxgi.dll` 替换）。
+   - 若游戏 Win64 原先已装 ReShade，先备份移走原 `dxgi.dll` 与 `ReShade.ini` 后再安装。
+   - 第三方 `*.addon64`（如 RenoDX）可放入外部 `reshade-addons\\`，或在外部 `ReShade.ini` 的 `[ADDON]` 下添加 `LoadGameDirAddons=1`（升级重装会保留你的外部 `ReShade.ini` 配置）。
+   - 若游戏内 Mod 异常，请先临时停用第三方插件排查挂钩冲突。
 """
 
 LINUX_GUIDE = """\

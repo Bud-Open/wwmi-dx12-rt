@@ -442,6 +442,23 @@ void EngineFrameTick(command_queue* queue, swapchain* sc, bool bind_back_buffer)
 #endif
         // WWMI's first-run guide is dismissed with F10, which is gated off: never let it open.
         if (PortApi::GetVarNs(L"WWMIv1", L"first_run", 0.f) != 0.f) PortApi::SetVarNs(L"WWMIv1", L"first_run", 0.f);
+        // WWMI-Package v1.2.2+ runs `@FilterTest` at startup (time < 30s) and shows
+        // "Please update XXMI DLL to v1.3.3+" when DX11 dHash [Filter] syntax is absent.
+        // WWMI-DX12-RT does not use XXMI's DX11 DLL; clear this false banner while keeping
+        // genuine mod incompatibility notices ($show_mod_error) visible and X-dismissible.
+        if (PortApi::GetVarNs(L"WWMIv1", L"show_xxmi_error", 0.f) != 0.f) {
+            PortApi::SetVarNs(L"WWMIv1", L"show_xxmi_error", 0.f);
+            if (PortApi::GetVarNs(L"WWMIv1", L"show_mod_error", 0.f) == 0.f &&
+                PortApi::GetVarNs(L"WWMIv1", L"show_guide", 0.f) == 0.f) {
+                PortApi::SetVarNs(L"WWMIv1", L"show_notification_widget", 0.f);
+            }
+            static bool s_logged_xxmi_compat = false;
+            if (!s_logged_xxmi_compat) {
+                s_logged_xxmi_compat = true;
+                logger::probe("WWMI-COMPAT: suppressed DX11 XXMI v1.3.3+ dHash-filter banner "
+                              "(not applicable to WWMI-DX12-RT; genuine mod warnings remain dismissible with X)");
+            }
+        }
         {
             PROF(PROF_ET_Lists);
             {

@@ -19,6 +19,7 @@ import contextlib
 import datetime as _dt
 import hashlib
 import json
+import locale
 import os
 import re
 import shlex
@@ -51,6 +52,24 @@ WATCH_PROCESS_NAMES = (
     "Client-Win64-Shipping.exe",
     "Wuthering Waves.exe",
 )
+
+
+def is_chinese_locale() -> bool:
+    override = os.environ.get("WWMI_SETUP_LANG", "").strip().lower()
+    if override.startswith("en"):
+        return False
+    if override.startswith("zh"):
+        return True
+    for key in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        val = os.environ.get(key, "").strip().lower()
+        if val:
+            return val.startswith("zh")
+    loc = (locale.getlocale()[0] or "").strip().lower()
+    return loc.startswith("zh") or "chinese" in loc
+
+
+def tr(zh: str, en: str) -> str:
+    return zh if is_chinese_locale() else en
 
 
 @dataclass
@@ -489,8 +508,10 @@ def load_install_ledger(base_root: Path) -> dict | None:
         return ledger
     except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise RuntimeError(
-            f"安装账本损坏或无法读取：{path}。请从备份恢复账本；无备份时先人工核对原 Win64 引导文件归属。"
-            f"（{exc}）"
+            tr(
+                f"安装账本损坏或无法读取：{path}。请从备份恢复账本；无备份时先人工核对原 Win64 引导文件归属。（{exc}）",
+                f"Install ledger is corrupted or unreadable: {path}. Restore from backup or inspect your Win64 bootstrap files manually. ({exc})",
+            )
         ) from exc
 
 
@@ -503,14 +524,27 @@ def _owned_bootstrap(win64_dir: Path, ledger: dict | None) -> dict[str, str]:
             continue
         if not ledger:
             raise RuntimeError(
-                f"Win64/{name} 已存在，但没有对应的活动账本，拒绝覆盖"
-                "（若为旧版换目录升级，请先在旧目录执行卸载，或直接覆盖原目录并保留 runtime/install-ledger.json 后重装）"
+                tr(
+                    f"Win64/{name} 已存在，但没有对应的活动账本，拒绝覆盖"
+                    "（若已有其他 ReShade/DXGI，请先备份移走原 Win64/dxgi.dll 与 ReShade.ini 后重试；"
+                    "WWMI-DX12-RT 需使用配对宿主，第三方 .addon64 如 RenoDX 可放入外部 reshade-addons/ 或在外部 ReShade.ini 设 LoadGameDirAddons=1 共存。"
+                    "若为旧版换目录升级，请先在旧目录执行卸载，或覆盖原目录并保留 runtime/install-ledger.json 后重装）",
+                    f"Win64/{name} already exists without an active WWMI-DX12-RT ledger; refusing to overwrite. "
+                    f"If you already use ReShade/DXGI, back up and move Win64/{name} and Win64/ReShade.ini first, then retry Install. "
+                    "WWMI-DX12-RT requires its paired dxgi.dll; to keep third-party .addon64 add-ons (e.g. RenoDX), place them in "
+                    "<ExternalFolder>/reshade-addons/ or set LoadGameDirAddons=1 under [ADDON] in <ExternalFolder>/ReShade.ini.",
+                )
             )
         sha = sha256_file(path)
         rec = records[name]
         previous = rec.get("previous_sha256") if ledger["state"] == "installing" else None
         if sha not in (rec["sha256"], previous):
-            raise RuntimeError(f"Win64/{name} 哈希与账本不一致，拒绝修改")
+            raise RuntimeError(
+                tr(
+                    f"Win64/{name} 哈希与账本不一致，拒绝修改",
+                    f"Win64/{name} hash does not match the install ledger; refusing to modify.",
+                )
+            )
         owned[name] = sha
     return owned
 
@@ -520,15 +554,36 @@ def _classify_mount(win64_dir: Path, ledger: dict | None) -> tuple[str, str, dic
     if active:
         recorded = Path(active["win64_dir"])
         if recorded != win64_dir:
-            return "active_elsewhere", f"账本仍绑定 {recorded}；请先卸载旧游戏目录，再安装到新目录", {}
+            return (
+                "active_elsewhere",
+                tr(
+                    f"账本仍绑定 {recorded}；请先卸载旧游戏目录，再安装到新目录",
+                    f"Ledger is still bound to {recorded}; uninstall the previous game directory first.",
+                ),
+                {},
+            )
     owned = _owned_bootstrap(win64_dir, active)
     if not active:
-        return "not_installed", "Win64 未挂载引导文件", owned
+        return "not_installed", tr("Win64 未挂载引导文件", "Not mounted in Win64"), owned
     if active["state"] == "installing":
-        return "installing", "上次安装未完成；可在同一目录重试安装或执行卸载", owned
+        return (
+            "installing",
+            tr(
+                "上次安装未完成；可在同一目录重试安装或执行卸载",
+                "Previous installation was interrupted; retry Install in the same directory or run Uninstall",
+            ),
+            owned,
+        )
     if len(owned) != len(BOOTSTRAP_FILES):
-        return "drifted", "账本引导文件有缺失，其余文件归属已确认；可重新安装恢复", owned
-    return "installed", "已正常挂载 2 文件 BasePath 外部引导桥", owned
+        return (
+            "drifted",
+            tr(
+                "账本引导文件有缺失，其余文件归属已确认；可重新安装恢复",
+                "Some managed bootstrap files are missing (remaining files verified); re-run Install to repair",
+            ),
+            owned,
+        )
+    return "installed", tr("已正常挂载 2 文件 BasePath 外部引导桥", "Active (2-file external BasePath mount)"), owned
 
 
 def inspect_mount_state(win64_dir: Path, base_root: Path) -> tuple[str, str]:
@@ -570,14 +625,50 @@ def proton_launch_options(base_root: Path, utf8_guard: bool) -> tuple[str, str |
     preload = base_root.resolve() / "lib/wine-filename-utf8.so"
     warning = None
     if any(c.isspace() or c == ":" for c in str(preload)):
-        warning = ("LD_PRELOAD 按空白和冒号拆分路径，引号也无法转义；如需 UTF-8 preload shim，"
-                   "请将工具解压并安装到不含空格和冒号的路径。")
+        warning = tr(
+            "LD_PRELOAD 按空白和冒号拆分路径，引号也无法转义；如需 UTF-8 preload shim，请将工具解压并安装到不含空格和冒号的路径。",
+            "LD_PRELOAD splits paths on whitespace and colons; to enable the UTF-8 preload shim, extract/install into a path without spaces or colons.",
+        )
     options = ['WINEDLLOVERRIDES="dxgi=n,b"']
     if utf8_guard:
         options.append("HOST_LC_ALL=C.UTF-8")
         if not warning and preload.is_file():
             options.append(f"LD_PRELOAD={shlex.quote(str(preload))}")
     return " ".join(options + ["%command%"]), warning
+
+
+def detect_wwmi_core_version(wwmi_dir: Path) -> str | None:
+    core_ini = wwmi_dir / "Core/WWMI/WuWa-Model-Importer.ini"
+    if not core_ini.is_file():
+        return None
+    try:
+        text = core_ini.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    m = re.search(r'data\s*=\s*"WWMI\s+([0-9]+(?:\.[0-9]+)+)', text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r"global\s+\$wwmi_version\s*=\s*([0-9]+(?:\.[0-9]+)*)", text, flags=re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def scan_third_party_win64_addons(win64_dir: Path) -> list[str]:
+    if not win64_dir.is_dir():
+        return []
+    own = {"wwmi_dx12.addon64", "zz_wwmi_rt_pack.addon64"}
+    found: list[str] = []
+    try:
+        for p in sorted(win64_dir.iterdir(), key=lambda item: item.name.lower()):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in (".addon", ".addon64"):
+                continue
+            if p.name.lower() in own:
+                continue
+            found.append(p.name)
+    except OSError:
+        return []
+    return found
 
 
 def run_doctor(
@@ -592,40 +683,85 @@ def run_doctor(
     findings: list[DoctorFinding] = []
 
     if (win64_dir / TARGET_SHIPPING_EXE).is_file():
-        findings.append(DoctorFinding("ok", "exe_found", f"已定位游戏主程序：{win64_dir / TARGET_SHIPPING_EXE}"))
+        findings.append(DoctorFinding("ok", "exe_found", tr(
+            f"已定位游戏主程序：{win64_dir / TARGET_SHIPPING_EXE}",
+            f"Game executable found: {win64_dir / TARGET_SHIPPING_EXE}",
+        )))
     else:
-        findings.append(DoctorFinding("error", "exe_missing", f"未找到 {TARGET_SHIPPING_EXE}：{win64_dir}"))
+        findings.append(DoctorFinding("error", "exe_missing", tr(
+            f"未找到 {TARGET_SHIPPING_EXE}：{win64_dir}",
+            f"{TARGET_SHIPPING_EXE} not found in: {win64_dir}",
+        )))
 
     mount_state, mount_msg = inspect_mount_state(win64_dir, base_root)
     lvl = "ok" if mount_state in ("installed", "not_installed") else ("warn" if mount_state == "drifted" else "error")
     findings.append(DoctorFinding(lvl, f"mount_{mount_state}", mount_msg))
 
     if (wwmi_dir / "d3dx.ini").is_file():
-        findings.append(DoctorFinding("ok", "d3dx_ini_ok", f"已找到 WWMI 入口配置：{wwmi_dir / 'd3dx.ini'}"))
+        findings.append(DoctorFinding("ok", "d3dx_ini_ok", tr(
+            f"已找到 WWMI 入口配置：{wwmi_dir / 'd3dx.ini'}",
+            f"WWMI entry config found: {wwmi_dir / 'd3dx.ini'}",
+        )))
     else:
-        findings.append(DoctorFinding("error", "d3dx_ini_missing", f"WWMI 目录缺少 d3dx.ini：{wwmi_dir}"))
+        findings.append(DoctorFinding("error", "d3dx_ini_missing", tr(
+            f"WWMI 目录缺少 d3dx.ini：{wwmi_dir}",
+            f"d3dx.ini missing in WWMI directory: {wwmi_dir}",
+        )))
 
     core_ini = wwmi_dir / "Core/WWMI/WuWa-Model-Importer.ini"
     if core_ini.is_file():
-        findings.append(DoctorFinding("ok", "wwmi_core_ok", "Core/WWMI 核心脚本齐全"))
+        wwmi_ver = detect_wwmi_core_version(wwmi_dir)
+        findings.append(DoctorFinding("ok", "wwmi_core_ok", tr(
+            f"Core/WWMI 核心脚本齐全{f'（检测到 WWMI {wwmi_ver}）' if wwmi_ver else ''}",
+            f"Core/WWMI scripts found{f' (WWMI {wwmi_ver})' if wwmi_ver else ''}",
+        )))
     else:
         findings.append(
             DoctorFinding(
                 "warn",
                 "wwmi_core_missing",
-                f"未检测到 {core_ini}（请确保已解压官方 WWMI-Package 核心文件）",
+                tr(
+                    f"未检测到 {core_ini}（请确保已解压官方 WWMI-Package 核心文件）",
+                    f"Missing {core_ini} (extract official WWMI-Package Core/ files here)",
+                ),
+            )
+        )
+
+    third_party_addons = scan_third_party_win64_addons(win64_dir)
+    if third_party_addons:
+        joined = ", ".join(third_party_addons)
+        findings.append(
+            DoctorFinding(
+                "warn",
+                "third_party_win64_addons",
+                tr(
+                    f"检测到游戏 Win64 目录存在其他 ReShade 插件：{joined}。"
+                    "默认隔离模式仅加载外部 reshade-addons/；如需共存（例如 RenoDX），"
+                    "可将插件放入外部 reshade-addons/，或在外部 ReShade.ini 的 [ADDON] 下添加 LoadGameDirAddons=1"
+                    "（若游戏内 Mod 异常，请先临时停用第三方插件排查冲突）。",
+                    f"Detected other ReShade add-on(s) in Win64: {joined}. "
+                    "External mount loads <ExternalFolder>/reshade-addons/ by default; to coexist (e.g. RenoDX), "
+                    "copy them into <ExternalFolder>/reshade-addons/ or set LoadGameDirAddons=1 under [ADDON] in external ReShade.ini "
+                    "(disable third-party add-ons first if mods stop working in-game).",
+                ),
             )
         )
 
     rfx_hits, non_ascii = scan_mods_health(wwmi_dir)
     if len(rfx_hits) == 1:
-        findings.append(DoctorFinding("ok", "rabbitfx_unique", f"RabbitFX 实例唯一：{rfx_hits[0]}"))
+        findings.append(DoctorFinding("ok", "rabbitfx_unique", tr(
+            f"RabbitFX 实例唯一：{rfx_hits[0]}",
+            f"RabbitFX unique (1 copy): {rfx_hits[0]}",
+        )))
     elif len(rfx_hits) == 0:
         findings.append(
             DoctorFinding(
                 "warn",
                 "rabbitfx_missing",
-                "Mods 目录下未检测到 RabbitFX.ini（依赖 RabbitFX 槽位的皮肤可能缺失材质或发光）",
+                tr(
+                    "Mods 目录下未检测到 RabbitFX.ini（依赖 RabbitFX 槽位的皮肤可能缺失材质或发光）",
+                    "RabbitFX.ini not found under Mods/ (required by some material/glow skins)",
+                ),
             )
         )
     else:
@@ -634,7 +770,10 @@ def run_doctor(
             DoctorFinding(
                 "error",
                 "rabbitfx_duplicate",
-                f"检测到 {len(rfx_hits)} 份重复的 RabbitFX.ini（会导致着色器冲突错乱，请只保留 1 份）：{joined}",
+                tr(
+                    f"检测到 {len(rfx_hits)} 份重复的 RabbitFX.ini（会导致着色器冲突错乱，请只保留 1 份）：{joined}",
+                    f"Detected {len(rfx_hits)} duplicate copies of RabbitFX.ini (keep only ONE copy): {joined}",
+                ),
             )
         )
 
@@ -648,8 +787,12 @@ def run_doctor(
             if not in_sandbox:
                 findings.append(DoctorFinding(
                     "warn", "flatpak_wwmi_sandbox",
-                    f"Flatpak Steam 默认沙箱可能无法读取宿主机 WWMI 目录（{wwmi_res}）；"
-                    f"请迁移至 Flatpak 数据目录或执行：flatpak override --user --filesystem={shlex.quote(str(wwmi_res))} com.valvesoftware.Steam",
+                    tr(
+                        f"Flatpak Steam 默认沙箱可能无法读取宿主机 WWMI 目录（{wwmi_res}）；"
+                        f"请迁移至 Flatpak 数据目录或执行：flatpak override --user --filesystem={shlex.quote(str(wwmi_res))} com.valvesoftware.Steam",
+                        f"Flatpak Steam's sandbox may block access to host WWMI directory ({wwmi_res}); "
+                        f"move it inside Flatpak's data dir or run: flatpak override --user --filesystem={shlex.quote(str(wwmi_res))} com.valvesoftware.Steam",
+                    ),
                 ))
         options, warning = proton_launch_options(base_root, utf8_guard=True)
         if warning:
@@ -657,12 +800,21 @@ def run_doctor(
         if non_ascii:
             legacy = compatdata_dir / "user_settings.py" if compatdata_dir else None
             if legacy and _legacy_utf8_locale(legacy):
-                detail = "旧 compatdata/user_settings.py 中检测到 UTF-8 locale，但现代 Proton 不从此处读取。"
+                detail = tr(
+                    "旧 compatdata/user_settings.py 中检测到 UTF-8 locale，但现代 Proton 不从此处读取。",
+                    "Legacy compatdata/user_settings.py specifies a UTF-8 locale, which modern Proton ignores.",
+                )
             else:
-                detail = f"检测到 {len(non_ascii)} 个非 ASCII Mod 目录（如 {non_ascii[0]}）。"
+                detail = tr(
+                    f"检测到 {len(non_ascii)} 个非 ASCII Mod 目录（如 {non_ascii[0]}）。",
+                    f"Detected {len(non_ascii)} non-ASCII mod path(s) (e.g. {non_ascii[0]}).",
+                )
             findings.append(DoctorFinding(
                 "warn", "linux_utf8_notice",
-                f"{detail} 如需 UTF-8 护航，请在 Steam 本游戏的启动选项中填写：{options}",
+                tr(
+                    f"{detail} 如需 UTF-8 护航，请在 Steam 本游戏的启动选项中填写：{options}",
+                    f"{detail} For UTF-8 filename safety, set Steam Launch Options to: {options}",
+                ),
             ))
 
     return DoctorReport(
@@ -816,6 +968,42 @@ def build_external_reshade_ini() -> str:
     )
 
 
+def merge_external_reshade_ini(existing_text: str | None) -> str:
+    """Preserve user ReShade.ini customizations across upgrades while ensuring reshade-addons is searched first."""
+    if not existing_text or not existing_text.strip():
+        return build_external_reshade_ini()
+    eol = "\r\n" if "\r\n" in existing_text else "\n"
+    lines = existing_text.splitlines()
+    in_addon = False
+    addon_header_idx = -1
+    addon_path_idx = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_addon = stripped[1:-1].strip().lower() == "addon"
+            if in_addon and addon_header_idx < 0:
+                addon_header_idx = i
+            continue
+        if in_addon and "=" in line and not stripped.startswith((";", "#")):
+            key, _, _val = line.partition("=")
+            if key.strip().lower() == "addonpath":
+                addon_path_idx = i
+                break
+    if addon_path_idx >= 0:
+        key, _, val = lines[addon_path_idx].partition("=")
+        tokens = [t.strip() for part in val.split(",") for t in part.split(";") if t.strip()]
+        if not any(t.replace("\\", "/").rstrip("/").lower() == "reshade-addons" for t in tokens):
+            updated = "reshade-addons," + val.strip() if val.strip() else "reshade-addons"
+            lines[addon_path_idx] = f"{key.strip()}={updated}"
+    elif addon_header_idx >= 0:
+        lines.insert(addon_header_idx + 1, "AddonPath=reshade-addons")
+    else:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend(["[ADDON]", "AddonPath=reshade-addons"])
+    return eol.join(lines) + eol
+
+
 def build_win64_stub_reshade_ini(engine_base_path: str) -> str:
     return f"[INSTALL]\nBasePath={engine_base_path}\n"
 
@@ -961,7 +1149,9 @@ def install_mount(
                 _atomic_write(dst, dxgi_data if rel == "host/ReShade64-game-forward.dll" else src.read_bytes())
         for sub in ("runtime/logs", "runtime/cache/shaders", "runtime/seed", "seed"):
             (base_root / sub).mkdir(parents=True, exist_ok=True)
-        _atomic_write(base_root / "ReShade.ini", build_external_reshade_ini().encode("utf-8"))
+        ext_reshade_path = base_root / "ReShade.ini"
+        existing_reshade = ext_reshade_path.read_text(encoding="utf-8", errors="ignore") if _regular_file(ext_reshade_path) else None
+        _atomic_write(ext_reshade_path, merge_external_reshade_ini(existing_reshade).encode("utf-8"))
         _atomic_write(base_root / "wwmi_dx12.ini", encode_wwmi_dx12_ini(
             build_wwmi_dx12_ini(engine_wwmi, engine_runtime, skin_mode=skin_mode)
         ))
@@ -1002,7 +1192,13 @@ def uninstall_mount(
     """Stage only bootstrap files with a verified name, location and digest."""
     base_root = base_root.resolve()
     ledger_path = _ledger_path(base_root)
-    noop = {"state": "noop", "message": f"未发现活动中的安装账本（{ledger_path}）"}
+    noop = {
+        "state": "noop",
+        "message": tr(
+            f"未发现活动中的安装账本（{ledger_path}）",
+            f"No active installation ledger found ({ledger_path})",
+        ),
+    }
 
     def preview(ledger: dict) -> list[Path]:
         win64 = Path(ledger["win64_dir"])

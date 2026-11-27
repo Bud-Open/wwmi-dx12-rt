@@ -51,6 +51,28 @@
 | **`SD`（极速精简包）/ 极低画质设置** | **存在边界限制** | ① 社区 Mod 仅针对 **LOD0 高模网格**制作，请将「角色精细度 / LOD」保持在 **高**（避免切换至 LOD1/LOD2 变回原版模型）；② 若 `SD` 包将未命中哈希的辅助贴图压缩至 `< 256×256`，局部小贴图将安全回退为原版材质。 |
 | **渲染 API 模式** | **必须为 DirectX 12** | 请勿勾选「使用 DX11 启动」或传入 `-dx11`（DX11 模式请继续使用原版 XXMI Launcher）。 |
 
+### 已实测皮肤清单与兼容范围说明
+
+> **兼容范围声明**：本项目采用 100% 通用渲染架构（无任何单角色/单皮肤硬编码），但受限于人力，**目前我们仅实机测试过以下皮肤**（测试环境：DX12 + 硬件光线追踪 + 4K UHD `-krqlv=uhd`，按需共用唯一一份 `RabbitFX`，覆盖 `WWMI 1.1.0` 与 `WWMI 1.2.2`），**无法保证社区所有皮肤均 100% 正常**。
+
+当前已实测运行正常的皮肤：
+- `Chisa Shrine Maiden NSFW`
+- `Hiyuki - Mist of Morning Glory`
+- `hsin-Moonover Fox`
+- `Iuno Sapphire Moon`
+- `Lily Lewd Saint`
+- `Lynae - Origin Toggle`
+- `shorekeeper OL NSFW switch`
+- `Suoming-Crimson Nocturne`
+- `洛瑟菈-暗夜魅影-序列045`
+- `清宵-夏日清风-序列058`
+- `穗穗-白澜穗光-序列053`
+
+如果遇到其他皮肤无法生效、贴图异常或渲染错乱，欢迎提交 **[GitHub Issue](https://github.com/Bud-Open/wwmi-dx12-rt/issues)** 并附上：
+1. **异常皮肤的名称**与**下载地址**；
+2. 最新一份运行日志 `wwmi_dx12_candidate-*.log`（位于 `<外部目录>/runtime/logs/`）；
+3. 游戏内画质设置（**硬件光追开/关**、**DLSS/FSR 帧生成**、`UHD`/`HD`/`SD` 资源包，以及是否同时加载了其他 ReShade 插件）。
+
 ---
 
 ## 快速安装与卸载指南
@@ -104,8 +126,12 @@
   - Linux/Proton 用户确认 Steam 启动选项已填入 `WINEDLLOVERRIDES="dxgi=n,b" %command%`；
   - 游戏内按 **`Home`**，确认状态面板显示绿色 `DX12 Ray Tracing + Hybrid Raster active` 且 `Active mods > 0`；
   - 确认 `WWMI` 目录下存在 `Core/WWMI/WuWa-Model-Importer.ini`。
-- **安装器拒绝覆盖现有 `dxgi.dll` 或 `ReShade.ini`**
-  - 这是防冲突保护机制，防止覆盖第三方 ReShade/OptiScaler/XXMI 或旧挂载残留。请先移除第三方文件，或在旧外部目录执行一次【卸载还原】后再安装。
+- **安装器拒绝覆盖现有 `dxgi.dll` 或 `ReShade.ini` / 与 RenoDX 等第三方 ReShade 插件共存**
+  - 这是防冲突保护机制，防止覆盖第三方 ReShade/OptiScaler/XXMI 或旧挂载残留。请先备份移走原 `Win64/dxgi.dll` 与 `Win64/ReShade.ini`（或在旧外部目录执行一次【卸载还原】）后再安装。
+  - **注意**：WWMI-DX12-RT 必须使用本包配对的 `dxgi.dll`（`ReShade64-game-forward.dll`）才能提供 DX12+RT 挂钩，切勿替换为原版 ReShade `dxgi.dll`。
+  - 如需同时加载 RenoDX 等第三方 ReShade 插件，可将对应 `*.addon64` 复制到 `<外部目录>/reshade-addons/`，或在 `<外部目录>/ReShade.ini` 的 `[ADDON]` 下设置 `LoadGameDirAddons=1`（或在 `AddonPath` 中以逗号/分号追加多目录）；后续升级重装会自动保留你的外部 `ReShade.ini` 自定义项。若游戏内 Mod 异常，请先临时停用第三方插件排查冲突。
+- **WWMI 核心版本兼容（`1.1.0` 与 `1.2.2+`）**
+  - 同时兼容旧版 `WWMI 1.1.0` 与新版 `WWMI 1.2.2+` 核心包：自动屏蔽仅面向 DX11 XXMI DLL 的 `v1.3.3+` dHash 误报提示，同时放行 **`X`** 键正常关闭真实 Mod 提示框。
 - **部分老旧 Hash Mod 在 4K UHD（`-krqlv=uhd`）下贴图错位**
   - 运行时 Route 3 会自动学习并缓存；若需批量转为跨画质、跨补丁的 Hash-Free 格式，可使用 [`tools/README.md`](./tools/README.md) 中的离线迁移与种子管理工具。
 - **日志与缓存在哪里？**

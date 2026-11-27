@@ -52,6 +52,40 @@ namespace {
 
 constexpr const wchar_t* kShippingExe = L"Client-Win64-Shipping.exe";
 
+bool g_zh_ui = false;
+
+bool DetectChineseUi(const std::wstring& cli_lang = {})
+{
+    auto parse_lang = [](std::wstring v) -> int {
+        for (wchar_t& c : v) c = (wchar_t)towlower(c);
+        while (!v.empty() && (v.front() == L' ' || v.front() == L'\t')) v.erase(v.begin());
+        while (!v.empty() && (v.back() == L' ' || v.back() == L'\t')) v.pop_back();
+        if (v.rfind(L"en", 0) == 0) return 0;
+        if (v.rfind(L"zh", 0) == 0) return 1;
+        return -1;
+    };
+    if (!cli_lang.empty()) {
+        const int r = parse_lang(cli_lang);
+        if (r >= 0) return r == 1;
+    }
+    wchar_t env[64]{};
+    if (GetEnvironmentVariableW(L"WWMI_SETUP_LANG", env, (DWORD)std::size(env)) > 0) {
+        const int r = parse_lang(env);
+        if (r >= 0) return r == 1;
+    }
+    return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_CHINESE;
+}
+
+inline const wchar_t* TrW(const wchar_t* zh, const wchar_t* en) noexcept
+{
+    return g_zh_ui ? zh : en;
+}
+
+inline const char* TrA(const char* zh, const char* en) noexcept
+{
+    return g_zh_ui ? zh : en;
+}
+
 std::string WideToUtf8(const std::wstring& w)
 {
     if (w.empty()) return {};
@@ -197,7 +231,8 @@ bool RegularFileOrMissing(const fs::path& path)
         WinError("无法检查文件", path, error);
     }
     if (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE))
-        throw std::runtime_error("拒绝操作非普通文件（含链接/重解析点）：" + WideToUtf8(path.wstring()));
+        throw std::runtime_error(std::string(TrA("拒绝操作非普通文件（含链接/重解析点）：",
+            "Refusing to operate on a non-regular file (directory/symlink/reparse point): ")) + WideToUtf8(path.wstring()));
     return true;
 }
 
@@ -441,7 +476,7 @@ bool InitWwmiSkeleton(const fs::path& target_dir, std::wstring& err_out)
     fs::create_directories(target_dir / L"Core", ec);
     fs::create_directories(target_dir / L"ShaderFixes", ec);
     if (ec) {
-        err_out = L"无法创建目录：" + target_dir.wstring();
+        err_out = std::wstring(TrW(L"无法创建目录：", L"Failed to create directory: ")) + target_dir.wstring();
         return false;
     }
     const fs::path d3dx = target_dir / L"d3dx.ini";
@@ -459,7 +494,7 @@ bool InitWwmiSkeleton(const fs::path& target_dir, std::wstring& err_out)
             "Key = no_modifiers VK_F10\r\n"
             "type = reload_config\r\n";
         if (!WriteUtf8File(d3dx, txt)) {
-            err_out = L"无法写入 d3dx.ini：" + d3dx.wstring();
+            err_out = std::wstring(TrW(L"无法写入 d3dx.ini：", L"Failed to write d3dx.ini: ")) + d3dx.wstring();
             return false;
         }
     }
@@ -564,8 +599,11 @@ LedgerInfo ReadLedger(const fs::path& base_root)
         }
         return info;
     } catch (const std::exception& e) {
-        throw std::runtime_error("安装账本损坏或无法读取：" + WideToUtf8(path.wstring()) +
-            "。请从备份恢复账本；无备份时先人工核对原 Win64 引导文件归属。（" + e.what() + "）");
+        throw std::runtime_error(g_zh_ui
+            ? ("安装账本损坏或无法读取：" + WideToUtf8(path.wstring()) +
+               "。请从备份恢复账本；无备份时先人工核对原 Win64 引导文件归属。（" + e.what() + "）")
+            : ("Install ledger is corrupted or unreadable: " + WideToUtf8(path.wstring()) +
+               ". Restore it from backup or inspect your Win64 bootstrap files manually. (" + e.what() + ")"));
     }
 }
 
@@ -589,10 +627,17 @@ Hashes OwnedBootstrap(const fs::path& win64_dir, const LedgerInfo& ledger)
         if (!RegularFileOrMissing(path)) continue;
         const auto name = WideToUtf8(kBootstrap[i]);
         if (!ledger.active())
-            throw std::runtime_error("Win64/" + name + " 已存在，但没有对应的活动账本，拒绝覆盖（若为旧版换目录升级，请先在旧目录卸载，或覆盖原目录并保留 runtime\\install-ledger.json 后重装）");
+            throw std::runtime_error(g_zh_ui
+                ? ("Win64/" + name + " 已存在，但没有对应的活动账本，拒绝覆盖（若已有其他 ReShade/DXGI，请先备份移走原 Win64\\" + name + " 与 ReShade.ini 后重试；WWMI-DX12-RT 需使用配对宿主，第三方 .addon64 如 RenoDX 可放入外部 reshade-addons\\ 或在外部 ReShade.ini 设 LoadGameDirAddons=1 共存。若为旧版换目录升级，请先在旧目录卸载，或覆盖原目录并保留 runtime\\install-ledger.json 后重装）")
+                : ("Win64/" + name + " already exists without an active WWMI-DX12-RT ledger; refusing to overwrite. "
+                   "If you already use ReShade/DXGI, back up and move Win64\\" + name + " and Win64\\ReShade.ini first, then retry Install. "
+                   "WWMI-DX12-RT requires its paired dxgi.dll; to keep third-party .addon64 add-ons (e.g. RenoDX), place them in <ExternalFolder>\\reshade-addons\\ or set LoadGameDirAddons=1 under [ADDON] in <ExternalFolder>\\ReShade.ini. "
+                   "If upgrading from another folder, uninstall from the old folder first or extract over it while keeping runtime\\install-ledger.json."));
         owned[i] = Sha256Hex(ReadFileChecked(path));
         if (owned[i] != ledger.sha256[i] && owned[i] != ledger.previous_sha256[i])
-            throw std::runtime_error("Win64/" + name + " 哈希与账本不一致，拒绝修改");
+            throw std::runtime_error(g_zh_ui
+                ? ("Win64/" + name + " 哈希与账本不一致，拒绝修改")
+                : ("Win64/" + name + " hash does not match the install ledger; refusing to modify."));
     }
     return owned;
 }
@@ -602,23 +647,27 @@ enum class MountState { NotInstalled, Installed, Drifted, Installing, ActiveElse
 MountState ClassifyMount(const fs::path& win64, const LedgerInfo& ledger, std::wstring& msg, Hashes& owned)
 {
     if (ledger.active() && !SamePath(ledger.win64_dir, win64)) {
-        msg = L"账本仍绑定 " + ledger.win64_dir.wstring() + L"；请先卸载旧游戏目录，再安装到新目录。";
+        msg = g_zh_ui
+            ? (L"账本仍绑定 " + ledger.win64_dir.wstring() + L"；请先卸载旧游戏目录，再安装到新目录。")
+            : (L"Ledger is still bound to " + ledger.win64_dir.wstring() + L". Uninstall the previous game directory first.");
         return MountState::ActiveElsewhere;
     }
     owned = OwnedBootstrap(win64, ledger);
     if (!ledger.active()) {
-        msg = L"Win64 未挂载引导文件。";
+        msg = TrW(L"Win64 未挂载引导文件。", L"Not mounted in Win64.");
         return MountState::NotInstalled;
     }
     if (ledger.state == LedgerInfo::State::Installing) {
-        msg = L"上次安装未完成；可在同一目录重试安装或执行卸载。";
+        msg = TrW(L"上次安装未完成；可在同一目录重试安装或执行卸载。",
+                  L"Previous installation was interrupted; retry Install in the same directory or run Uninstall.");
         return MountState::Installing;
     }
     if (owned[0].empty() || owned[1].empty()) {
-        msg = L"账本引导文件有缺失，其余文件归属已确认；可重新安装恢复。";
+        msg = TrW(L"账本引导文件有缺失，其余文件归属已确认；可重新安装恢复。",
+                  L"Some managed bootstrap files are missing (remaining files verified); re-run Install to repair.");
         return MountState::Drifted;
     }
-    msg = L"已正常挂载 2 文件 BasePath 外部引导桥。";
+    msg = TrW(L"已正常挂载 2 文件 BasePath 外部引导桥。", L"Active (2-file external BasePath mount).");
     return MountState::Installed;
 }
 
@@ -631,6 +680,111 @@ MountState InspectMountState(const fs::path& win64_dir, const fs::path& base_roo
         msg_out = Utf8ToWide(e.what());
         return MountState::Conflict;
     }
+}
+
+std::wstring DetectWwmiCoreVersion(const fs::path& wwmi_dir)
+{
+    const std::string text = ReadUtf8File(wwmi_dir / L"Core\\WWMI\\WuWa-Model-Importer.ini");
+    if (text.empty()) return {};
+    std::smatch m;
+    if (std::regex_search(text, m, std::regex(R"(data\s*=\s*\"WWMI\s+([0-9]+(?:\.[0-9]+)+))", std::regex::icase)))
+        return Utf8ToWide(m[1].str());
+    if (std::regex_search(text, m, std::regex(R"(global\s+\$wwmi_version\s*=\s*([0-9]+(?:\.[0-9]+)*))", std::regex::icase)))
+        return Utf8ToWide(m[1].str());
+    return {};
+}
+
+std::vector<std::wstring> ScanThirdPartyWin64Addons(const fs::path& win64_dir)
+{
+    std::vector<std::wstring> found;
+    std::error_code ec;
+    if (!fs::is_directory(win64_dir, ec)) return found;
+    for (const fs::directory_entry& e : fs::directory_iterator(win64_dir, fs::directory_options::skip_permission_denied, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        const std::wstring ext = LowerWide(e.path().extension().wstring());
+        if (ext != L".addon" && ext != L".addon64") continue;
+        const std::wstring name = e.path().filename().wstring();
+        if (_wcsicmp(name.c_str(), L"wwmi_dx12.addon64") == 0 ||
+            _wcsicmp(name.c_str(), L"zz_wwmi_rt_pack.addon64") == 0)
+            continue;
+        found.push_back(name);
+    }
+    std::sort(found.begin(), found.end(), [](const std::wstring& a, const std::wstring& b) {
+        return _wcsicmp(a.c_str(), b.c_str()) < 0;
+    });
+    return found;
+}
+
+std::string MergeExternalReShadeIni(const fs::path& ini_path)
+{
+    const std::string kDefault =
+        "[INSTALL]\r\nLogging=0\r\n\r\n[ADDON]\r\nAddonPath=reshade-addons\r\n\r\n[OVERLAY]\r\nTutorialProgress=4\r\n";
+    if (!RegularFileOrMissing(ini_path)) return kDefault;
+    const std::string existing = ReadFileChecked(ini_path);
+    auto trim_ascii = [](std::string s) {
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r')) s.erase(s.begin());
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.pop_back();
+        return s;
+    };
+    auto lower_ascii = [](std::string s) {
+        for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        return s;
+    };
+    if (trim_ascii(existing).empty()) return kDefault;
+
+    const std::string eol = existing.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+    std::vector<std::string> lines;
+    std::istringstream iss(existing);
+    for (std::string line; std::getline(iss, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(std::move(line));
+    }
+    bool in_addon = false;
+    int addon_header_idx = -1;
+    int addon_path_idx = -1;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string trimmed = trim_ascii(lines[i]);
+        if (trimmed.size() >= 2 && trimmed.front() == '[' && trimmed.back() == ']') {
+            in_addon = lower_ascii(trim_ascii(trimmed.substr(1, trimmed.size() - 2))) == "addon";
+            if (in_addon && addon_header_idx < 0) addon_header_idx = (int)i;
+            continue;
+        }
+        if (in_addon && !trimmed.empty() && trimmed.front() != ';' && trimmed.front() != '#') {
+            const size_t eq = lines[i].find('=');
+            if (eq != std::string::npos && lower_ascii(trim_ascii(lines[i].substr(0, eq))) == "addonpath") {
+                addon_path_idx = (int)i;
+                break;
+            }
+        }
+    }
+    if (addon_path_idx >= 0) {
+        const size_t eq = lines[addon_path_idx].find('=');
+        const std::string key = trim_ascii(lines[addon_path_idx].substr(0, eq));
+        const std::string val = trim_ascii(lines[addon_path_idx].substr(eq + 1));
+        bool has_default = false;
+        size_t pos = 0;
+        while (pos <= val.size()) {
+            size_t sep = val.find_first_of(",;", pos);
+            std::string tok = lower_ascii(trim_ascii(sep == std::string::npos ? val.substr(pos) : val.substr(pos, sep - pos)));
+            for (char& c : tok) if (c == '\\') c = '/';
+            while (!tok.empty() && tok.back() == '/') tok.pop_back();
+            if (tok == "reshade-addons") { has_default = true; break; }
+            if (sep == std::string::npos) break;
+            pos = sep + 1;
+        }
+        if (!has_default) {
+            lines[addon_path_idx] = key + "=" + (val.empty() ? "reshade-addons" : ("reshade-addons," + val));
+        }
+    } else if (addon_header_idx >= 0) {
+        lines.insert(lines.begin() + addon_header_idx + 1, "AddonPath=reshade-addons");
+    } else {
+        if (!lines.empty() && !trim_ascii(lines.back()).empty()) lines.emplace_back();
+        lines.emplace_back("[ADDON]");
+        lines.emplace_back("AddonPath=reshade-addons");
+    }
+    std::ostringstream out;
+    for (const std::string& l : lines) out << l << eol;
+    return out.str();
 }
 
 int CountRabbitFxInstances(const fs::path& wwmi_dir)
@@ -776,12 +930,15 @@ bool PerformInstall(const fs::path& raw_game_dir, const fs::path& raw_wwmi_dir, 
 {
     try {
         if (IsGameRunning())
-            throw std::runtime_error("检测到《鸣潮》正在运行，请先退出游戏再安装。");
+            throw std::runtime_error(TrA("检测到《鸣潮》正在运行，请先退出游戏再安装。",
+                "Wuthering Waves is currently running. Close the game and retry."));
         const auto provided_win64 = ResolveWin64FromAnyGameDir(raw_game_dir);
         if (provided_win64.empty())
-            throw std::runtime_error("无效的游戏目录（未找到 Client-Win64-Shipping.exe）。");
+            throw std::runtime_error(TrA("无效的游戏目录（未找到 Client-Win64-Shipping.exe）。",
+                "Invalid game directory (Client-Win64-Shipping.exe not found)."));
         if (raw_wwmi_dir.empty() || !fs::is_regular_file(raw_wwmi_dir / L"d3dx.ini"))
-            throw std::runtime_error("无效的 WWMI 目录（未找到 d3dx.ini）。请选择已有 WWMI 或点击【新建骨架】。");
+            throw std::runtime_error(TrA("无效的 WWMI 目录（未找到 d3dx.ini）。请选择已有 WWMI 或点击【新建骨架】。",
+                "Invalid WWMI directory (d3dx.ini not found). Select an existing WWMI folder or click [Init Skeleton]."));
         const auto win64 = CanonicalPath(provided_win64);
         const auto wwmi = CanonicalPath(raw_wwmi_dir);
         const auto base = CanonicalPath(raw_base);
@@ -842,8 +999,7 @@ bool PerformInstall(const fs::path& raw_game_dir, const fs::path& raw_wwmi_dir, 
         const auto runtime = base / L"runtime";
         for (const auto* dir : { L"logs", L"cache\\shaders", L"seed" }) fs::create_directories(runtime / dir);
         fs::create_directories(base / L"seed");
-        AtomicWrite(base / L"ReShade.ini",
-            "[INSTALL]\r\nLogging=0\r\n\r\n[ADDON]\r\nAddonPath=reshade-addons\r\n\r\n[OVERLAY]\r\nTutorialProgress=4\r\n");
+        AtomicWrite(base / L"ReShade.ini", MergeExternalReShadeIni(base / L"ReShade.ini"));
         const std::wstring wini = L"\ufeff; Managed by WWMI-DX12-RT Setup\r\n[wwmi-dx12]\r\nwwmi_dir=" +
             wwmi.wstring() + L"\r\nskin_mode=base\r\nruntime_dir=" + runtime.wstring() +
             L"\r\nmax_logs=10\r\ntex_struct_fallback=1\r\ndebug=0\r\nlog_level=1\r\n";
@@ -851,7 +1007,8 @@ bool PerformInstall(const fs::path& raw_game_dir, const fs::path& raw_wwmi_dir, 
             std::string(reinterpret_cast<const char*>(wini.data()), wini.size() * sizeof(wchar_t)));
 
         if (IsGameRunning())
-            throw std::runtime_error("检测到《鸣潮》正在运行，请先退出游戏再安装。");
+            throw std::runtime_error(TrA("检测到《鸣潮》正在运行，请先退出游戏再安装。",
+                "Wuthering Waves is currently running. Close the game and retry."));
         const auto current = OwnedBootstrap(win64, ReadLedger(base));
         std::vector<fs::path> old_files;
         for (size_t i = 0; i < kBootstrap.size(); ++i)
@@ -865,10 +1022,27 @@ bool PerformInstall(const fs::path& raw_game_dir, const fs::path& raw_wwmi_dir, 
             if (!MoveFileExW(temp.c_str(), dest.c_str(), MOVEFILE_WRITE_THROUGH)) WinError("无法提交引导文件", dest);
         }
         write_ledger(false);
-        msg_out = L"安装启用成功！请使用 DirectX 12 模式从库洛官方启动器或 Steam 开始游戏。";
+        msg_out = TrW(
+            L"安装启用成功！请使用 DirectX 12 模式从库洛官方启动器或 Steam 开始游戏。",
+            L"Installed and enabled! Launch Wuthering Waves in DirectX 12 mode from the Kuro Launcher or Steam.");
         std::error_code core_ec;
         if (!fs::is_regular_file(wwmi / L"Core\\WWMI\\WuWa-Model-Importer.ini", core_ec)) {
-            msg_out += L"\r\n\r\n[提示] 尚未检测到官方 Core\\WWMI 核心文件，请将官方 WWMI-Package 的 Core 目录放入该 WWMI 文件夹后再使用角色皮肤（需要 RabbitFX 的皮肤请在 Mods 下仅保留一份）。";
+            msg_out += TrW(
+                L"\r\n\r\n[提示] 尚未检测到官方 Core\\WWMI 核心文件，请将官方 WWMI-Package 的 Core 目录放入该 WWMI 文件夹后再使用角色皮肤（需要 RabbitFX 的皮肤请在 Mods 下仅保留一份）。",
+                L"\r\n\r\n[Note] Official Core\\WWMI files were not detected yet. Copy WWMI-Package's Core\\ folder into this WWMI directory before using character mods (keep at most one copy of RabbitFX under Mods\\).");
+        }
+        const auto extra_addons = ScanThirdPartyWin64Addons(win64);
+        if (!extra_addons.empty()) {
+            std::wstring list_str;
+            for (size_t i = 0; i < extra_addons.size(); ++i) {
+                if (i) list_str += L", ";
+                list_str += extra_addons[i];
+            }
+            msg_out += g_zh_ui
+                ? (L"\r\n\r\n[提示] 检测到游戏 Win64 目录存在其他 ReShade 插件（" + list_str +
+                   L"）。如需一起加载（例如 RenoDX），可将其复制到本工具 reshade-addons\\，或在外部 ReShade.ini 的 [ADDON] 下添加 LoadGameDirAddons=1（若游戏内 Mod 异常请先临时停用第三方插件排查）。")
+                : (L"\r\n\r\n[Note] Detected other ReShade add-on(s) in Win64: " + list_str +
+                   L". To load them alongside WWMI-DX12-RT (e.g. RenoDX), either copy them into <ExternalFolder>\\reshade-addons\\ or add LoadGameDirAddons=1 under [ADDON] in <ExternalFolder>\\ReShade.ini. If mods stop working in-game, temporarily disable third-party add-ons to check for conflicts.");
         }
         return true;
     } catch (const std::exception& e) {
@@ -881,15 +1055,20 @@ bool PerformUninstall(const fs::path& raw_base, std::wstring& msg_out)
 {
     try {
         if (IsGameRunning())
-            throw std::runtime_error("检测到《鸣潮》正在运行，请先退出游戏再卸载。");
+            throw std::runtime_error(TrA("检测到《鸣潮》正在运行，请先退出游戏再卸载。",
+                "Wuthering Waves is currently running. Close the game and retry Uninstall."));
         const auto base = CanonicalPath(raw_base);
-        const auto noop = [&]() { msg_out = L"当前没有活动中的安装记录，无需卸载。"; return true; };
+        const auto noop = [&]() {
+            msg_out = TrW(L"当前没有活动中的安装记录，无需卸载。", L"No active installation ledger found; nothing to uninstall.");
+            return true;
+        };
         if (!ReadLedger(base).active()) return noop();
         const MountLock lock(base);
         const auto ledger = ReadLedger(base);
         if (!ledger.active()) return noop();
         if (!SamePath(ledger.win64_dir, CanonicalPath(ledger.win64_dir)))
-            throw std::runtime_error("原 Win64 目录现在指向其他位置，拒绝卸载。");
+            throw std::runtime_error(TrA("原 Win64 目录现在指向其他位置，拒绝卸载。",
+                "Recorded Win64 directory now resolves elsewhere; refusing to uninstall."));
         const auto owned = OwnedBootstrap(ledger.win64_dir, ledger);
         std::vector<fs::path> files;
         for (size_t i = 0; i < kBootstrap.size(); ++i)
@@ -901,7 +1080,9 @@ bool PerformUninstall(const fs::path& raw_base, std::wstring& msg_out)
         journal << "{\n  \"schema_version\": 1,\n  \"state\": \"uninstalled\",\n  \"win64_dir\": \""
             << JsonEscape(ledger.win64_dir.wstring()) << "\",\n  \"staged_batch\": \"" << JsonEscape(batch.wstring()) << "\"\n}\n";
         AtomicWrite(JournalPath(base), journal.str());
-        msg_out = batch.empty() ? L"已卸载：引导文件均已不存在。" : L"已卸载，引导文件暂存于：" + batch.wstring();
+        msg_out = batch.empty()
+            ? std::wstring(TrW(L"已卸载：引导文件均已不存在。", L"Uninstalled: bootstrap files were already absent."))
+            : (std::wstring(TrW(L"已卸载，引导文件暂存于：", L"Uninstalled. Staged bootstrap backup: ")) + batch.wstring());
         return true;
     } catch (const std::exception& e) {
         msg_out = Utf8ToWide(e.what());
@@ -912,36 +1093,63 @@ bool PerformUninstall(const fs::path& raw_base, std::wstring& msg_out)
 std::wstring BuildDoctorText(const fs::path& raw_game, const fs::path& raw_wwmi, const fs::path& base_root)
 {
     std::wostringstream ss;
-    ss << L"外部挂载程序根：" << NormWinPath(base_root) << L"\r\n";
+    ss << TrW(L"外部挂载程序根：", L"External runtime root: ") << NormWinPath(base_root) << L"\r\n";
 
     const fs::path win64 = ResolveWin64FromAnyGameDir(raw_game);
     if (win64.empty()) {
-        ss << L"[错误] 游戏目录：未找到 Client-Win64-Shipping.exe\r\n";
+        ss << TrW(L"[错误] 游戏目录：未找到 Client-Win64-Shipping.exe\r\n",
+                  L"[ERR]  Game directory: Client-Win64-Shipping.exe not found\r\n");
     } else {
-        ss << L"[正常] 游戏 Win64：" << win64.wstring() << L"\r\n";
+        ss << TrW(L"[正常] 游戏 Win64：", L"[OK]   Game Win64: ") << win64.wstring() << L"\r\n";
         std::wstring mmsg;
         InspectMountState(win64, base_root, mmsg);
-        ss << L"[状态] 挂载检查：" << mmsg << L"\r\n";
+        ss << TrW(L"[状态] 挂载检查：", L"[INFO] Mount status: ") << mmsg << L"\r\n";
     }
 
     std::error_code ec;
     if (raw_wwmi.empty() || !fs::is_regular_file(raw_wwmi / L"d3dx.ini", ec)) {
-        ss << L"[待设] WWMI 目录：尚未关联有效的 d3dx.ini（可选中已有 XXMI\\WWMI 或点击新建骨架）\r\n";
+        ss << TrW(L"[待设] WWMI 目录：尚未关联有效的 d3dx.ini（可选中已有 XXMI\\WWMI 或点击新建骨架）\r\n",
+                  L"[WARN] WWMI directory: no d3dx.ini linked yet (select an existing XXMI\\WWMI folder or click Init Skeleton)\r\n");
     } else {
         const fs::path wwmi = NormWinPath(raw_wwmi);
-        ss << L"[正常] WWMI 目录：" << wwmi.wstring() << L"\r\n";
-        if (fs::is_regular_file(wwmi / L"Core\\WWMI\\WuWa-Model-Importer.ini", ec))
-            ss << L"[正常] Core\\WWMI 核心包齐全\r\n";
-        else
-            ss << L"[提示] 缺少 Core\\WWMI\\WuWa-Model-Importer.ini（请放入官方 WWMI-Package 核心文件）\r\n";
+        ss << TrW(L"[正常] WWMI 目录：", L"[OK]   WWMI directory: ") << wwmi.wstring() << L"\r\n";
+        if (fs::is_regular_file(wwmi / L"Core\\WWMI\\WuWa-Model-Importer.ini", ec)) {
+            const std::wstring ver = DetectWwmiCoreVersion(wwmi);
+            if (g_zh_ui)
+                ss << L"[正常] Core\\WWMI 核心包齐全" << (ver.empty() ? L"" : (L"（检测到 WWMI " + ver + L"）")) << L"\r\n";
+            else
+                ss << L"[OK]   Core\\WWMI scripts found" << (ver.empty() ? L"" : (L" (WWMI " + ver + L")")) << L"\r\n";
+        } else {
+            ss << TrW(L"[提示] 缺少 Core\\WWMI\\WuWa-Model-Importer.ini（请放入官方 WWMI-Package 核心文件）\r\n",
+                      L"[WARN] Missing Core\\WWMI\\WuWa-Model-Importer.ini (place official WWMI-Package Core\\ files here)\r\n");
+        }
+        if (!win64.empty()) {
+            const auto extra_addons = ScanThirdPartyWin64Addons(win64);
+            if (!extra_addons.empty()) {
+                std::wstring list_str;
+                for (size_t i = 0; i < extra_addons.size(); ++i) {
+                    if (i) list_str += L", ";
+                    list_str += extra_addons[i];
+                }
+                if (g_zh_ui)
+                    ss << L"[提示] Win64 存在其他 ReShade 插件：" << list_str
+                       << L"（需放入外部 reshade-addons\\ 或在外部 ReShade.ini [ADDON] 中设 LoadGameDirAddons=1 才会加载）\r\n";
+                else
+                    ss << L"[WARN] Other ReShade add-on(s) in Win64: " << list_str
+                       << L" (copy into <ExternalFolder>\\reshade-addons\\ or set LoadGameDirAddons=1 under [ADDON] in external ReShade.ini to load them)\r\n";
+            }
+        }
 
         const int rfx = CountRabbitFxInstances(wwmi);
         if (rfx == 1)
-            ss << L"[正常] RabbitFX.ini 实例唯一 (1 份)\r\n";
+            ss << TrW(L"[正常] RabbitFX.ini 实例唯一 (1 份)\r\n", L"[OK]   RabbitFX.ini unique (1 copy)\r\n");
         else if (rfx == 0)
-            ss << L"[提示] Mods 下未检测到 RabbitFX.ini（部分材质/发光 Mod 需要安装 RabbitFX）\r\n";
-        else
+            ss << TrW(L"[提示] Mods 下未检测到 RabbitFX.ini（部分材质/发光 Mod 需要安装 RabbitFX）\r\n",
+                      L"[WARN] RabbitFX.ini not found under Mods\\ (required by some material/glow mods)\r\n");
+        else if (g_zh_ui)
             ss << L"[错误] 检测到 " << rfx << L" 份重复的 RabbitFX.ini！请只保留唯一一份以免着色器冲突\r\n";
+        else
+            ss << L"[ERR]  Detected " << rfx << L" duplicate copies of RabbitFX.ini! Keep only ONE copy to avoid shader conflicts.\r\n";
     }
     return ss.str();
 }
@@ -966,6 +1174,7 @@ int RunCli(int argc, wchar_t** argv, const fs::path& base_root)
         if (a == L"--cli" && i + 1 < argc) action = argv[++i];
         else if (a == L"--game" && i + 1 < argc) game_arg = argv[++i];
         else if (a == L"--wwmi" && i + 1 < argc) wwmi_arg = argv[++i];
+        else if (a == L"--lang" && i + 1 < argc) g_zh_ui = DetectChineseUi(argv[++i]);
     }
     if (action != L"uninstall" && action != L"init-wwmi" && game_arg.empty())
         game_arg = AutoDiscoverGameWin64(base_root);
@@ -1063,7 +1272,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         const UINT dpi = GetDpiForWindow(hwnd);
         const auto sc = [&](int v) { return MulDiv(v, (int)dpi, 96); };
         st->font = CreateFontW(-sc(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+            TrW(L"Microsoft YaHei UI", L"Segoe UI"));
 
         auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD style, int x, int y, int w, int h, int id) {
             HWND c = CreateWindowExW((wcscmp(cls, L"EDIT") == 0) ? WS_EX_CLIENTEDGE : 0, cls, txt,
@@ -1073,23 +1283,26 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return c;
         };
 
-        mk(L"STATIC", L"鸣潮游戏目录（支持库洛官方启动器根目录 / Steam 目录 / Win64）：", 0, 16, 14, 620, 22, 0);
+        mk(L"STATIC", TrW(L"鸣潮游戏目录（支持库洛官方启动器根目录 / Steam 目录 / Win64）：",
+            L"Wuthering Waves folder (Kuro Launcher root / Steam folder / Win64):"), 0, 16, 14, 620, 22, 0);
         st->edit_game = mk(L"EDIT", L"", ES_AUTOHSCROLL, 16, 38, 536, 28, IDC_EDIT_GAME);
-        mk(L"BUTTON", L"浏览...", BS_PUSHBUTTON, 560, 38, 96, 28, IDC_BTN_BROWSE_GAME);
+        mk(L"BUTTON", TrW(L"浏览...", L"Browse..."), BS_PUSHBUTTON, 560, 38, 96, 28, IDC_BTN_BROWSE_GAME);
 
-        mk(L"STATIC", L"WWMI Mod 目录（可直接复用已有 XXMI Launcher\\WWMI，或点右侧新建）：", 0, 16, 76, 620, 22, 0);
+        mk(L"STATIC", TrW(L"WWMI Mod 目录（可直接复用已有 XXMI Launcher\\WWMI，或点右侧新建）：",
+            L"WWMI Mods folder (reuse existing XXMI Launcher\\WWMI, or click Init Skeleton):"), 0, 16, 76, 620, 22, 0);
         st->edit_wwmi = mk(L"EDIT", L"", ES_AUTOHSCROLL, 16, 100, 434, 28, IDC_EDIT_WWMI);
-        mk(L"BUTTON", L"浏览...", BS_PUSHBUTTON, 458, 100, 94, 28, IDC_BTN_BROWSE_WWMI);
-        mk(L"BUTTON", L"新建骨架", BS_PUSHBUTTON, 560, 100, 96, 28, IDC_BTN_INIT_WWMI);
+        mk(L"BUTTON", TrW(L"浏览...", L"Browse..."), BS_PUSHBUTTON, 458, 100, 94, 28, IDC_BTN_BROWSE_WWMI);
+        mk(L"BUTTON", TrW(L"新建骨架", L"Init Skeleton"), BS_PUSHBUTTON, 560, 100, 96, 28, IDC_BTN_INIT_WWMI);
 
-        mk(L"STATIC", L"当前环境与健康自检状态（运行期对游戏目录 0 字节额外写入）：", 0, 16, 140, 620, 22, 0);
+        mk(L"STATIC", TrW(L"当前环境与健康自检状态（运行期对游戏目录 0 字节额外写入）：",
+            L"Environment & health check (zero runtime writes inside the game folder):"), 0, 16, 140, 620, 22, 0);
         st->edit_report = mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL, 16, 164, 640, 165, IDC_EDIT_REPORT);
 
-        mk(L"BUTTON", L"一键安装启用", BS_DEFPUSHBUTTON, 16, 344, 140, 36, IDC_BTN_INSTALL);
-        mk(L"BUTTON", L"一键卸载还原", BS_PUSHBUTTON, 166, 344, 130, 36, IDC_BTN_UNINSTALL);
-        mk(L"BUTTON", L"刷新自检", BS_PUSHBUTTON, 306, 344, 105, 36, IDC_BTN_DOCTOR);
-        mk(L"BUTTON", L"打开 Mods 目录", BS_PUSHBUTTON, 421, 344, 118, 36, IDC_BTN_OPEN_MODS);
-        mk(L"BUTTON", L"打开日志目录", BS_PUSHBUTTON, 549, 344, 107, 36, IDC_BTN_OPEN_LOGS);
+        mk(L"BUTTON", TrW(L"一键安装启用", L"Install & Enable"), BS_DEFPUSHBUTTON, 16, 344, 140, 36, IDC_BTN_INSTALL);
+        mk(L"BUTTON", TrW(L"一键卸载还原", L"Uninstall / Restore"), BS_PUSHBUTTON, 166, 344, 130, 36, IDC_BTN_UNINSTALL);
+        mk(L"BUTTON", TrW(L"刷新自检", L"Refresh Check"), BS_PUSHBUTTON, 306, 344, 105, 36, IDC_BTN_DOCTOR);
+        mk(L"BUTTON", TrW(L"打开 Mods 目录", L"Open Mods"), BS_PUSHBUTTON, 421, 344, 118, 36, IDC_BTN_OPEN_MODS);
+        mk(L"BUTTON", TrW(L"打开日志目录", L"Open Logs"), BS_PUSHBUTTON, 549, 344, 107, 36, IDC_BTN_OPEN_LOGS);
 
         const fs::path g = AutoDiscoverGameWin64(st->base_root);
         const fs::path w = AutoDiscoverWwmiDir(st->base_root);
@@ -1102,14 +1315,18 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!st) break;
         const int id = LOWORD(wp);
         if (id == IDC_BTN_BROWSE_GAME) {
-            const std::wstring p = BrowseFolderDialog(hwnd, L"请选择《鸣潮》安装目录（包含 Wuthering Waves Game 或 Client-Win64-Shipping.exe）");
+            const std::wstring p = BrowseFolderDialog(hwnd, TrW(
+                L"请选择《鸣潮》安装目录（包含 Wuthering Waves Game 或 Client-Win64-Shipping.exe）",
+                L"Select Wuthering Waves install folder (containing Wuthering Waves Game or Client-Win64-Shipping.exe)"));
             if (!p.empty()) {
                 const fs::path resolved = ResolveWin64FromAnyGameDir(p);
                 SetWindowTextW(st->edit_game, (resolved.empty() ? p : resolved.wstring()).c_str());
                 RefreshGuiReport(st);
             }
         } else if (id == IDC_BTN_BROWSE_WWMI) {
-            const std::wstring p = BrowseFolderDialog(hwnd, L"请选择包含 d3dx.ini 与 Mods 的 WWMI 目录（如 XXMI Launcher\\WWMI）");
+            const std::wstring p = BrowseFolderDialog(hwnd, TrW(
+                L"请选择包含 d3dx.ini 与 Mods 的 WWMI 目录（如 XXMI Launcher\\WWMI）",
+                L"Select WWMI folder containing d3dx.ini and Mods\\ (e.g. XXMI Launcher\\WWMI)"));
             if (!p.empty()) {
                 SetWindowTextW(st->edit_wwmi, p.c_str());
                 RefreshGuiReport(st);
@@ -1121,10 +1338,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (InitWwmiSkeleton(target, err)) {
                 SetWindowTextW(st->edit_wwmi, NormWinPath(target).c_str());
                 RefreshGuiReport(st);
-                MessageBoxW(hwnd, (L"已创建标准 WWMI 目录骨架：\n" + NormWinPath(target) + L"\n\n请确保放入官方 Core\\WWMI 与 Mods\\RabbitFX。").c_str(),
-                    L"WWMI DX12+RT", MB_OK | MB_ICONINFORMATION);
+                const std::wstring ok_msg = g_zh_ui
+                    ? (L"已创建标准 WWMI 目录骨架：\n" + NormWinPath(target) + L"\n\n请确保放入官方 Core\\WWMI 与 Mods\\RabbitFX。")
+                    : (L"Initialized standard WWMI skeleton:\n" + NormWinPath(target) + L"\n\nPlace official Core\\WWMI and Mods\\RabbitFX inside before launching.");
+                MessageBoxW(hwnd, ok_msg.c_str(), L"WWMI DX12+RT", MB_OK | MB_ICONINFORMATION);
             } else {
-                MessageBoxW(hwnd, err.c_str(), L"错误", MB_OK | MB_ICONERROR);
+                MessageBoxW(hwnd, err.c_str(), TrW(L"错误", L"Error"), MB_OK | MB_ICONERROR);
             }
         } else if (id == IDC_BTN_INSTALL) {
             std::wstring res_msg;
@@ -1143,7 +1362,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             const fs::path mods = wwmi / L"Mods";
             std::error_code ec;
             if (fs::is_directory(mods, ec)) ShellExecuteW(hwnd, L"open", mods.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            else MessageBoxW(hwnd, L"Mods 目录不存在，请先设置有效的 WWMI 目录。", L"提示", MB_OK | MB_ICONWARNING);
+            else MessageBoxW(hwnd, TrW(L"Mods 目录不存在，请先设置有效的 WWMI 目录。",
+                L"Mods folder does not exist yet. Select a valid WWMI folder first."),
+                TrW(L"提示", L"Notice"), MB_OK | MB_ICONWARNING);
         } else if (id == IDC_BTN_OPEN_LOGS) {
             const fs::path logs = st->base_root / L"runtime\\logs";
             std::error_code ec;
@@ -1166,13 +1387,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
 {
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    g_zh_ui = DetectChineseUi();
     const fs::path base_root = SelfBaseRoot();
 
     bool cli_mode = false;
     for (int i = 1; i < argc; ++i) {
-        if ( wcscmp(argv[i], L"--cli") == 0) {
+        if (wcscmp(argv[i], L"--cli") == 0) {
             cli_mode = true;
-            break;
+        } else if (wcscmp(argv[i], L"--lang") == 0 && i + 1 < argc) {
+            g_zh_ui = DetectChineseUi(argv[++i]);
         }
     }
     if (cli_mode) {
@@ -1206,7 +1429,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
     const UINT dpi = GetDpiForSystem();
     const int w = MulDiv(688, (int)dpi, 96);
     const int h = MulDiv(432, (int)dpi, 96);
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"WWMI DX12+RT 安装配置器 (Windows 官方启动器 / Steam 通用版)",
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName,
+        TrW(L"WWMI DX12+RT 安装配置器 (Windows 官方启动器 / Steam 通用版)",
+            L"WWMI DX12+RT Setup (Windows Kuro Launcher & Steam)"),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, w, h, nullptr, nullptr,
         hInst, &st);
 
