@@ -22,6 +22,84 @@ extern void unregister_addon_effect_runtime_sync();
 extern HMODULE g_module_handle;
 extern std::filesystem::path g_target_executable_path;
 
+namespace reshade {
+std::vector<std::filesystem::path> resolve_addon_search_dirs(const ini_file &config)
+{
+	std::vector<std::filesystem::path> search_dirs;
+	auto append_search_dir = [&search_dirs](const std::filesystem::path &raw) {
+		if (raw.empty())
+			return;
+		std::filesystem::path resolved = raw.is_absolute() ? raw : (g_reshade_base_path / raw);
+		std::error_code norm_ec;
+		std::filesystem::path canonical = std::filesystem::weakly_canonical(resolved, norm_ec);
+		if (!norm_ec && !canonical.empty())
+			resolved = std::move(canonical);
+		for (const auto &existing : search_dirs)
+		{
+			if (_wcsicmp(existing.c_str(), resolved.c_str()) == 0)
+				return;
+		}
+		search_dirs.push_back(std::move(resolved));
+	};
+
+	const std::filesystem::path game_dir = g_target_executable_path.parent_path();
+	auto parse_path_entries = [&](const std::vector<std::string> &entries, const char *key_name) {
+		for (const std::string &entry : entries)
+		{
+			size_t start = 0;
+			while (start <= entry.size())
+			{
+				const size_t sep = entry.find(';', start);
+				std::string token = (sep == std::string::npos) ? entry.substr(start) : entry.substr(start, sep - start);
+				while (!token.empty() && (token.front() == ' ' || token.front() == '\t'))
+					token.erase(token.begin());
+				while (!token.empty() && (token.back() == ' ' || token.back() == '\t'))
+					token.pop_back();
+				if (!token.empty())
+				{
+					if (_stricmp(token.c_str(), "$(GameDir)") == 0 || _stricmp(token.c_str(), "$GAME") == 0)
+					{
+						append_search_dir(game_dir);
+					}
+					else
+					{
+						const int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, token.data(), static_cast<int>(token.size()), nullptr, 0);
+						if (wide_len <= 0)
+						{
+							log::message(log::level::warning, "Skipping non-UTF-8 path entry in [ADDON] %s (save ReShade.ini as UTF-8).", key_name);
+						}
+						else
+						{
+							std::wstring wide(static_cast<size_t>(wide_len), L'\0');
+							MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, token.data(), static_cast<int>(token.size()), wide.data(), wide_len);
+							append_search_dir(std::filesystem::path(std::move(wide)));
+						}
+					}
+				}
+				if (sep == std::string::npos)
+					break;
+				start = sep + 1;
+			}
+		}
+	};
+
+	std::vector<std::string> configured_paths;
+	if (config.get("ADDON", "AddonPath", configured_paths) && !configured_paths.empty())
+		parse_path_entries(configured_paths, "AddonPath");
+	if (search_dirs.empty())
+		append_search_dir(g_reshade_base_path);
+
+	std::vector<std::string> extra_paths;
+	if (config.get("ADDON", "ExtraAddonPaths", extra_paths) && !extra_paths.empty())
+		parse_path_entries(extra_paths, "ExtraAddonPaths");
+
+	if (config.get("ADDON", "LoadGameDirAddons") && !game_dir.empty())
+		append_search_dir(game_dir);
+
+	return search_dirs;
+}
+}
+
 extern std::filesystem::path get_module_path(HMODULE module);
 
 #if RESHADE_VERBOSE_LOG
@@ -213,60 +291,9 @@ void reshade::load_addons()
 		}
 	}
 
-	// Get directories from where to load add-ons from.
-	// Supports comma-separated (native ReShade INI vector) and semicolon-separated paths,
-	// portable $(GameDir) / $GAME tokens, and opt-in [ADDON] LoadGameDirAddons=1 so external
-	// BasePath mounts can coexist cleanly with third-party add-ons in Client\Binaries\Win64.
+	// Resolve ordered add-on search directories (AddonPath + ExtraAddonPaths + optional LoadGameDirAddons=1).
 	// Earlier search directories always win on duplicate filenames.
-	std::vector<std::filesystem::path> search_dirs;
-	auto append_search_dir = [&search_dirs](const std::filesystem::path &raw) {
-		if (raw.empty())
-			return;
-		std::filesystem::path resolved = raw.is_absolute() ? raw : (g_reshade_base_path / raw);
-		std::error_code norm_ec;
-		std::filesystem::path canonical = std::filesystem::weakly_canonical(resolved, norm_ec);
-		if (!norm_ec && !canonical.empty())
-			resolved = std::move(canonical);
-		for (const auto &existing : search_dirs)
-		{
-			if (_wcsicmp(existing.c_str(), resolved.c_str()) == 0)
-				return;
-		}
-		search_dirs.push_back(std::move(resolved));
-	};
-
-	const std::filesystem::path game_dir = g_target_executable_path.parent_path();
-	std::vector<std::string> configured_paths;
-	if (config.get("ADDON", "AddonPath", configured_paths) && !configured_paths.empty())
-	{
-		for (const std::string &entry : configured_paths)
-		{
-			size_t start = 0;
-			while (start <= entry.size())
-			{
-				const size_t sep = entry.find(';', start);
-				std::string token = (sep == std::string::npos) ? entry.substr(start) : entry.substr(start, sep - start);
-				while (!token.empty() && (token.front() == ' ' || token.front() == '\t'))
-					token.erase(token.begin());
-				while (!token.empty() && (token.back() == ' ' || token.back() == '\t'))
-					token.pop_back();
-				if (!token.empty())
-				{
-					if (_stricmp(token.c_str(), "$(GameDir)") == 0 || _stricmp(token.c_str(), "$GAME") == 0)
-						append_search_dir(game_dir);
-					else
-						append_search_dir(std::filesystem::u8path(token));
-				}
-				if (sep == std::string::npos)
-					break;
-				start = sep + 1;
-			}
-		}
-	}
-	if (search_dirs.empty())
-		append_search_dir(g_reshade_base_path);
-	if (config.get("ADDON", "LoadGameDirAddons") && !game_dir.empty())
-		append_search_dir(game_dir);
+	const std::vector<std::filesystem::path> search_dirs = resolve_addon_search_dirs(config);
 
 	std::vector<std::filesystem::path> addon_paths;
 	std::unordered_set<std::wstring> seen_filenames;
@@ -284,11 +311,12 @@ void reshade::load_addons()
 		for (const std::filesystem::directory_entry &entry : std::filesystem::directory_iterator(addon_search_path, std::filesystem::directory_options::skip_permission_denied, ec))
 		{
 			const std::filesystem::path &candidate = entry.path();
-			if (candidate.extension() != L".addon" &&
+			const std::wstring ext = candidate.extension().wstring();
+			if (_wcsicmp(ext.c_str(), L".addon") != 0 &&
 #ifndef _WIN64
-				candidate.extension() != L".addon32")
+				_wcsicmp(ext.c_str(), L".addon32") != 0)
 #else
-				candidate.extension() != L".addon64")
+				_wcsicmp(ext.c_str(), L".addon64") != 0)
 #endif
 				continue;
 			std::wstring fname_lower = candidate.filename().wstring();

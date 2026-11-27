@@ -144,7 +144,7 @@
 - **安装器拒绝覆盖现有 `dxgi.dll` 或 `ReShade.ini` / 与 RenoDX 等第三方 ReShade 插件共存**
   - 这是防冲突保护机制，防止覆盖第三方 ReShade/OptiScaler/XXMI 或旧挂载残留。请先备份移走原 `Win64/dxgi.dll` 与 `Win64/ReShade.ini`（或在旧外部目录执行一次【卸载还原】）后再安装。
   - **注意**：WWMI-DX12-RT 必须使用本包配对的 `dxgi.dll`（`ReShade64-game-forward.dll`）才能提供 DX12+RT 挂钩，切勿替换为原版 ReShade `dxgi.dll`。
-  - 如需同时加载 RenoDX 等第三方 ReShade 插件，可将对应 `*.addon64` 复制到 `<外部目录>/reshade-addons/`，或在 `<外部目录>/ReShade.ini` 的 `[ADDON]` 下设置 `LoadGameDirAddons=1`（或在 `AddonPath` 中以逗号/分号追加多目录）；后续升级重装会自动保留你的外部 `ReShade.ini` 自定义项。若游戏内 Mod 异常，请先临时停用第三方插件排查冲突。
+  - 如需同时加载 RenoDX 等第三方 ReShade 插件，可将对应 `*.addon64` 复制到 `<外部目录>/reshade-addons/`，或在 `<外部目录>/ReShade.ini`（UTF-8）的 `[ADDON]` 下设置 `LoadGameDirAddons=1`（或 `ExtraAddonPaths=<目录1>,<目录2>`）；后续升级重装会自动保留你的外部 `ReShade.ini` 自定义项。若游戏内 Mod 异常，请先临时停用第三方插件排查冲突。
 - **WWMI 核心版本兼容（`1.1.0` 与 `1.2.2+`）**
   - 同时兼容旧版 `WWMI 1.1.0` 与新版 `WWMI 1.2.2+` 核心包：自动屏蔽仅面向 DX11 XXMI DLL 的 `v1.3.3+` dHash 误报提示，同时放行 **`X`** 键正常关闭真实 Mod 提示框。
 - **部分老旧 Hash Mod 在 4K UHD（`-krqlv=uhd`）下贴图错位**

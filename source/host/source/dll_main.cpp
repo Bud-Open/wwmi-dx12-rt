@@ -33,6 +33,12 @@ extern "C" __declspec(dllexport) const wchar_t *WINAPI WWMIGetMountedBasePath()
 	return s_external_base_path ? g_reshade_base_path.c_str() : nullptr;
 }
 
+#if RESHADE_ADDON >= 2
+namespace reshade {
+	std::vector<std::filesystem::path> resolve_addon_search_dirs(const ini_file &config);
+}
+#endif
+
 extern bool resolve_path(std::filesystem::path &path, std::error_code &ec, const std::filesystem::path &base);
 
 /// <summary>
@@ -417,16 +423,40 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 
 #if RESHADE_ADDON >= 2
 			// It is not safe to call 'LoadLibrary' from 'DllMain', but there are cases where add-ons want to be loaded as early as possible, so at least give the option
-			if (std::vector<std::filesystem::path> addons;
-				config.get("ADDON", "LoadFromDllMain", addons))
+			if (std::vector<std::string> raw_addons;
+				config.get("ADDON", "LoadFromDllMain", raw_addons))
 			{
-				std::filesystem::path addon_search_path = g_reshade_base_path;
-				if (config.get("ADDON", "AddonPath", addon_search_path))
-					addon_search_path = g_reshade_base_path / addon_search_path;
+				const std::vector<std::filesystem::path> search_dirs = reshade::resolve_addon_search_dirs(config);
+				const std::filesystem::path fallback_dir = search_dirs.empty() ? g_reshade_base_path : search_dirs.front();
 
-				for (std::filesystem::path &path : addons)
+				for (const std::string &raw_name : raw_addons)
 				{
-					path = addon_search_path / path;
+					if (raw_name.empty())
+						continue;
+					const int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw_name.data(), static_cast<int>(raw_name.size()), nullptr, 0);
+					if (wide_len <= 0)
+					{
+						reshade::log::message(reshade::log::level::warning, "Skipping non-UTF-8 entry in [ADDON] LoadFromDllMain (save ReShade.ini as UTF-8).");
+						continue;
+					}
+					std::wstring wide(static_cast<size_t>(wide_len), L'\0');
+					MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw_name.data(), static_cast<int>(raw_name.size()), wide.data(), wide_len);
+					std::filesystem::path path(std::move(wide));
+					if (!path.is_absolute())
+					{
+						std::filesystem::path resolved = fallback_dir / path;
+						for (const std::filesystem::path &dir : search_dirs)
+						{
+							std::error_code exist_ec;
+							const std::filesystem::path cand = dir / path;
+							if (std::filesystem::is_regular_file(cand, exist_ec))
+							{
+								resolved = cand;
+								break;
+							}
+						}
+						path = std::move(resolved);
+					}
 
 					reshade::log::message(reshade::log::level::info, "Loading add-on module \"%s\" ...", path.u8string().c_str());
 

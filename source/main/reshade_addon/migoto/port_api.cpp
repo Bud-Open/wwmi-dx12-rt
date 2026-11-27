@@ -311,6 +311,23 @@ void PresentPre()
     if (G->gReloadConfigPending) FrameDriverConfig();
     // Before the first [Present]: their load order is [Constants] then everything else.
     RunConstantsOnce();
+    // Suppress inapplicable WWMI popups AFTER [Constants] (which runs CommandListInitialize
+    // on WWMI 1.2.2+) and BEFORE [Present] draws, preventing even a 1-frame flash on startup
+    // or early F10 reload while leaving genuine mod warnings ($show_mod_error) X-dismissible.
+    if (GetVarNs(L"WWMIv1", L"first_run", 0.f) != 0.f) SetVarNs(L"WWMIv1", L"first_run", 0.f);
+    if (GetVarNs(L"WWMIv1", L"show_xxmi_error", 0.f) != 0.f) {
+        SetVarNs(L"WWMIv1", L"show_xxmi_error", 0.f);
+        if (GetVarNs(L"WWMIv1", L"show_mod_error", 0.f) == 0.f &&
+            GetVarNs(L"WWMIv1", L"show_guide", 0.f) == 0.f) {
+            SetVarNs(L"WWMIv1", L"show_notification_widget", 0.f);
+        }
+        static bool s_logged_xxmi_compat = false;
+        if (!s_logged_xxmi_compat) {
+            s_logged_xxmi_compat = true;
+            logger::probe("WWMI-COMPAT: suppressed DX11 XXMI v1.3.3+ dHash-filter banner "
+                          "(not applicable to WWMI-DX12-RT; genuine mod warnings remain dismissible with X)");
+        }
+    }
     G->frame_no++;
     MigotoPort::SweepSelectionVars();
     g_step_inputs.Take();

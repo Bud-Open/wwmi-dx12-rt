@@ -720,7 +720,13 @@ std::string MergeExternalReShadeIni(const fs::path& ini_path)
     const std::string kDefault =
         "[INSTALL]\r\nLogging=0\r\n\r\n[ADDON]\r\nAddonPath=reshade-addons\r\n\r\n[OVERLAY]\r\nTutorialProgress=4\r\n";
     if (!RegularFileOrMissing(ini_path)) return kDefault;
-    const std::string existing = ReadFileChecked(ini_path);
+    std::string existing = ReadFileChecked(ini_path);
+    if (existing.size() >= 3 &&
+        static_cast<unsigned char>(existing[0]) == 0xEF &&
+        static_cast<unsigned char>(existing[1]) == 0xBB &&
+        static_cast<unsigned char>(existing[2]) == 0xBF) {
+        existing.erase(0, 3);
+    }
     auto trim_ascii = [](std::string s) {
         while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r')) s.erase(s.begin());
         while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.pop_back();
@@ -729,6 +735,60 @@ std::string MergeExternalReShadeIni(const fs::path& ini_path)
     auto lower_ascii = [](std::string s) {
         for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
         return s;
+    };
+    auto parse_section = [&](const std::string& line, std::string& sec_out) -> bool {
+        // Match ReShade's exact case-sensitive section parsing (ini_file.cpp).
+        const std::string t = trim_ascii(line);
+        if (t.empty() || t.front() != '[') return false;
+        const size_t close = t.find(']');
+        std::string inner = (close == std::string::npos) ? t : t.substr(0, close);
+        while (!inner.empty() && (inner.front() == ' ' || inner.front() == '\t' || inner.front() == '[' || inner.front() == ']'))
+            inner.erase(inner.begin());
+        while (!inner.empty() && (inner.back() == ' ' || inner.back() == '\t' || inner.back() == '[' || inner.back() == ']'))
+            inner.pop_back();
+        sec_out = std::move(inner);
+        return true;
+    };
+    auto split_reshade_tokens = [&](const std::string& val) -> std::vector<std::string> {
+        // Decode ReShade's ",," escaped literal comma while splitting on single ',' and ';'.
+        std::vector<std::string> comma_parts;
+        std::string buf;
+        for (size_t i = 0; i < val.size(); ++i) {
+            if (val[i] == ',') {
+                if (i + 1 < val.size() && val[i + 1] == ',') {
+                    buf.push_back(',');
+                    ++i;
+                    continue;
+                }
+                comma_parts.push_back(std::move(buf));
+                buf.clear();
+                continue;
+            }
+            buf.push_back(val[i]);
+        }
+        comma_parts.push_back(std::move(buf));
+
+        std::vector<std::string> out;
+        for (const std::string& part : comma_parts) {
+            size_t pos = 0;
+            while (pos <= part.size()) {
+                const size_t sep = part.find(';', pos);
+                const std::string tok = trim_ascii(sep == std::string::npos ? part.substr(pos) : part.substr(pos, sep - pos));
+                if (!tok.empty()) out.push_back(tok);
+                if (sep == std::string::npos) break;
+                pos = sep + 1;
+            }
+        }
+        return out;
+    };
+    auto escape_commas = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            out.push_back(c);
+            if (c == ',') out.push_back(',');
+        }
+        return out;
     };
     if (trim_ascii(existing).empty()) return kDefault;
 
@@ -741,39 +801,48 @@ std::string MergeExternalReShadeIni(const fs::path& ini_path)
     }
     bool in_addon = false;
     int addon_header_idx = -1;
-    int addon_path_idx = -1;
+    std::vector<int> addon_path_indices;
     for (size_t i = 0; i < lines.size(); ++i) {
         const std::string trimmed = trim_ascii(lines[i]);
-        if (trimmed.size() >= 2 && trimmed.front() == '[' && trimmed.back() == ']') {
-            in_addon = lower_ascii(trim_ascii(trimmed.substr(1, trimmed.size() - 2))) == "addon";
+        if (trimmed.empty() || trimmed.front() == ';' || trimmed.front() == '#' || trimmed.front() == '/')
+            continue;
+        std::string sec_name;
+        if (parse_section(lines[i], sec_name)) {
+            in_addon = (sec_name == "ADDON");
             if (in_addon && addon_header_idx < 0) addon_header_idx = (int)i;
             continue;
         }
-        if (in_addon && !trimmed.empty() && trimmed.front() != ';' && trimmed.front() != '#') {
+        if (in_addon) {
             const size_t eq = lines[i].find('=');
-            if (eq != std::string::npos && lower_ascii(trim_ascii(lines[i].substr(0, eq))) == "addonpath") {
-                addon_path_idx = (int)i;
-                break;
+            if (eq != std::string::npos && trim_ascii(lines[i].substr(0, eq)) == "AddonPath") {
+                addon_path_indices.push_back((int)i);
             }
         }
     }
-    if (addon_path_idx >= 0) {
-        const size_t eq = lines[addon_path_idx].find('=');
-        const std::string key = trim_ascii(lines[addon_path_idx].substr(0, eq));
-        const std::string val = trim_ascii(lines[addon_path_idx].substr(eq + 1));
-        bool has_default = false;
-        size_t pos = 0;
-        while (pos <= val.size()) {
-            size_t sep = val.find_first_of(",;", pos);
-            std::string tok = lower_ascii(trim_ascii(sep == std::string::npos ? val.substr(pos) : val.substr(pos, sep - pos)));
-            for (char& c : tok) if (c == '\\') c = '/';
-            while (!tok.empty() && tok.back() == '/') tok.pop_back();
-            if (tok == "reshade-addons") { has_default = true; break; }
-            if (sep == std::string::npos) break;
-            pos = sep + 1;
+    if (!addon_path_indices.empty()) {
+        std::vector<std::string> extras;
+        std::vector<std::string> seen_norms;
+        for (int idx : addon_path_indices) {
+            const size_t eq = lines[(size_t)idx].find('=');
+            const std::string val = trim_ascii(lines[(size_t)idx].substr(eq + 1));
+            for (const std::string& raw_tok : split_reshade_tokens(val)) {
+                std::string norm = lower_ascii(raw_tok);
+                for (char& c : norm) if (c == '\\') c = '/';
+                while (!norm.empty() && norm.back() == '/') norm.pop_back();
+                if (norm != "reshade-addons" &&
+                    std::find(seen_norms.begin(), seen_norms.end(), norm) == seen_norms.end()) {
+                    seen_norms.push_back(std::move(norm));
+                    extras.push_back(escape_commas(raw_tok));
+                }
+            }
         }
-        if (!has_default) {
-            lines[addon_path_idx] = key + "=" + (val.empty() ? "reshade-addons" : ("reshade-addons," + val));
+        const int first_idx = addon_path_indices.front();
+        std::string merged = "reshade-addons";
+        for (const std::string& extra : extras)
+            merged += (!extra.empty() && extra.front() == ',' ? ", " : ",") + extra;
+        lines[(size_t)first_idx] = "AddonPath=" + merged;
+        for (size_t k = addon_path_indices.size(); k-- > 1;) {
+            lines.erase(lines.begin() + addon_path_indices[k]);
         }
     } else if (addon_header_idx >= 0) {
         lines.insert(lines.begin() + addon_header_idx + 1, "AddonPath=reshade-addons");
@@ -1157,12 +1226,18 @@ std::wstring BuildDoctorText(const fs::path& raw_game, const fs::path& raw_wwmi,
 // ------------------------- Headless CLI Mode -------------------------
 void CliPrint(const std::wstring& w)
 {
-    const std::string s = WideToUtf8(w) + "\n";
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut && hOut != INVALID_HANDLE_VALUE) {
+    if (!hOut || hOut == INVALID_HANDLE_VALUE) return;
+    DWORD mode = 0;
+    if (GetConsoleMode(hOut, &mode)) {
+        const std::wstring line = w + L"\n";
         DWORD written = 0;
-        WriteFile(hOut, s.data(), (DWORD)s.size(), &written, nullptr);
+        WriteConsoleW(hOut, line.data(), (DWORD)line.size(), &written, nullptr);
+        return;
     }
+    const std::string s = WideToUtf8(w) + "\n";
+    DWORD written = 0;
+    WriteFile(hOut, s.data(), (DWORD)s.size(), &written, nullptr);
 }
 
 int RunCli(int argc, wchar_t** argv, const fs::path& base_root)

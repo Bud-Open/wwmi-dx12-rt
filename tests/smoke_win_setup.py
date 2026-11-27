@@ -25,6 +25,7 @@ def smoke(archive: Path, root: Path, wine: str | None = None) -> None:
         return out
 
     with zipfile.ZipFile(archive) as zip_file:
+        assert "WWMI-DX12-RT-win64/ReShade.ini" not in zip_file.namelist(), "release archive must not overwrite user ReShade.ini"
         zip_file.extractall(root)
     base = root / "WWMI-DX12-RT-win64"
     exe = base / "WWMI-DX12-RT-Setup.exe"
@@ -51,13 +52,22 @@ def smoke(archive: Path, root: Path, wine: str | None = None) -> None:
     cli("install", reason="renodx-sample.addon64", lang="en")
     assert {p.name for p in win64.iterdir()} == {SHIPPING, "dxgi.dll", "ReShade.ini", "renodx-sample.addon64"}
     ext_ini = base / "ReShade.ini"
-    ext_ini.write_text(
-        "[INSTALL]\r\nLogging=1\r\n\r\n[ADDON]\r\nAddonPath=D:\\Extra\r\nLoadGameDirAddons=1\r\n",
-        encoding="utf-8",
+    ext_ini.write_bytes(
+        b"\xef\xbb\xbf[INSTALL]\r\nLogging=1\r\n\r\n"
+        b"[ADDON] ; custom user section\r\naddonpath=D:\\IgnoredLower\r\n"
+        b"AddonPath=D:\\ReShade,, Extras,reshade-addons\r\nAddonPath=D:\\More\r\n"
+        b"ExtraAddonPaths=D:\\ThirdParty\r\nLoadGameDirAddons=1\r\n"
     )
+    # Simulate documented upgrade: extract release ZIP over existing folder before re-running Setup.
+    with zipfile.ZipFile(archive) as zip_file:
+        zip_file.extractall(root)
     cli("install", lang="zh", reason="安装启用成功")
     merged = ext_ini.read_text(encoding="utf-8")
-    assert "Logging=1" in merged and "LoadGameDirAddons=1" in merged and "AddonPath=reshade-addons,D:\\Extra" in merged, merged
+    assert not merged.startswith("\ufeff"), merged
+    assert "Logging=1" in merged and "LoadGameDirAddons=1" in merged and "ExtraAddonPaths=D:\\ThirdParty" in merged, merged
+    assert "addonpath=D:\\IgnoredLower" in merged, merged
+    assert "AddonPath=reshade-addons,D:\\ReShade,, Extras,D:\\More" in merged, merged
+    assert merged.count("AddonPath=") == 1, merged
     cli("doctor", reason="Other ReShade add-on(s) in Win64", lang="en")
     cli("doctor", reason="Win64 存在其他 ReShade 插件", lang="zh")
     ini = base / "wwmi_dx12.ini"

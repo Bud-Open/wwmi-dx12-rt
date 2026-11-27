@@ -968,33 +968,92 @@ def build_external_reshade_ini() -> str:
     )
 
 
+def _parse_ini_section_name(line: str) -> str | None:
+    """Match ReShade's exact case-sensitive section parsing (line[0] == '[')."""
+    stripped = line.strip()
+    if not stripped.startswith("["):
+        return None
+    close = stripped.find("]")
+    raw = stripped[:close] if close != -1 else stripped
+    return raw.strip(" \t[]")
+
+
+def _split_addon_path_tokens(raw: str) -> list[str]:
+    """Split ReShade's comma-separated list (decoding ',,' as literal ',') and ';' sub-tokens."""
+    comma_parts: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == ",":
+            if i + 1 < n and raw[i + 1] == ",":
+                buf.append(",")
+                i += 2
+                continue
+            comma_parts.append("".join(buf))
+            buf.clear()
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    comma_parts.append("".join(buf))
+
+    out: list[str] = []
+    for part in comma_parts:
+        for tok in part.split(";"):
+            cleaned = tok.strip()
+            if cleaned:
+                out.append(cleaned)
+    return out
+
+
 def merge_external_reshade_ini(existing_text: str | None) -> str:
     """Preserve user ReShade.ini customizations across upgrades while ensuring reshade-addons is searched first."""
-    if not existing_text or not existing_text.strip():
+    if not existing_text:
+        return build_external_reshade_ini()
+    if existing_text.startswith("\ufeff"):
+        existing_text = existing_text[1:]
+    if not existing_text.strip():
         return build_external_reshade_ini()
     eol = "\r\n" if "\r\n" in existing_text else "\n"
     lines = existing_text.splitlines()
     in_addon = False
     addon_header_idx = -1
-    addon_path_idx = -1
+    addon_path_indices: list[int] = []
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_addon = stripped[1:-1].strip().lower() == "addon"
+        if not stripped or stripped.startswith((";", "#", "/")):
+            continue
+        sec = _parse_ini_section_name(line)
+        if sec is not None:
+            in_addon = sec == "ADDON"
             if in_addon and addon_header_idx < 0:
                 addon_header_idx = i
             continue
-        if in_addon and "=" in line and not stripped.startswith((";", "#")):
+        if in_addon and "=" in line:
             key, _, _val = line.partition("=")
-            if key.strip().lower() == "addonpath":
-                addon_path_idx = i
-                break
-    if addon_path_idx >= 0:
-        key, _, val = lines[addon_path_idx].partition("=")
-        tokens = [t.strip() for part in val.split(",") for t in part.split(";") if t.strip()]
-        if not any(t.replace("\\", "/").rstrip("/").lower() == "reshade-addons" for t in tokens):
-            updated = "reshade-addons," + val.strip() if val.strip() else "reshade-addons"
-            lines[addon_path_idx] = f"{key.strip()}={updated}"
+            if key.strip() == "AddonPath":
+                addon_path_indices.append(i)
+    if addon_path_indices:
+        extras: list[str] = []
+        seen_extras: set[str] = set()
+        for idx in addon_path_indices:
+            _, _, val = lines[idx].partition("=")
+            for tok in _split_addon_path_tokens(val):
+                norm = tok.replace("\\", "/").rstrip("/").lower()
+                if norm == "reshade-addons":
+                    continue
+                if norm not in seen_extras:
+                    seen_extras.add(norm)
+                    extras.append(tok.replace(",", ",,"))
+        first_idx = addon_path_indices[0]
+        merged_val = "reshade-addons"
+        for extra in extras:
+            merged_val += (", " if extra.startswith(",") else ",") + extra
+        lines[first_idx] = f"AddonPath={merged_val}"
+        for dup_idx in reversed(addon_path_indices[1:]):
+            lines.pop(dup_idx)
     elif addon_header_idx >= 0:
         lines.insert(addon_header_idx + 1, "AddonPath=reshade-addons")
     else:

@@ -207,7 +207,9 @@ def populate_common_runtime(dst_root: Path, payload_map: dict[str, Path], includ
         shutil.copy2(src, out)
 
     (dst_root / "seed").mkdir(parents=True, exist_ok=True)
-    (dst_root / "ReShade.ini").write_text(core.build_external_reshade_ini(), encoding="utf-8")
+    # Do NOT bundle a live ReShade.ini in release archives: extracting an upgrade over an
+    # existing external folder would overwrite user customizations (LoadGameDirAddons, presets,
+    # ExtraAddonPaths) before Setup runs. Both installers create ReShade.ini on first install.
 
     for root_doc in ("LICENSE", "THIRD-PARTY-NOTICES.md"):
         doc_src = ROOT / root_doc

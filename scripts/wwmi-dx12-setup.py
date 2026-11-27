@@ -86,7 +86,10 @@ def print_doctor_report(rep: core.DoctorReport) -> None:
 def cmd_doctor(args: argparse.Namespace) -> int:
     win64_dir, wwmi_dir, base_root, inst = resolve_defaults(args)
     if not win64_dir:
-        print("未自动检测到《鸣潮》安装目录，请通过 --game-win64 指定路径。", file=sys.stderr)
+        print(core.tr(
+            "未自动检测到《鸣潮》安装目录，请通过 --game-win64 指定路径。",
+            "Could not auto-detect Wuthering Waves; pass --game-win64 explicitly.",
+        ), file=sys.stderr)
         return 2
     if not wwmi_dir:
         wwmi_dir = base_root / "WWMI"
@@ -107,21 +110,30 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_init_wwmi(args: argparse.Namespace) -> int:
     target = Path(args.target).expanduser().resolve()
     out = core.init_wwmi_skeleton(target)
-    print(f"已初始化标准 WWMI 目录骨架：{out}")
-    print(f"  - 请将官方 WWMI-Package 的 Core/ 与 RabbitFX 放入该目录，角色皮肤解压至 {out / 'Mods'}")
+    print(core.tr(f"已初始化标准 WWMI 目录骨架：{out}", f"Initialized standard WWMI skeleton: {out}"))
+    print(core.tr(
+        f"  - 请将官方 WWMI-Package 的 Core/ 与 RabbitFX 放入该目录，角色皮肤解压至 {out / 'Mods'}",
+        f"  - Copy official WWMI-Package Core/ and RabbitFX here, and extract skins under {out / 'Mods'}",
+    ))
     return 0
 
 
 def cmd_install(args: argparse.Namespace) -> int:
     win64_dir, wwmi_dir, base_root, _ = resolve_defaults(args)
     if not win64_dir:
-        print("错误：未找到《鸣潮》Win64 目录，请使用 --game-win64 指定。", file=sys.stderr)
+        print(core.tr(
+            "错误：未找到《鸣潮》Win64 目录，请使用 --game-win64 指定。",
+            "Error: Wuthering Waves Win64 directory not found; specify --game-win64.",
+        ), file=sys.stderr)
         return 2
     dry_run = getattr(args, "dry_run", False)
     init_wwmi = not wwmi_dir and getattr(args, "init_missing_wwmi", False)
     if not wwmi_dir:
         if not init_wwmi:
-            print("错误：未找到现有 WWMI 目录，请使用 --wwmi-dir 指定或添加 --init-missing-wwmi。", file=sys.stderr)
+            print(core.tr(
+                "错误：未找到现有 WWMI 目录，请使用 --wwmi-dir 指定或添加 --init-missing-wwmi。",
+                "Error: No existing WWMI directory found; pass --wwmi-dir or add --init-missing-wwmi.",
+            ), file=sys.stderr)
             return 2
         wwmi_dir = base_root / "WWMI"
 
@@ -164,18 +176,27 @@ def _run_uninstall(args: argparse.Namespace) -> tuple[int, str]:
         _, _, base_root, _ = resolve_defaults(args)
     res = core.uninstall_mount(base_root=base_root, dry_run=args.dry_run)
     if args.dry_run:
-        print("[dry-run] 卸载预览：")
+        print(core.tr("[dry-run] 卸载预览：", "[dry-run] Uninstall preview:"))
         print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 0, "卸载预检完成，未修改文件。"
+        return 0, core.tr("卸载预检完成，未修改文件。", "Uninstall dry-run complete; no files modified.")
     if res.get("state") == "noop":
         msg = res["message"]
         print(msg)
         return 0, msg
-    lines = [f"已安全卸载还原游戏目录：{res.get('win64_dir')}"]
+    lines = [core.tr(
+        f"已安全卸载还原游戏目录：{res.get('win64_dir')}",
+        f"Safely uninstalled and restored game directory: {res.get('win64_dir')}",
+    )]
     if res.get("staged_batch"):
-        lines.append(f"移除的引导文件已安全暂存至：{res['staged_batch']}")
+        lines.append(core.tr(
+            f"移除的引导文件已安全暂存至：{res['staged_batch']}",
+            f"Removed bootstrap files staged at: {res['staged_batch']}",
+        ))
     if res.get("has_legacy_settings"):
-        lines.append("旧版账本中的 compatdata 设置已保留；请按需人工检查旧配置和 Steam 启动选项。")
+        lines.append(core.tr(
+            "旧版账本中的 compatdata 设置已保留；请按需人工检查旧配置和 Steam 启动选项。",
+            "Legacy compatdata settings recorded in the old ledger were preserved; review old settings and Steam Launch Options if needed.",
+        ))
     msg = "\n".join(lines)
     print(msg)
     return 0, msg
@@ -196,8 +217,8 @@ def cmd_desktop_entry(args: argparse.Namespace) -> int:
     content = (
         "[Desktop Entry]\n"
         "Type=Application\n"
-        "Name=WWMI DX12+RT 配置器\n"
-        "Comment=鸣潮 DX12 + 光追 Mod 外部挂载安装与卸载工具\n"
+        f"Name={core.tr('WWMI DX12+RT 配置器', 'WWMI DX12+RT Setup')}\n"
+        f"Comment={core.tr('鸣潮 DX12 + 光追 Mod 外部挂载安装与卸载工具', 'Wuthering Waves DX12 + RT external mount setup & uninstaller')}\n"
         f'Exec="{sys.executable}" "{Path(__file__).resolve()}" gui\n'
         "Icon=applications-games\n"
         "Terminal=false\n"
@@ -205,7 +226,7 @@ def cmd_desktop_entry(args: argparse.Namespace) -> int:
     )
     desktop_file.write_text(content, encoding="utf-8")
     desktop_file.chmod(0o755)
-    print(f"已生成桌面应用入口：{desktop_file}")
+    print(core.tr(f"已生成桌面应用入口：{desktop_file}", f"Created desktop entry: {desktop_file}"))
     return 0
 
 
@@ -213,17 +234,26 @@ def gui_install(args: argparse.Namespace, base_root: Path) -> tuple[int, str]:
     args.init_missing_wwmi = True
     rc = cmd_install(args)
     if rc != 0:
-        return rc, "安装未完成：未找到游戏或 WWMI 目录，请查看终端输出。"
+        return rc, core.tr(
+            "安装未完成：未找到游戏或 WWMI 目录，请查看终端输出。",
+            "Installation incomplete: game or WWMI directory not found (check terminal output).",
+        )
     if args.dry_run:
-        return rc, "安装预检通过，未写入文件。"
-    message = "安装启用成功。"
+        return rc, core.tr("安装预检通过，未写入文件。", "Install dry-run succeeded; no files written.")
+    message = core.tr("安装启用成功。", "Installed and enabled successfully.")
     _, wwmi_dir, resolved_base, _ = resolve_defaults(args)
     target_wwmi = wwmi_dir or (resolved_base / "WWMI")
     if not (target_wwmi / "Core/WWMI/WuWa-Model-Importer.ini").is_file():
-        message += f"\n\n[提示] 尚未检测到官方 Core/WWMI 核心包，请将其放入：\n{target_wwmi}"
+        message += core.tr(
+            f"\n\n[提示] 尚未检测到官方 Core/WWMI 核心包，请将其放入：\n{target_wwmi}",
+            f"\n\n[Note] Official Core/WWMI scripts not detected yet; place them inside:\n{target_wwmi}",
+        )
     if sys.platform != "win32":
         options, warning = core.proton_launch_options(base_root, args.proton_utf8_guard)
-        message += f"\n\nSteam → 游戏属性 → 启动选项（请确保使用 DX12 启动）：\n{options}"
+        message += core.tr(
+            f"\n\nSteam → 游戏属性 → 启动选项（请确保使用 DX12 启动）：\n{options}",
+            f"\n\nSteam -> Properties -> Launch Options (ensure DX12 mode):\n{options}",
+        )
         if warning:
             message += f"\n\n{warning}"
     return rc, message
@@ -233,14 +263,21 @@ def cmd_gui(args: argparse.Namespace) -> int:
     """Interactive wizard via kdialog / zenity (for Linux desktop & Steam Deck) with TUI fallback."""
     win64_dir, wwmi_dir, base_root, inst = resolve_defaults(args)
     state, state_msg = (
-        core.inspect_mount_state(win64_dir, base_root) if win64_dir else ("not_installed", "未检测到游戏目录")
+        core.inspect_mount_state(win64_dir, base_root)
+        if win64_dir
+        else ("not_installed", core.tr("未检测到游戏目录", "Game directory not detected"))
     )
     summary = (
-        f"当前状态：{state} ({state_msg})\n"
-        f"游戏目录：{win64_dir or '未检测到'}\n"
-        f"WWMI 目录：{wwmi_dir or '未检测到 (安装时将初始化)'}\n"
-        f"外部挂载根：{base_root}"
+        f"{core.tr('当前状态', 'Status')}: {state} ({state_msg})\n"
+        f"{core.tr('游戏目录', 'Game Dir')}: {win64_dir or core.tr('未检测到', 'Not detected')}\n"
+        f"{core.tr('WWMI 目录', 'WWMI Dir')}: {wwmi_dir or core.tr('未检测到 (安装时将初始化)', 'Not detected (will initialize on install)')}\n"
+        f"{core.tr('外部挂载根', 'External Root')}: {base_root}"
     )
+
+    title = core.tr("WWMI DX12+RT 安装配置器", "WWMI DX12+RT Setup")
+    opt_install = core.tr("一键安装启用（原习惯从 Steam / 官方启动器直启）", "Install & Enable (launch normally via Steam / Kuro Launcher)")
+    opt_uninstall = core.tr("一键卸载还原（恢复 100% 纯净游戏目录）", "Uninstall / Restore (restore clean Win64 directory)")
+    opt_doctor = core.tr("运行环境与 RabbitFX 健康自检", "Run environment & RabbitFX health check")
 
     kdialog = shutil.which("kdialog")
     zenity = shutil.which("zenity")
@@ -250,15 +287,15 @@ def cmd_gui(args: argparse.Namespace) -> int:
             [
                 kdialog,
                 "--title",
-                "WWMI DX12+RT 安装配置器",
+                title,
                 "--menu",
-                f"{summary}\n\n请选择要执行的操作：",
+                f"{summary}\n\n{core.tr('请选择要执行的操作：', 'Choose an action:')}",
                 "install",
-                "一键安装启用（原习惯从 Steam / 官方启动器直启）",
+                opt_install,
                 "uninstall",
-                "一键卸载还原（恢复 100% 纯净游戏目录）",
+                opt_uninstall,
                 "doctor",
-                "运行环境与 RabbitFX 健康自检",
+                opt_doctor,
             ],
             capture_output=True,
             text=True,
@@ -292,16 +329,16 @@ def cmd_gui(args: argparse.Namespace) -> int:
             [
                 zenity,
                 "--list",
-                "--title=WWMI DX12+RT 安装配置器",
+                f"--title={title}",
                 f"--text={summary}",
-                "--column=代码",
-                "--column=操作说明",
+                f"--column={core.tr('代码', 'Action')}",
+                f"--column={core.tr('操作说明', 'Description')}",
                 "install",
-                "一键安装启用（原习惯从 Steam / 官方启动器直启）",
+                opt_install,
                 "uninstall",
-                "一键卸载还原（恢复 100% 纯净游戏目录）",
+                opt_uninstall,
                 "doctor",
-                "运行环境与 RabbitFX 健康自检",
+                opt_doctor,
                 "--width=680",
                 "--height=360",
             ],
@@ -334,8 +371,11 @@ def cmd_gui(args: argparse.Namespace) -> int:
 
     # Terminal interactive fallback
     print(summary)
-    print("\n1) 一键安装启用   2) 一键卸载还原   3) 健康自检   q) 退出")
-    sel = input("请输入选项 [1/2/3/q]: ").strip().lower()
+    print(core.tr(
+        "\n1) 一键安装启用   2) 一键卸载还原   3) 健康自检   q) 退出",
+        "\n1) Install & Enable   2) Uninstall / Restore   3) Health Check   q) Quit",
+    ))
+    sel = input(core.tr("请输入选项 [1/2/3/q]: ", "Enter choice [1/2/3/q]: ")).strip().lower()
     if sel == "1":
         rc, _ = gui_install(args, base_root)
         return rc
@@ -419,5 +459,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as exc:
-        print(f"错误：{exc}", file=sys.stderr)
+        print(f"{core.tr('错误：', 'Error: ')}{exc}", file=sys.stderr)
         sys.exit(1)

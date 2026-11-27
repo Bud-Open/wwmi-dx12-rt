@@ -391,18 +391,40 @@ class TestInstallerCore(unittest.TestCase):
 
         self.install()
         custom_ini = (
-            "[INSTALL]\nLogging=1\n\n"
-            "[ADDON]\nAddonPath=D:\\ExtraAddons\nLoadGameDirAddons=1\n\n"
+            "\ufeff[INSTALL]\nLogging=1\n\n"
+            "[ADDON] ; custom user paths\n"
+            "addonpath=D:\\IgnoredLowercase\n"
+            "AddonPath=D:\\ReShade,, Extras,reshade-addons\n"
+            "AddonPath=D:\\MoreAddons\n"
+            "ExtraAddonPaths=D:\\ThirdParty\n"
+            "LoadGameDirAddons=1\n\n"
             "[GENERAL]\nPresetPath=D:\\Presets\\MyPreset.ini\n"
         )
         (self.base / "ReShade.ini").write_text(custom_ini, encoding="utf-8")
-        # Reinstall must preserve user customizations while ensuring reshade-addons stays first.
+        # Simulate archive overlay upgrade: packaged release must NOT include a live ReShade.ini
+        # that would overwrite user customizations before Setup runs.
+        pkg = load_script("package_release_overlay_test", "scripts/package_release.py")
+        overlay_dir = self.case / "OverlayRelease"
+        overlay_dir.mkdir()
+        pkg.populate_common_runtime(overlay_dir, core.resolve_payload_sources(self.source), include_linux_so=True)
+        self.assertFalse((overlay_dir / "ReShade.ini").exists())
+        shutil.copytree(overlay_dir, self.base, dirs_exist_ok=True)
+        # Reinstall must preserve user customizations, literal escaped commas ',,', and exact-case AddonPath.
         self.install()
         merged = (self.base / "ReShade.ini").read_text(encoding="utf-8")
+        self.assertFalse(merged.startswith("\ufeff"))
         self.assertIn("Logging=1", merged)
         self.assertIn("LoadGameDirAddons=1", merged)
+        self.assertIn("ExtraAddonPaths=D:\\ThirdParty", merged)
         self.assertIn("PresetPath=D:\\Presets\\MyPreset.ini", merged)
-        self.assertIn("AddonPath=reshade-addons,D:\\ExtraAddons", merged)
+        self.assertIn("addonpath=D:\\IgnoredLowercase", merged)
+        self.assertIn("AddonPath=reshade-addons,D:\\ReShade,, Extras,D:\\MoreAddons", merged)
+        self.assertEqual(merged.count("AddonPath="), 1)
+        self.assertEqual(merged.count("[ADDON]"), 1)
+        self.assertIn(
+            "AddonPath=reshade-addons, ,,CommaLead",
+            core.merge_external_reshade_ini("[ADDON]\nAddonPath=reshade-addons, ,,CommaLead\n"),
+        )
 
         # Legacy WWMI 1.1.0 version detection
         core_ini.write_text(
@@ -422,6 +444,26 @@ class TestInstallerCore(unittest.TestCase):
             rep = core.run_doctor(self.win64, self.wwmi, self.base)
             self.assertTrue(any("Not mounted in Win64" in f.message for f in rep.findings))
             self.assertIn("No active installation ledger", self.uninstall()["message"])
+
+            # Verify Linux GUI wizard passes English menu labels when --lang en overrides a Chinese default.
+            setup = load_script("linux_setup_en_gui", "scripts/wwmi-dx12-setup.py")
+            captured_cmds: list[list[str]] = []
+
+            def fake_run(cmd, **_kwargs):
+                captured_cmds.append(list(cmd))
+                return type("Proc", (), {"returncode": 1, "stdout": ""})()
+
+            with patch.dict(os.environ, {"WWMI_SETUP_LANG": "zh"}), \
+                    patch.object(setup, "resolve_defaults", return_value=(self.win64, self.wwmi, self.base, None)), \
+                    patch.object(setup.shutil, "which", side_effect=lambda name: "/usr/bin/kdialog" if name == "kdialog" else None), \
+                    patch.object(setup.subprocess, "run", side_effect=fake_run):
+                self.assertEqual(setup.main(["gui", "--lang", "en"]), 0)
+            self.assertEqual(len(captured_cmds), 1)
+            joined = " ".join(captured_cmds[0])
+            self.assertIn("WWMI DX12+RT Setup", joined)
+            self.assertIn("Install & Enable", joined)
+            self.assertIn("Uninstall / Restore", joined)
+            self.assertNotIn("一键安装", joined)
 
 
 if __name__ == "__main__":
