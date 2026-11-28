@@ -36,12 +36,16 @@
 #include <winhttp.h>
 
 #include "ledger_json.hpp"
+#include "mini_unzip.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
 #include <optional>
 #include <stdexcept>
 #include <cstdio>
@@ -220,17 +224,22 @@ std::string ReadFileChecked(const fs::path& path)
     return bytes;
 }
 
-std::string Sha256Hex(const std::string& bytes)
+std::string Sha256HexBytes(const uint8_t* data, size_t len)
 {
     BCRYPT_ALG_HANDLE alg = nullptr;
     if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
         throw std::runtime_error("无法初始化 SHA-256");
     unsigned char digest[32]{};
-    const auto status = BCryptHash(alg, nullptr, 0, reinterpret_cast<PUCHAR>(const_cast<char*>(bytes.data())),
-        static_cast<ULONG>(bytes.size()), digest, sizeof(digest));
+    const auto status = BCryptHash(alg, nullptr, 0, const_cast<PUCHAR>(data),
+        static_cast<ULONG>(len), digest, sizeof(digest));
     BCryptCloseAlgorithmProvider(alg, 0);
     if (status != 0) throw std::runtime_error("无法计算 SHA-256");
     return Hex(digest, sizeof(digest));
+}
+
+std::string Sha256Hex(const std::string& bytes)
+{
+    return Sha256HexBytes(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
 }
 
 void WinError(const char* action, const fs::path& path, DWORD code = GetLastError())
@@ -261,16 +270,21 @@ bool RegularFileOrMissing(const fs::path& path)
     return true;
 }
 
-void WriteNewFile(const fs::path& path, const std::string& bytes)
+void WriteNewFileBytes(const fs::path& path, const uint8_t* data, size_t len)
 {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) WinError("无法创建事务暂存文件", path);
     DWORD written = 0;
-    const bool ok = WriteFile(f, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
-        written == bytes.size() && FlushFileBuffers(f);
+    const bool ok = (len == 0 || (WriteFile(f, data, static_cast<DWORD>(len), &written, nullptr) && written == len)) &&
+        FlushFileBuffers(f);
     const DWORD error = GetLastError();
     const bool closed = CloseHandle(f) != FALSE;
     if (!ok || !closed) WinError("无法写完事务暂存文件", path, ok ? GetLastError() : error);
+}
+
+void WriteNewFile(const fs::path& path, const std::string& bytes)
+{
+    WriteNewFileBytes(path, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
 }
 
 void AtomicWrite(const fs::path& path, const std::string& bytes)
@@ -738,6 +752,95 @@ std::optional<int> CompareSemVer(const std::string& a, const std::string& b)
     return pa->prerelease.size() < pb->prerelease.size() ? -1 : 1;
 }
 
+bool InDirectory(const fs::path& child, const fs::path& parent);
+std::string TrimAscii(std::string s);
+std::string LowerAscii(std::string s);
+
+std::string ValidateSlotRelPath(const std::string& raw)
+{
+    if (raw.empty()) return {};
+    std::string norm = raw;
+    for (char& c : norm) if (c == '\\') c = '/';
+    while (!norm.empty() && norm.front() == '/') norm.erase(norm.begin());
+    while (!norm.empty() && norm.back() == '/') norm.pop_back();
+    const size_t slash = norm.find('/');
+    if (slash == std::string::npos || norm.find('/', slash + 1) != std::string::npos)
+        throw std::runtime_error("invalid managed slot path");
+    const std::string head = norm.substr(0, slash);
+    const std::string name = norm.substr(slash + 1);
+    if (head != "versions" || name.empty() || name.size() > 80 || name == "." || name == ".." ||
+        name.back() == ' ' || name.back() == '.')
+        throw std::runtime_error("invalid managed slot name");
+    for (unsigned char c : name) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '.' || c == '_' || c == '-';
+        if (!ok) throw std::runtime_error("forbidden char in slot name");
+    }
+    return "versions/" + name;
+}
+
+fs::path ResolveSlotDir(const fs::path& base_root, const std::string& slot_rel)
+{
+    const fs::path base_canon = CanonicalPath(base_root);
+    const std::string clean = ValidateSlotRelPath(slot_rel);
+    if (clean.empty()) return base_canon;
+    std::wstring rel_w = Utf8ToWide(clean);
+    for (wchar_t& c : rel_w) if (c == L'/') c = L'\\';
+    const fs::path versions_root = CanonicalPath(base_canon / L"versions");
+    const fs::path target = CanonicalPath(base_canon / rel_w);
+    if (!InDirectory(target, versions_root) || SamePath(target, versions_root))
+        throw std::runtime_error("slot path escapes versions directory");
+    return target;
+}
+
+std::string SlotNameForRelease(const std::string& version, const std::string& commit, const std::string& archive_sha)
+{
+    std::string safe_ver;
+    for (unsigned char c : TrimAscii(version)) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '.' || c == '_' || c == '-';
+        safe_ver.push_back(ok ? static_cast<char>(c) : '_');
+        if (safe_ver.size() >= 32) break;
+    }
+    if (safe_ver.empty()) safe_ver = "dev";
+    std::string suffix_src = (commit.size() >= 7 && IsHex(commit, commit.size())) ? commit : archive_sha;
+    std::string suffix = LowerAscii(suffix_src.substr(0, std::min<size_t>(8, suffix_src.size())));
+    if (suffix.empty()) suffix = "00000000";
+    return ValidateSlotRelPath("versions/" + safe_ver + "-" + suffix);
+}
+
+fs::path SetupPrefsPath(const fs::path& base_root)
+{
+    return base_root / L"runtime\\setup-prefs.json";
+}
+
+bool LoadAutoCheckPref(const fs::path& base_root)
+{
+    try {
+        const fs::path path = SetupPrefsPath(base_root);
+        if (!RegularFileOrMissing(path)) return true;
+        const auto root = ledger_json::Reader(ReadFileChecked(path)).parse();
+        if (root.type == ledger_json::Value::Type::Object) {
+            auto it = root.fields.find("auto_check_updates");
+            if (it != root.fields.end() && it->second.type == ledger_json::Value::Type::Other) {
+                if (it->second.text == "false") return false;
+                if (it->second.text == "true") return true;
+            }
+        }
+    } catch (...) {
+    }
+    return true;
+}
+
+void SaveAutoCheckPref(const fs::path& base_root, bool enabled)
+{
+    std::error_code ec;
+    fs::create_directories(base_root / L"runtime", ec);
+    const std::string json = std::string("{\n  \"schema_version\": 1,\n  \"auto_check_updates\": ") +
+        (enabled ? "true" : "false") + "\n}\n";
+    AtomicWrite(SetupPrefsPath(base_root), json);
+}
+
 struct LedgerInfo {
     enum class State { Missing, Installed, Installing, RollingBack, Uninstalled };
     State state = State::Missing;
@@ -756,6 +859,11 @@ struct LedgerInfo {
     std::string migrated_to;
     std::string restored_from;
     std::string restored_pending_id;
+    std::string active_slot;
+    bool has_previous_slot = false;
+    std::string previous_slot;
+    std::string previous_version;
+    std::string previous_commit;
 
     bool active() const { return state == State::Installed || state == State::Installing || state == State::RollingBack; }
     bool pending() const { return state == State::Installing || state == State::RollingBack; }
@@ -816,6 +924,19 @@ LedgerInfo ReadLedger(const fs::path& base_root)
         }
         if (auto it = json.fields.find("restored_pending_id"); it != json.fields.end() && it->second.type == ledger_json::Value::Type::String) {
             info.restored_pending_id = it->second.text;
+        }
+        if (auto it = json.fields.find("active_slot"); it != json.fields.end() && it->second.type == ledger_json::Value::Type::String) {
+            info.active_slot = ValidateSlotRelPath(it->second.text);
+        }
+        if (auto it = json.fields.find("previous_slot"); it != json.fields.end() && it->second.type == ledger_json::Value::Type::String) {
+            info.previous_slot = ValidateSlotRelPath(it->second.text);
+            info.has_previous_slot = true;
+        }
+        if (auto it = json.fields.find("previous_version"); it != json.fields.end() && it->second.type == ledger_json::Value::Type::String) {
+            info.previous_version = it->second.text;
+        }
+        if (auto it = json.fields.find("previous_commit"); it != json.fields.end() && it->second.type == ledger_json::Value::Type::String) {
+            info.previous_commit = it->second.text;
         }
         if (info.active()) {
             const auto& records = json.at("win64_files");
@@ -890,6 +1011,8 @@ fs::path LedgerGameWin64(const fs::path& base_root)
 using Hashes = std::array<std::string, kBootstrap.size()>;
 
 bool InDirectory(const fs::path& child, const fs::path& parent);
+std::string TrimAscii(std::string s);
+std::string LowerAscii(std::string s);
 
 fs::path VerifiedRecoveryBackupPath(const fs::path& bkp_raw, const std::string& prev_sha, const fs::path& base_root)
 {
@@ -1169,7 +1292,8 @@ bool DetectVerifiedWin64Owner(
         }
     }
 
-    const fs::path host_dll_a = candidate / L"host\\ReShade64-game-forward.dll";
+    const fs::path slot_root_a = ResolveSlotDir(candidate, ledger_a.active_slot);
+    const fs::path host_dll_a = slot_root_a / L"host\\ReShade64-game-forward.dll";
     if (!RegularFileOrMissing(host_dll_a) || Sha256Hex(ReadFileChecked(host_dll_a)) != actual[0]) {
         reject_reason = g_zh_ui
             ? ("旧目录 " + WideToUtf8(candidate.wstring()) + " 缺少匹配的 host\\ReShade64-game-forward.dll，无法验证 Win64\\dxgi.dll 归属，拒绝覆盖。")
@@ -1407,10 +1531,26 @@ std::vector<std::wstring> ScanThirdPartyWin64Addons(const fs::path& win64_dir)
     return found;
 }
 
-std::string MergeExternalReShadeIni(const fs::path& ini_path)
+bool IsManagedSlotAddonToken(const std::string& norm_lower)
 {
+    const size_t s1 = norm_lower.find('/');
+    if (s1 == std::string::npos) return false;
+    const size_t s2 = norm_lower.find('/', s1 + 1);
+    if (s2 == std::string::npos || norm_lower.find('/', s2 + 1) != std::string::npos) return false;
+    return norm_lower.compare(0, s1, "versions") == 0 && norm_lower.compare(s2 + 1, std::string::npos, "reshade-addons") == 0;
+}
+
+std::string MergeExternalReShadeIni(const fs::path& ini_path, const std::string& addon_rel_path = "reshade-addons")
+{
+    std::string clean_primary = addon_rel_path;
+    for (char& c : clean_primary) if (c == '/') c = '\\';
+    while (!clean_primary.empty() && clean_primary.back() == '\\') clean_primary.pop_back();
+    if (clean_primary.empty()) clean_primary = "reshade-addons";
+    const bool is_slot = (LowerAscii(clean_primary) != "reshade-addons");
+    const std::string default_val = is_slot ? (clean_primary + ",reshade-addons") : "reshade-addons";
+    const std::string default_line = "AddonPath=" + default_val;
     const std::string kDefault =
-        "[INSTALL]\r\nLogging=0\r\n\r\n[ADDON]\r\nAddonPath=reshade-addons\r\n\r\n[OVERLAY]\r\nTutorialProgress=4\r\n";
+        "[INSTALL]\r\nLogging=0\r\n\r\n[ADDON]\r\n" + default_line + "\r\n\r\n[OVERLAY]\r\nTutorialProgress=4\r\n";
     if (!RegularFileOrMissing(ini_path)) return kDefault;
     std::string existing = ReadFileChecked(ini_path);
     if (existing.size() >= 3 &&
@@ -1521,7 +1661,7 @@ std::string MergeExternalReShadeIni(const fs::path& ini_path)
                 std::string norm = lower_ascii(raw_tok);
                 for (char& c : norm) if (c == '\\') c = '/';
                 while (!norm.empty() && norm.back() == '/') norm.pop_back();
-                if (norm != "reshade-addons" &&
+                if (norm != "reshade-addons" && !IsManagedSlotAddonToken(norm) &&
                     std::find(seen_norms.begin(), seen_norms.end(), norm) == seen_norms.end()) {
                     seen_norms.push_back(std::move(norm));
                     extras.push_back(escape_commas(raw_tok));
@@ -1529,7 +1669,7 @@ std::string MergeExternalReShadeIni(const fs::path& ini_path)
             }
         }
         const int first_idx = addon_path_indices.front();
-        std::string merged = "reshade-addons";
+        std::string merged = default_val;
         for (const std::string& extra : extras)
             merged += (!extra.empty() && extra.front() == ',' ? ", " : ",") + extra;
         lines[(size_t)first_idx] = "AddonPath=" + merged;
@@ -1537,11 +1677,11 @@ std::string MergeExternalReShadeIni(const fs::path& ini_path)
             lines.erase(lines.begin() + addon_path_indices[k]);
         }
     } else if (addon_header_idx >= 0) {
-        lines.insert(lines.begin() + addon_header_idx + 1, "AddonPath=reshade-addons");
+        lines.insert(lines.begin() + addon_header_idx + 1, default_line);
     } else {
         if (!lines.empty() && !trim_ascii(lines.back()).empty()) lines.emplace_back();
         lines.emplace_back("[ADDON]");
-        lines.emplace_back("AddonPath=reshade-addons");
+        lines.emplace_back(default_line);
     }
     std::ostringstream out;
     for (const std::string& l : lines) out << l << eol;
@@ -1568,7 +1708,7 @@ std::vector<std::wstring> ScanReShadeIniMigrationWarnings(const std::string& ini
         std::string norm = LowerAscii(t);
         for (char& c : norm) if (c == '\\') c = '/';
         while (!norm.empty() && norm.back() == '/') norm.pop_back();
-        if (norm == "reshade-addons" || norm == ".") return false;
+        if (norm == "reshade-addons" || norm == "." || IsManagedSlotAddonToken(norm)) return false;
         if (t.front() == '/' || t.front() == '\\' || t.front() == '%') return false;
         if (t.size() >= 2 && ((t[0] >= 'A' && t[0] <= 'Z') || (t[0] >= 'a' && t[0] <= 'z')) && t[1] == ':') return false;
         if (std::all_of(t.begin(), t.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) return false;
@@ -2126,6 +2266,90 @@ void EnsureRestoreSourceFinalized(const fs::path& base_root, const LedgerInfo& l
     }
 }
 
+struct UpdateCheckResult;
+fs::path PublishStagedSlotLockedWin(
+    const fs::path& base,
+    const std::string& slot_rel,
+    const fs::path& stage_dir,
+    const UpdateCheckResult& manifest);
+
+struct StagedReleaseInfo {
+    bool        active = false;
+    std::string slot;
+    std::string version;
+    std::string commit;
+};
+
+fs::path StagedReleasePath(const fs::path& base) { return base / L"runtime\\staged-release.json"; }
+
+StagedReleaseInfo ReadStagedReleaseWin(const fs::path& base)
+{
+    StagedReleaseInfo info{};
+    const fs::path p = StagedReleasePath(base);
+    if (!RegularFileOrMissing(p)) return info;
+    try {
+        const auto root = ledger_json::Reader(ReadFileChecked(p)).parse();
+        if (root.type != ledger_json::Value::Type::Object) return info;
+        auto it_act = root.fields.find("active");
+        if (it_act == root.fields.end() || it_act->second.type != ledger_json::Value::Type::Other || it_act->second.text != "true")
+            return info;
+        auto it_slot = root.fields.find("slot");
+        auto it_ver = root.fields.find("version");
+        if (it_slot == root.fields.end() || it_slot->second.type != ledger_json::Value::Type::String ||
+            it_ver == root.fields.end() || it_ver->second.type != ledger_json::Value::Type::String)
+            return info;
+        const std::string clean = ValidateSlotRelPath(it_slot->second.text);
+        const std::string ver = TrimAscii(it_ver->second.text);
+        if (clean.empty() || ver.empty()) return info;
+        info.active = true;
+        info.slot = clean;
+        info.version = ver;
+        auto it_c = root.fields.find("commit");
+        if (it_c != root.fields.end() && it_c->second.type == ledger_json::Value::Type::String)
+            info.commit = TrimAscii(it_c->second.text);
+    } catch (...) {
+        return {};
+    }
+    return info;
+}
+
+void SaveStagedReleaseWin(const fs::path& base, const std::string& slot_rel, const std::string& version, const std::string& commit)
+{
+    const std::string clean = ValidateSlotRelPath(slot_rel);
+    std::ostringstream out;
+    out << "{\n  \"schema_version\": 1,\n  \"active\": true,\n"
+        << "  \"slot\": \"" << JsonEscape(Utf8ToWide(clean)) << "\",\n"
+        << "  \"version\": \"" << JsonEscape(Utf8ToWide(version)) << "\",\n";
+    if (!commit.empty())
+        out << "  \"commit\": \"" << JsonEscape(Utf8ToWide(commit)) << "\"\n}\n";
+    else
+        out << "  \"commit\": null\n}\n";
+    AtomicWrite(StagedReleasePath(base), out.str());
+}
+
+void ClearStagedReleaseWin(const fs::path& base)
+{
+    std::error_code ec;
+    const fs::path p = StagedReleasePath(base);
+    if (!fs::exists(p, ec)) return;
+    try {
+        AtomicWrite(p, "{\n  \"schema_version\": 1,\n  \"active\": false\n}\n");
+    } catch (...) {
+    }
+}
+
+fs::path ResolveFolderActiveHostDll(const fs::path& folder, const LedgerInfo& led)
+{
+    if (!led.active_slot.empty()) {
+        try {
+            const fs::path slot_host = ResolveSlotDir(folder, led.active_slot) / L"host\\ReShade64-game-forward.dll";
+            if (RegularFileOrMissing(slot_host)) return slot_host;
+        } catch (...) {
+        }
+    }
+    return folder / L"host\\ReShade64-game-forward.dll";
+}
+
 bool PerformInstall(
     const fs::path& raw_game_dir,
     const fs::path& raw_wwmi_dir,
@@ -2239,11 +2463,61 @@ bool PerformInstall(
         for (const auto* dir : { L"logs", L"cache\\shaders", L"seed", L"recovery" }) fs::create_directories(runtime / dir);
         fs::create_directories(base / L"seed");
 
+        std::string active_slot_keep;
+        bool keep_prev_slot = false;
+        std::string prev_slot_keep, prev_ver_keep, prev_commit_keep;
+        std::string eff_install_ver = pkg_prov.version;
+        std::string eff_install_commit = pkg_prov.commit;
+        fs::path effective_host_dll = copies.empty() ? (base / L"host\\ReShade64-game-forward.dll") : copies.front().first;
+        std::string addon_rel_for_ini = "reshade-addons";
+        bool used_staged_release = false;
+        if (!verified_owner && !old_ledger.active_slot.empty()) {
+            try {
+                const fs::path sdir = ResolveSlotDir(base, old_ledger.active_slot);
+                if (RegularFileOrMissing(sdir / L"host\\ReShade64-game-forward.dll") &&
+                    RegularFileOrMissing(sdir / L"reshade-addons\\wwmi_dx12.addon64")) {
+                    active_slot_keep = old_ledger.active_slot;
+                    keep_prev_slot = old_ledger.has_previous_slot;
+                    prev_slot_keep = old_ledger.previous_slot;
+                    prev_ver_keep = old_ledger.previous_version;
+                    prev_commit_keep = old_ledger.previous_commit;
+                    effective_host_dll = sdir / L"host\\ReShade64-game-forward.dll";
+                    if (!old_ledger.installed_version.empty()) eff_install_ver = old_ledger.installed_version;
+                    if (!old_ledger.installed_commit.empty()) eff_install_commit = old_ledger.installed_commit;
+                    addon_rel_for_ini = active_slot_keep + "\\reshade-addons";
+                    for (char& c : addon_rel_for_ini) if (c == '/') c = '\\';
+                }
+            } catch (...) {
+            }
+        } else if (!verified_owner && !old_ledger.active()) {
+            const auto staged = ReadStagedReleaseWin(base);
+            if (staged.active) {
+                try {
+                    const fs::path sdir = ResolveSlotDir(base, staged.slot);
+                    const auto cmp = CompareSemVer(pkg_prov.version, staged.version);
+                    const bool staged_is_ge = (staged.version == pkg_prov.version) || (cmp && *cmp <= 0) ||
+                        (!ParseSemVer(pkg_prov.version).has_value() && ParseSemVer(staged.version).has_value());
+                    if (RegularFileOrMissing(sdir / L"host\\ReShade64-game-forward.dll") &&
+                        RegularFileOrMissing(sdir / L"reshade-addons\\wwmi_dx12.addon64") &&
+                        staged_is_ge) {
+                        active_slot_keep = staged.slot;
+                        effective_host_dll = sdir / L"host\\ReShade64-game-forward.dll";
+                        eff_install_ver = staged.version;
+                        eff_install_commit = staged.commit;
+                        addon_rel_for_ini = active_slot_keep + "\\reshade-addons";
+                        for (char& c : addon_rel_for_ini) if (c == '/') c = '\\';
+                        used_staged_release = true;
+                    }
+                } catch (...) {
+                }
+            }
+        }
+
         const fs::path reshade_src = RegularFileOrMissing(base / L"ReShade.ini")
             ? (base / L"ReShade.ini")
             : (verified_owner && RegularFileOrMissing(verified_owner->base_root / L"ReShade.ini")
                 ? (verified_owner->base_root / L"ReShade.ini") : (base / L"ReShade.ini"));
-        const std::string merged_reshade = MergeExternalReShadeIni(reshade_src);
+        const std::string merged_reshade = MergeExternalReShadeIni(reshade_src, addon_rel_for_ini);
         AtomicWrite(base / L"ReShade.ini", merged_reshade);
         if (verified_owner) {
             const auto rs_warns = ScanReShadeIniMigrationWarnings(merged_reshade, verified_owner->base_root);
@@ -2286,7 +2560,7 @@ bool PerformInstall(
         }
 
         const std::array<std::string, kBootstrap.size()> content = {
-            ReadFileChecked(copies.empty() ? base / L"host\\ReShade64-game-forward.dll" : copies.front().first),
+            ReadFileChecked(effective_host_dll),
             "[INSTALL]\r\nBasePath=" + WideToUtf8(base.wstring()) + "\r\n",
         };
         Hashes expected;
@@ -2342,11 +2616,20 @@ bool PerformInstall(
                 << "  \"base_root\": \"" << JsonEscape(base.wstring()) << "\",\n"
                 << "  \"win64_dir\": \"" << JsonEscape(win64.wstring()) << "\",\n"
                 << "  \"wwmi_dir\": \"" << JsonEscape(wwmi.wstring()) << "\",\n"
-                << "  \"installed_version\": \"" << JsonEscape(Utf8ToWide(pkg_prov.version)) << "\",\n";
-            if (!pkg_prov.commit.empty())
-                out << "  \"installed_commit\": \"" << JsonEscape(Utf8ToWide(pkg_prov.commit)) << "\",\n";
+                << "  \"installed_version\": \"" << JsonEscape(Utf8ToWide(eff_install_ver)) << "\",\n";
+            if (!eff_install_commit.empty())
+                out << "  \"installed_commit\": \"" << JsonEscape(Utf8ToWide(eff_install_commit)) << "\",\n";
             else
                 out << "  \"installed_commit\": null,\n";
+            if (!active_slot_keep.empty())
+                out << "  \"active_slot\": \"" << JsonEscape(Utf8ToWide(active_slot_keep)) << "\",\n";
+            if (keep_prev_slot) {
+                out << "  \"previous_slot\": \"" << JsonEscape(Utf8ToWide(prev_slot_keep)) << "\",\n";
+                if (!prev_ver_keep.empty())
+                    out << "  \"previous_version\": \"" << JsonEscape(Utf8ToWide(prev_ver_keep)) << "\",\n";
+                if (!prev_commit_keep.empty())
+                    out << "  \"previous_commit\": \"" << JsonEscape(Utf8ToWide(prev_commit_keep)) << "\",\n";
+            }
             if (!preserved_upgraded_from.empty())
                 out << "  \"upgraded_from\": \"" << JsonEscape(Utf8ToWide(preserved_upgraded_from)) << "\",\n";
             if (installing) {
@@ -2447,12 +2730,13 @@ bool PerformInstall(
 
         // ---- Step 3: Commit B ownership and mark A migrated_to (never deleting A) ----
         write_ledger(false);
+        if (used_staged_release) ClearStagedReleaseWin(base);
         if (!previous_owner_root.empty()) {
             const std::wstring w = MarkPreviousOwnerMigrated(previous_owner_root, base);
             if (!w.empty()) migration_warnings.push_back(w);
         }
 
-        const std::wstring new_ver_w = Utf8ToWide(pkg_prov.version);
+        const std::wstring new_ver_w = Utf8ToWide(eff_install_ver);
         if (action_kind == InstallActionKind::Upgrade && verified_owner) {
             const std::wstring old_ver_w = FormatInstalledVersionW(verified_owner->ledger);
             msg_out = g_zh_ui
@@ -2514,6 +2798,252 @@ bool PerformInstall(
     }
 }
 
+void PruneUnusedSlotsWin(const fs::path& base, const std::string& keep_a, const std::string& keep_b)
+{
+    std::error_code ec;
+    const fs::path versions_dir = base / L"versions";
+    if (!fs::is_directory(versions_dir, ec)) return;
+    auto slot_leaf = [](const std::string& s) -> std::wstring {
+        if (s.empty()) return {};
+        const size_t p = s.find_last_of("/\\");
+        return LowerWide(Utf8ToWide(p == std::string::npos ? s : s.substr(p + 1)));
+    };
+    const std::wstring ka = slot_leaf(keep_a);
+    const std::wstring kb = slot_leaf(keep_b);
+    const fs::path stage_root = base / L"runtime\\uninstall-staging";
+    for (const auto& entry : fs::directory_iterator(versions_dir, ec)) {
+        if (!entry.is_directory(ec)) continue;
+        const std::wstring leaf = LowerWide(entry.path().filename().wstring());
+        if ((!ka.empty() && leaf == ka) || (!kb.empty() && leaf == kb)) continue;
+        fs::create_directories(stage_root, ec);
+        const fs::path dst = stage_root / (L"old-slot-" + entry.path().filename().wstring() + L"-" + Utf8ToWide(NewToken().substr(0, 8)));
+        MoveFileExW(entry.path().c_str(), dst.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+    }
+}
+
+bool SwitchBaseRootSlot(
+    const fs::path& raw_base,
+    const std::string& target_slot_rel,
+    const std::string& target_ver,
+    const std::string& target_commit,
+    bool is_rollback,
+    std::wstring& msg_out,
+    const fs::path* staged_dir_to_publish = nullptr,
+    const UpdateCheckResult* staged_manifest = nullptr,
+    fs::path* published_slot_dir_out = nullptr)
+{
+    try {
+        if (IsGameRunning())
+            throw std::runtime_error(TrA("检测到《鸣潮》正在运行，请先退出游戏后重试。",
+                "Wuthering Waves is currently running. Close the game and retry."));
+        const fs::path base = CanonicalPath(raw_base);
+        const std::string clean_slot = ValidateSlotRelPath(target_slot_rel);
+        fs::path slot_dir = ResolveSlotDir(base, clean_slot);
+        if (!staged_dir_to_publish) {
+            const fs::path host_dll_pre = slot_dir / L"host\\ReShade64-game-forward.dll";
+            if (!RegularFileOrMissing(host_dll_pre) || !RegularFileOrMissing(slot_dir / L"reshade-addons\\wwmi_dx12.addon64"))
+                throw std::runtime_error(TrA("目标版本槽缺少核心运行时文件，拒绝切换。",
+                    "Target version slot is missing core runtime binaries; refusing switch."));
+        }
+
+        const auto pre_led = ReadLedger(base);
+        if (pre_led.state != LedgerInfo::State::Installed)
+            throw std::runtime_error(TrA("当前目录未处于已安装状态，请先完成首次安装。",
+                "Current folder is not installed yet; run initial Install first."));
+        const fs::path win64 = CanonicalPath(pre_led.win64_dir);
+        if (!SamePath(pre_led.win64_dir, win64))
+            throw std::runtime_error(TrA("原 Win64 目录现在指向其他位置，拒绝切换。",
+                "Recorded Win64 directory now resolves elsewhere; refusing switch."));
+
+        const Win64MutexLock wlock(win64);
+        const BaseRootMutexLocks blocks({ base });
+        if (IsGameRunning())
+            throw std::runtime_error(TrA("检测到《鸣潮》正在运行，请先退出游戏后重试。",
+                "Wuthering Waves is currently running. Close the game and retry."));
+        const auto led_cur = ReadLedger(base);
+        if (led_cur.state != LedgerInfo::State::Installed || !SamePath(CanonicalPath(led_cur.win64_dir), win64))
+            throw std::runtime_error(TrA("加锁后账本状态已变化，请重试。",
+                "Ledger state changed while acquiring lock; retry."));
+
+        if (staged_dir_to_publish && !staged_dir_to_publish->empty() && staged_manifest) {
+            slot_dir = PublishStagedSlotLockedWin(base, clean_slot, *staged_dir_to_publish, *staged_manifest);
+        }
+        if (published_slot_dir_out) *published_slot_dir_out = slot_dir;
+
+        const fs::path host_dll = slot_dir / L"host\\ReShade64-game-forward.dll";
+        if (!RegularFileOrMissing(host_dll) || !RegularFileOrMissing(slot_dir / L"reshade-addons\\wwmi_dx12.addon64"))
+            throw std::runtime_error(TrA("目标版本槽缺少核心运行时文件，拒绝切换。",
+                "Target version slot is missing core runtime binaries; refusing switch."));
+
+        const Hashes owned = OwnedBootstrap(win64, led_cur, base);
+        if (owned[0].empty() || owned[1].empty())
+            throw std::runtime_error(TrA("当前 Win64 引导文件不完整，请先修复安装后再升级或回滚。",
+                "Current Win64 bootstrap files are incomplete; repair install first."));
+
+        const std::string old_slot = led_cur.active_slot;
+        const std::string old_ver = led_cur.installed_version.empty() ? "dev" : led_cur.installed_version;
+        const std::string old_commit = led_cur.installed_commit;
+        const std::string old_ledger_raw = ReadFileChecked(JournalPath(base));
+
+        // Preserve existing rollback target on idempotent same-slot re-apply (old_slot == clean_slot).
+        const bool next_has_prev = !is_rollback && ((old_slot != clean_slot) ? true : led_cur.has_previous_slot);
+        const std::string next_prev_slot = (old_slot != clean_slot) ? old_slot : led_cur.previous_slot;
+        const std::string next_prev_ver = (old_slot != clean_slot) ? old_ver : led_cur.previous_version;
+        const std::string next_prev_commit = (old_slot != clean_slot) ? old_commit : led_cur.previous_commit;
+
+        const std::array<std::string, kBootstrap.size()> content = {
+            ReadFileChecked(host_dll),
+            "[INSTALL]\r\nBasePath=" + WideToUtf8(base.wstring()) + "\r\n",
+        };
+        Hashes expected;
+        for (size_t i = 0; i < kBootstrap.size(); ++i) expected[i] = Sha256Hex(content[i]);
+
+        std::string addon_rel = "reshade-addons";
+        if (!clean_slot.empty()) {
+            addon_rel = clean_slot + "\\reshade-addons";
+            for (char& c : addon_rel) if (c == '/') c = '\\';
+        }
+        const fs::path ext_rs_path = base / L"ReShade.ini";
+        const bool had_ext_rs = RegularFileOrMissing(ext_rs_path);
+        const std::string old_ext_rs = had_ext_rs ? ReadFileChecked(ext_rs_path) : std::string{};
+        const std::string merged_rs = MergeExternalReShadeIni(ext_rs_path, addon_rel);
+
+        const std::string token = NewToken();
+        std::array<fs::path, kBootstrap.size()> backup_paths;
+        const fs::path recovery_dir = CreateRecoveryBackup(win64, owned, base, token, backup_paths);
+        if (had_ext_rs) WriteNewFile(recovery_dir / L"external-ReShade.ini", old_ext_rs);
+
+        auto write_slot_ledger = [&](bool installing) {
+            std::ostringstream out;
+            out << "{\n  \"schema_version\": 1,\n  \"state\": \"" << (installing ? "installing" : "installed") << "\",\n"
+                << "  \"platform_kind\": \"windows\",\n"
+                << "  \"base_root\": \"" << JsonEscape(base.wstring()) << "\",\n"
+                << "  \"win64_dir\": \"" << JsonEscape(win64.wstring()) << "\",\n"
+                << "  \"wwmi_dir\": \"" << JsonEscape(led_cur.wwmi_dir.wstring()) << "\",\n"
+                << "  \"installed_version\": \"" << JsonEscape(Utf8ToWide(target_ver)) << "\",\n";
+            if (!target_commit.empty())
+                out << "  \"installed_commit\": \"" << JsonEscape(Utf8ToWide(target_commit)) << "\",\n";
+            else
+                out << "  \"installed_commit\": null,\n";
+            if (!led_cur.upgraded_from.empty())
+                out << "  \"upgraded_from\": \"" << JsonEscape(Utf8ToWide(led_cur.upgraded_from)) << "\",\n";
+            out << "  \"active_slot\": \"" << JsonEscape(Utf8ToWide(clean_slot)) << "\",\n";
+            if (is_rollback) {
+                out << "  \"rolled_back_from_slot\": \"" << JsonEscape(Utf8ToWide(old_slot)) << "\",\n";
+            } else if (next_has_prev) {
+                out << "  \"previous_slot\": \"" << JsonEscape(Utf8ToWide(next_prev_slot)) << "\",\n";
+                if (!next_prev_ver.empty())
+                    out << "  \"previous_version\": \"" << JsonEscape(Utf8ToWide(next_prev_ver)) << "\",\n";
+                if (!next_prev_commit.empty())
+                    out << "  \"previous_commit\": \"" << JsonEscape(Utf8ToWide(next_prev_commit)) << "\",\n";
+            }
+            if (installing) {
+                out << "  \"pending_id\": \"" << token << "\",\n"
+                    << "  \"recovery_dir\": \"" << JsonEscape(recovery_dir.wstring()) << "\",\n";
+            }
+            out << "  \"win64_files\": [\n";
+            for (size_t i = 0; i < kBootstrap.size(); ++i) {
+                if (i) out << ",\n";
+                out << "    { \"relative\": \"" << WideToUtf8(kBootstrap[i]) << "\", \"path\": \""
+                    << JsonEscape((win64 / kBootstrap[i]).wstring()) << "\", \"sha256\": \"" << expected[i]
+                    << "\", \"size\": " << content[i].size();
+                if (installing) {
+                    out << ", \"previous_sha256\": \"" << owned[i]
+                        << "\", \"recovery_backup\": \"" << JsonEscape(backup_paths[i].wstring()) << "\"";
+                }
+                out << " }";
+            }
+            out << "\n  ],\n  \"extra_managed_files\": []\n}\n";
+            AtomicWrite(JournalPath(base), out.str());
+        };
+
+        write_slot_ledger(true);
+        try {
+            AtomicWrite(ext_rs_path, merged_rs);
+            for (size_t i = 0; i < kBootstrap.size(); ++i) {
+                if (owned[i] == expected[i]) continue;
+                const fs::path temp = PendingPath(win64, token, kBootstrap[i]);
+                const fs::path dest = win64 / kBootstrap[i];
+                WriteNewFile(temp, content[i]);
+                if (!MoveFileExW(temp.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                    WinError("无法提交版本槽引导文件", dest);
+            }
+            write_slot_ledger(false);
+        } catch (...) {
+            if (had_ext_rs) {
+                try { AtomicWrite(ext_rs_path, old_ext_rs); } catch (...) {}
+            }
+            for (size_t idx = kBootstrap.size(); idx-- > 0;) {
+                if (backup_paths[idx].empty()) continue;
+                try {
+                    const fs::path rb_tmp = win64 / (L".wwmi-rb-" + Utf8ToWide(NewToken()) + L"-" + kBootstrap[idx] + L".tmp");
+                    WriteNewFile(rb_tmp, ReadFileChecked(backup_paths[idx]));
+                    MoveFileExW(rb_tmp.c_str(), (win64 / kBootstrap[idx]).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+                } catch (...) {}
+            }
+            try {
+                if (Sha256Hex(ReadFileChecked(win64 / kBootstrap[0])) == owned[0] &&
+                    Sha256Hex(ReadFileChecked(win64 / kBootstrap[1])) == owned[1]) {
+                    AtomicWrite(JournalPath(base), old_ledger_raw);
+                }
+            } catch (...) {}
+            throw;
+        }
+
+        ClearStagedReleaseWin(base);
+        PruneUnusedSlotsWin(base, clean_slot, next_has_prev ? next_prev_slot : std::string{});
+
+        const std::wstring from_w = Utf8ToWide(old_ver);
+        const std::wstring to_w = Utf8ToWide(target_ver);
+        if (is_rollback) {
+            msg_out = g_zh_ui
+                ? (L"已安全回滚至上一版本：" + to_w + L"（外部配置、缓存与 Mod 完整保留）。")
+                : (L"Safely rolled back to previous version: " + to_w + L" (settings, cache, and Mods preserved).");
+        } else {
+            msg_out = g_zh_ui
+                ? (L"无感升级完成：" + from_w + L" -> " + to_w + L"！目录路径与配置均已保留，随时可在「更多操作」一键回滚。")
+                : (L"Seamless upgrade complete: " + from_w + L" -> " + to_w + L"! Folder path and settings preserved; roll back anytime via More.");
+        }
+        return true;
+    } catch (const std::exception& e) {
+        msg_out = Utf8ToWide(e.what());
+        return false;
+    }
+}
+
+bool TrySelfReplaceSetupExe(const fs::path& slot_dir, const fs::path& base_root, bool& replaced_out)
+{
+    replaced_out = false;
+    try {
+        const fs::path new_exe = slot_dir / L"WWMI-DX12-RT-Setup.exe";
+        const fs::path cur_exe = base_root / L"WWMI-DX12-RT-Setup.exe";
+        if (!RegularFileOrMissing(new_exe) || !RegularFileOrMissing(cur_exe)) return true;
+        const std::string new_bytes = ReadFileChecked(new_exe);
+        const std::string cur_bytes = ReadFileChecked(cur_exe);
+        if (Sha256Hex(new_bytes) == Sha256Hex(cur_bytes)) return true;
+        std::error_code ec;
+        const fs::path stage_dir = base_root / L"runtime\\staging";
+        fs::create_directories(stage_dir, ec);
+        const std::wstring tok = Utf8ToWide(NewToken().substr(0, 8));
+        const fs::path tmp_new = base_root / (L".WWMI-DX12-RT-Setup-" + tok + L".tmp");
+        const fs::path moved_old = stage_dir / (L"prev-setup-" + tok + L".exe");
+        // Write and flush the full new executable BEFORE moving the running executable aside.
+        WriteNewFile(tmp_new, new_bytes);
+        if (!MoveFileExW(cur_exe.c_str(), moved_old.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            MoveFileExW(tmp_new.c_str(), (stage_dir / tmp_new.filename()).c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+            return false;
+        }
+        if (!MoveFileExW(tmp_new.c_str(), cur_exe.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            MoveFileExW(moved_old.c_str(), cur_exe.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+            return false;
+        }
+        replaced_out = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool PerformRollback(const fs::path& raw_base, const fs::path& raw_target, std::wstring& msg_out)
 {
     try {
@@ -2525,6 +3055,12 @@ bool PerformRollback(const fs::path& raw_base, const fs::path& raw_target, std::
         if (initial_b.state != LedgerInfo::State::Installed && initial_b.state != LedgerInfo::State::RollingBack)
             throw std::runtime_error(TrA("当前目录未处于已安装或待恢复回滚状态，无法执行回滚。",
                 "Current folder is not in an active installed or rolling_back state; cannot roll back."));
+
+        if (raw_target.empty() && initial_b.state == LedgerInfo::State::Installed && initial_b.has_previous_slot) {
+            const std::string prev_ver = initial_b.previous_version.empty()
+                ? TrA("上一版本", "Previous version") : initial_b.previous_version;
+            return SwitchBaseRootSlot(base, initial_b.previous_slot, prev_ver, initial_b.previous_commit, true, msg_out);
+        }
 
         fs::path raw_prev;
         if (initial_b.state == LedgerInfo::State::RollingBack) {
@@ -2555,7 +3091,8 @@ bool PerformRollback(const fs::path& raw_base, const fs::path& raw_target, std::
             throw std::runtime_error(g_zh_ui
                 ? ("旧版目录不存在，无法回滚：" + WideToUtf8(target_a.wstring()))
                 : ("Previous folder does not exist: " + WideToUtf8(target_a.wstring())));
-        const fs::path host_dll_a = target_a / L"host\\ReShade64-game-forward.dll";
+        const auto pre_ledger_a = ReadLedger(target_a);
+        fs::path host_dll_a = ResolveFolderActiveHostDll(target_a, pre_ledger_a);
         if (!RegularFileOrMissing(host_dll_a))
             throw std::runtime_error(g_zh_ui
                 ? ("旧版目录缺少 host\\ReShade64-game-forward.dll，无法回滚：" + WideToUtf8(target_a.wstring()))
@@ -2627,10 +3164,6 @@ bool PerformRollback(const fs::path& raw_base, const fs::path& raw_target, std::
         if (resuming_rollback && !SamePath(CanonicalPath(ledger_b.rollback_target), target_a))
             throw std::runtime_error(TrA("加锁后回滚目标发生变化，请重试回滚。",
                 "Rollback target changed while acquiring lock; retry Rollback."));
-        if (!RegularFileOrMissing(host_dll_a))
-            throw std::runtime_error(g_zh_ui
-                ? ("旧版目录缺少 host\\ReShade64-game-forward.dll，无法回滚：" + WideToUtf8(target_a.wstring()))
-                : ("Previous folder is missing host\\ReShade64-game-forward.dll: " + WideToUtf8(target_a.wstring())));
         const fs::path cur_restore_src = RestoredSourceRoot(ledger_b, base);
         const BaseRootMutexLocks extra_rb_lock({
             (!cur_restore_src.empty() && !SamePath(cur_restore_src, base) && !SamePath(cur_restore_src, target_a) && !SamePath(cur_restore_src, pre_restore_src))
@@ -2639,6 +3172,11 @@ bool PerformRollback(const fs::path& raw_base, const fs::path& raw_target, std::
         EnsureRestoreSourceFinalized(base, ledger_b);
 
         auto ledger_a = ReadLedger(target_a);
+        host_dll_a = ResolveFolderActiveHostDll(target_a, ledger_a);
+        if (!RegularFileOrMissing(host_dll_a))
+            throw std::runtime_error(g_zh_ui
+                ? ("旧版目录缺少 host\\ReShade64-game-forward.dll，无法回滚：" + WideToUtf8(target_a.wstring()))
+                : ("Previous folder is missing host\\ReShade64-game-forward.dll: " + WideToUtf8(target_a.wstring())));
         const bool already_committed_a = validate_target_a(ledger_a, resuming_rollback, ledger_b);
 
         const auto abandoned = PendingFiles(ledger_b);
@@ -2679,6 +3217,8 @@ bool PerformRollback(const fs::path& raw_base, const fs::path& raw_target, std::
                 stale_a << "  \"installed_version\": \"" << JsonEscape(Utf8ToWide(ledger_a.installed_version)) << "\",\n";
             if (!ledger_a.installed_commit.empty())
                 stale_a << "  \"installed_commit\": \"" << JsonEscape(Utf8ToWide(ledger_a.installed_commit)) << "\",\n";
+            if (!ledger_a.active_slot.empty())
+                stale_a << "  \"active_slot\": \"" << JsonEscape(Utf8ToWide(ledger_a.active_slot)) << "\",\n";
             stale_a << "  \"migrated_to\": \"" << JsonEscape(base.wstring()) << "\"\n}\n";
             AtomicWrite(JournalPath(target_a), stale_a.str());
             ledger_a.state = LedgerInfo::State::Uninstalled;
@@ -2846,6 +3386,15 @@ bool PerformRollback(const fs::path& raw_base, const fs::path& raw_target, std::
             out_a << "  \"installed_version\": \"" << JsonEscape(Utf8ToWide(ledger_a.installed_version)) << "\",\n";
         if (!ledger_a.installed_commit.empty())
             out_a << "  \"installed_commit\": \"" << JsonEscape(Utf8ToWide(ledger_a.installed_commit)) << "\",\n";
+        if (!ledger_a.active_slot.empty())
+            out_a << "  \"active_slot\": \"" << JsonEscape(Utf8ToWide(ledger_a.active_slot)) << "\",\n";
+        if (ledger_a.has_previous_slot) {
+            out_a << "  \"previous_slot\": \"" << JsonEscape(Utf8ToWide(ledger_a.previous_slot)) << "\",\n";
+            if (!ledger_a.previous_version.empty())
+                out_a << "  \"previous_version\": \"" << JsonEscape(Utf8ToWide(ledger_a.previous_version)) << "\",\n";
+            if (!ledger_a.previous_commit.empty())
+                out_a << "  \"previous_commit\": \"" << JsonEscape(Utf8ToWide(ledger_a.previous_commit)) << "\",\n";
+        }
         out_a << "  \"restored_from\": \"" << JsonEscape(base.wstring()) << "\",\n"
               << "  \"restored_pending_id\": \"" << commit_pending_id << "\",\n"
               << "  \"win64_files\": [\n";
@@ -3038,9 +3587,17 @@ std::wstring BuildDoctorText(const fs::path& raw_game, const fs::path& raw_wwmi,
     return ss.str();
 }
 
-// ------------------------- Opt-In Manual Update Check -------------------------
+// ------------------------- Verified Manifest Update & Self-Update -------------------------
 constexpr const wchar_t* kGithubAllowedPrefix = L"https://github.com/Bud-Open/wwmi-dx12-rt/";
 constexpr const wchar_t* kGithubFallbackUrl = L"https://github.com/Bud-Open/wwmi-dx12-rt/releases/latest";
+constexpr const wchar_t* kUpdateManifestUrl = L"https://github.com/Bud-Open/wwmi-dx12-rt/releases/latest/download/update-manifest.json";
+constexpr const wchar_t* kGithubDownloadPrefix = L"https://github.com/Bud-Open/wwmi-dx12-rt/releases/download/";
+constexpr int kUpdaterProtocolVersion = 1;
+constexpr uint64_t kMaxManifestBytes = 2ull * 1024ull * 1024ull;
+constexpr uint64_t kMaxArchiveBytes = 64ull * 1024ull * 1024ull;
+constexpr uint64_t kMaxUnpackedBytes = 128ull * 1024ull * 1024ull;
+constexpr uint32_t kMaxArchiveFiles = 1024u;
+constexpr int kMaxRedirectHops = 5;
 
 bool IsAllowedGithubReleaseUrl(const std::wstring& url)
 {
@@ -3051,23 +3608,93 @@ bool IsAllowedGithubReleaseUrl(const std::wstring& url)
     return true;
 }
 
-struct UpdateCheckResult {
-    bool ok = false;
-    bool update_available = false;
-    std::wstring current_version;
-    std::wstring latest_version;
-    std::wstring release_url = kGithubFallbackUrl;
-    std::wstring asset_name;
-    std::wstring asset_digest;
-    std::wstring published_at;
-    std::wstring error;
-};
-
-UpdateCheckResult CheckLatestReleaseWinHttp(const std::string& current_version)
+bool ValidateUpdateHopUrlW(
+    const std::wstring& url,
+    bool is_initial_hop,
+    std::wstring& host_out,
+    std::wstring& path_out,
+    std::wstring& err_out)
 {
-    UpdateCheckResult res;
-    res.current_version = Utf8ToWide(current_version.empty() ? "dev" : current_version);
+    if (url.empty()) {
+        err_out = TrW(L"更新链接为空。", L"Update URL is empty.");
+        return false;
+    }
+    for (wchar_t c : url) {
+        if (c <= 0x20 || c == 0x7F || c == L'"' || c == L'\'') {
+            err_out = TrW(L"更新链接包含非法字符。", L"Update URL contains invalid characters.");
+            return false;
+        }
+    }
+    URL_COMPONENTSW uc{};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t host_buf[256]{};
+    wchar_t path_buf[4096]{};
+    wchar_t extra_buf[2048]{};
+    wchar_t user_buf[128]{};
+    wchar_t pass_buf[128]{};
+    uc.lpszHostName = host_buf;
+    uc.dwHostNameLength = (DWORD)std::size(host_buf);
+    uc.lpszUrlPath = path_buf;
+    uc.dwUrlPathLength = (DWORD)std::size(path_buf);
+    uc.lpszExtraInfo = extra_buf;
+    uc.dwExtraInfoLength = (DWORD)std::size(extra_buf);
+    uc.lpszUserName = user_buf;
+    uc.dwUserNameLength = (DWORD)std::size(user_buf);
+    uc.lpszPassword = pass_buf;
+    uc.dwPasswordLength = (DWORD)std::size(pass_buf);
+    if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc)) {
+        err_out = TrW(L"无法解析更新链接。", L"Failed to parse update URL.");
+        return false;
+    }
+    if (uc.nScheme != INTERNET_SCHEME_HTTPS) {
+        err_out = TrW(L"拒绝非 HTTPS 更新链接。", L"Refused non-HTTPS update URL.");
+        return false;
+    }
+    if (uc.nPort != INTERNET_DEFAULT_HTTPS_PORT) {
+        err_out = TrW(L"拒绝非 443 端口的更新链接。", L"Refused update URL on non-443 port.");
+        return false;
+    }
+    if (uc.dwUserNameLength > 0 || uc.dwPasswordLength > 0) {
+        err_out = TrW(L"拒绝含凭据的更新链接。", L"Refused update URL with embedded credentials.");
+        return false;
+    }
+    const std::wstring host_low = LowerWide(std::wstring(uc.lpszHostName, uc.dwHostNameLength));
+    const std::wstring raw_path = std::wstring(uc.lpszUrlPath, uc.dwUrlPathLength);
+    const std::wstring extra = std::wstring(uc.lpszExtraInfo, uc.dwExtraInfoLength);
+    const std::wstring full_path = raw_path + extra;
+    const bool in_repo_releases = (raw_path.rfind(L"/Bud-Open/wwmi-dx12-rt/releases/", 0) == 0);
 
+    if (is_initial_hop) {
+        if (host_low != L"github.com" || !in_repo_releases) {
+            err_out = TrW(L"初始更新链接不在允许仓库内。", L"Initial update URL is outside the allowed repository.");
+            return false;
+        }
+    } else {
+        const bool host_ok = (host_low == L"github.com" ||
+            host_low == L"release-assets.githubusercontent.com" ||
+            host_low == L"objects.githubusercontent.com");
+        if (!host_ok || (host_low == L"github.com" && !in_repo_releases)) {
+            err_out = g_zh_ui
+                ? (L"重定向目标主机不在白名单内：" + host_low)
+                : (L"Redirect host not in allowlist: " + host_low);
+            return false;
+        }
+    }
+    host_out = host_low;
+    path_out = full_path.empty() ? L"/" : full_path;
+    return true;
+}
+
+bool WinHttpFetchVerified(
+    const std::wstring& initial_url,
+    uint64_t max_bytes,
+    DWORD timeout_ms,
+    std::vector<uint8_t>& out_bytes,
+    const std::function<void(uint64_t, uint64_t)>& progress_cb,
+    const std::atomic<bool>* cancel_flag,
+    std::wstring& err_out)
+{
+    out_bytes.clear();
     HINTERNET hSession = WinHttpOpen(
         L"WWMI-DX12-RT-Setup",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
@@ -3075,131 +3702,603 @@ UpdateCheckResult CheckLatestReleaseWinHttp(const std::string& current_version)
         WINHTTP_NO_PROXY_BYPASS,
         0);
     if (!hSession) {
-        res.error = TrW(L"无法初始化 WinHTTP 网络会话。", L"Failed to initialize WinHTTP session.");
-        return res;
+        err_out = TrW(L"无法初始化 WinHTTP 网络会话。", L"Failed to initialize WinHTTP session.");
+        return false;
     }
-    WinHttpSetTimeouts(hSession, 5000, 5000, 8000, 8000);
+    WinHttpSetTimeouts(hSession, (int)timeout_ms, (int)timeout_ms, (int)timeout_ms, (int)(timeout_ms * 2));
 
-    HINTERNET hConnect = WinHttpConnect(hSession, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hConnect) {
-        WinHttpCloseHandle(hSession);
-        res.error = TrW(L"无法连接 api.github.com。", L"Failed to connect to api.github.com.");
-        return res;
-    }
+    std::wstring cur_url = initial_url;
+    bool ok = false;
+    for (int hop = 0; hop <= kMaxRedirectHops; ++hop) {
+        if (cancel_flag && cancel_flag->load()) {
+            err_out = TrW(L"用户已取消更新下载。", L"Update download cancelled by user.");
+            break;
+        }
+        std::wstring host, path;
+        if (!ValidateUpdateHopUrlW(cur_url, hop == 0, host, path, err_out)) break;
 
-    HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect,
-        L"GET",
-        L"/repos/Bud-Open/wwmi-dx12-rt/releases/latest",
-        nullptr,
-        WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE);
-    if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        res.error = TrW(L"无法创建 HTTPS 请求。", L"Failed to create HTTPS request.");
-        return res;
-    }
+        HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!hConnect) {
+            err_out = g_zh_ui
+                ? (L"无法连接更新服务器：" + host)
+                : (L"Failed to connect to update host: " + host);
+            break;
+        }
+        HINTERNET hRequest = WinHttpOpenRequest(
+            hConnect, L"GET", path.c_str(), nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect);
+            err_out = TrW(L"无法创建 HTTPS 请求。", L"Failed to create HTTPS request.");
+            break;
+        }
+        DWORD redir_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redir_policy, sizeof(redir_policy));
 
-    const wchar_t* headers = L"Accept: application/vnd.github+json\r\n";
-    BOOL sent = WinHttpSendRequest(hRequest, headers, (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    if (sent) sent = WinHttpReceiveResponse(hRequest, nullptr);
+        BOOL sent = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+        if (sent) sent = WinHttpReceiveResponse(hRequest, nullptr);
+        const DWORD net_err = sent ? ERROR_SUCCESS : GetLastError();
 
-    DWORD status_code = 0;
-    DWORD status_size = sizeof(status_code);
-    if (sent) {
-        WinHttpQueryHeaders(
-            hRequest,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &status_code,
-            &status_size,
-            WINHTTP_NO_HEADER_INDEX);
-    }
+        DWORD status_code = 0;
+        DWORD status_sz = sizeof(status_code);
+        if (sent) {
+            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_sz, WINHTTP_NO_HEADER_INDEX);
+        }
 
-    std::string body;
-    constexpr size_t kMaxBody = 1024 * 1024;
-    if (sent && status_code == 200) {
-        for (;;) {
-            DWORD avail = 0;
-            if (!WinHttpQueryDataAvailable(hRequest, &avail) || avail == 0) break;
-            if (body.size() >= kMaxBody) break;
-            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(avail, kMaxBody - body.size()));
-            const size_t offset = body.size();
-            body.resize(offset + chunk);
-            DWORD read = 0;
-            if (!WinHttpReadData(hRequest, body.data() + offset, chunk, &read) || read == 0) {
-                body.resize(offset);
+        if (!sent) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            err_out = g_zh_ui
+                ? (L"无法访问 GitHub Releases（WinHTTP " + std::to_wstring(net_err) + L"）。请检查网络连接。")
+                : (L"Could not reach GitHub Releases (WinHTTP " + std::to_wstring(net_err) + L"). Check your network.");
+            break;
+        }
+
+        if (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308) {
+            DWORD loc_bytes = 0;
+            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &loc_bytes, WINHTTP_NO_HEADER_INDEX);
+            std::wstring loc;
+            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && loc_bytes > 0 && loc_bytes < 16384) {
+                loc.resize(loc_bytes / sizeof(wchar_t));
+                if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, loc.data(), &loc_bytes, WINHTTP_NO_HEADER_INDEX)) {
+                    while (!loc.empty() && loc.back() == L'\0') loc.pop_back();
+                } else {
+                    loc.clear();
+                }
+            }
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            loc = TrimWide(loc);
+            if (loc.empty() || hop >= kMaxRedirectHops) {
+                err_out = TrW(L"更新下载重定向超限或缺少目标地址。", L"Too many update redirects or missing Location header.");
                 break;
             }
-            body.resize(offset + read);
+            if (!loc.empty() && loc.front() == L'/') {
+                cur_url = L"https://" + host + loc;
+            } else {
+                cur_url = loc;
+            }
+            continue;
         }
-    }
 
-    const DWORD net_err = sent ? ERROR_SUCCESS : GetLastError();
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
+        if (status_code != 200) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            err_out = g_zh_ui
+                ? (L"GitHub Releases 返回 HTTP " + std::to_wstring(status_code) + L"。")
+                : (L"GitHub Releases returned HTTP " + std::to_wstring(status_code) + L".");
+            break;
+        }
+
+        uint64_t content_len = 0;
+        {
+            wchar_t cl_buf[64]{};
+            DWORD cl_sz = sizeof(cl_buf);
+            if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX, cl_buf, &cl_sz, WINHTTP_NO_HEADER_INDEX)) {
+                try { content_len = std::stoull(std::wstring(cl_buf)); } catch (...) { content_len = 0; }
+            }
+            if (content_len > max_bytes) {
+                WinHttpCloseHandle(hRequest);
+                WinHttpCloseHandle(hConnect);
+                err_out = TrW(L"更新包体积超出安全上限，已中止。", L"Update payload exceeds safety size limit; aborted.");
+                break;
+            }
+            if (content_len > 0) out_bytes.reserve(static_cast<size_t>(std::min<uint64_t>(content_len, max_bytes)));
+        }
+
+        bool read_ok = true;
+        std::array<uint8_t, 65536> buf{};
+        for (;;) {
+            if (cancel_flag && cancel_flag->load()) {
+                err_out = TrW(L"用户已取消更新下载。", L"Update download cancelled by user.");
+                read_ok = false;
+                break;
+            }
+            DWORD avail = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &avail)) {
+                err_out = TrW(L"下载过程中网络连接中断。", L"Network interrupted during download.");
+                read_ok = false;
+                break;
+            }
+            if (avail == 0) break;
+            const DWORD want = static_cast<DWORD>(std::min<size_t>(avail, buf.size()));
+            DWORD got = 0;
+            if (!WinHttpReadData(hRequest, buf.data(), want, &got)) {
+                err_out = TrW(L"读取下载数据时出错。", L"Error reading download stream.");
+                read_ok = false;
+                break;
+            }
+            if (got == 0) break;
+            if (out_bytes.size() + got > max_bytes) {
+                err_out = TrW(L"下载体积超出安全上限，已中止。", L"Download exceeded maximum allowed size; aborted.");
+                read_ok = false;
+                break;
+            }
+            out_bytes.insert(out_bytes.end(), buf.data(), buf.data() + got);
+            if (progress_cb) progress_cb(out_bytes.size(), content_len);
+        }
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        ok = read_ok;
+        break;
+    }
     WinHttpCloseHandle(hSession);
+    return ok;
+}
 
-    if (!sent) {
-        res.error = g_zh_ui
-            ? (L"无法访问 GitHub Releases（WinHTTP " + std::to_wstring(net_err) + L"）。请检查网络连接。")
-            : (L"Could not reach GitHub Releases (WinHTTP " + std::to_wstring(net_err) + L"). Check your network connection.");
-        return res;
-    }
-    if (status_code != 200) {
-        res.error = g_zh_ui
-            ? (L"GitHub API 返回状态码 HTTP " + std::to_wstring(status_code) + L"。")
-            : (L"GitHub API returned HTTP " + std::to_wstring(status_code) + L".");
-        return res;
-    }
+struct ManifestFileSpec {
+    std::string path;
+    uint64_t bytes = 0;
+    std::string sha256;
+};
 
+struct UpdateCheckResult {
+    bool ok = false;
+    bool from_manifest = false;
+    bool update_available = false;
+    bool requires_manual_upgrade = false;
+    bool is_auto_check = false;
+    int min_updater_protocol = 1;
+    std::wstring current_version;
+    std::wstring latest_version;
+    std::string latest_version_utf8;
+    std::string commit;
+    std::wstring release_url = kGithubFallbackUrl;
+    std::wstring asset_name;
+    std::string asset_root;
+    uint64_t asset_bytes = 0;
+    uint64_t unpacked_bytes = 0;
+    std::string asset_sha256;
+    std::wstring asset_digest;
+    std::wstring asset_url;
+    std::wstring published_at;
+    std::vector<ManifestFileSpec> files;
+    std::wstring error;
+};
+
+bool ParseJsonUint64(const ledger_json::Value& v, uint64_t& out)
+{
+    if (v.type != ledger_json::Value::Type::Number || v.text.empty()) return false;
+    for (char c : v.text) if (c < '0' || c > '9') return false;
+    try {
+        out = std::stoull(v.text);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+UpdateCheckResult ParseUpdateManifestJson(const std::string& body, const std::string& current_version)
+{
+    UpdateCheckResult res;
+    res.current_version = Utf8ToWide(current_version.empty() ? "dev" : current_version);
     try {
         const auto root = ledger_json::Reader(body).parse();
-        if (root.type != ledger_json::Value::Type::Object) throw std::runtime_error("not a JSON object");
-        std::string latest;
-        if (auto it = root.fields.find("tag_name"); it != root.fields.end() && it->second.type == ledger_json::Value::Type::String)
-            latest = TrimAscii(it->second.text);
+        if (root.type != ledger_json::Value::Type::Object) throw std::runtime_error("manifest root is not an object");
+        uint64_t schema_v = 0;
+        if (!ParseJsonUint64(root.at("schema_version"), schema_v) || schema_v != 1)
+            throw std::runtime_error("unsupported manifest schema_version");
+        if (root.at("repo").string() != "Bud-Open/wwmi-dx12-rt")
+            throw std::runtime_error("manifest repo mismatch");
+        uint64_t min_proto = 1;
+        if (auto it = root.fields.find("min_updater_protocol"); it != root.fields.end()) {
+            if (!ParseJsonUint64(it->second, min_proto) || min_proto < 1)
+                throw std::runtime_error("invalid min_updater_protocol");
+        }
+        res.min_updater_protocol = static_cast<int>(std::min<uint64_t>(min_proto, 999999));
+        res.requires_manual_upgrade = (min_proto > kUpdaterProtocolVersion);
+
+        const std::string latest = TrimAscii(root.at("version").string());
+        if (!ParseSemVer(latest).has_value()) throw std::runtime_error("invalid manifest SemVer version");
+        res.latest_version_utf8 = latest;
         res.latest_version = Utf8ToWide(latest);
-        if (auto it = root.fields.find("html_url"); it != root.fields.end() && it->second.type == ledger_json::Value::Type::String) {
-            const std::wstring candidate = Utf8ToWide(it->second.text);
-            if (IsAllowedGithubReleaseUrl(candidate)) res.release_url = candidate;
+
+        if (auto it = root.fields.find("commit"); it != root.fields.end() && it->second.type == ledger_json::Value::Type::String) {
+            const std::string c = TrimAscii(it->second.text);
+            if (!c.empty() && (c.size() < 7 || c.size() > 40 || !IsHex(c, c.size())))
+                throw std::runtime_error("invalid manifest commit");
+            res.commit = c;
         }
         if (auto it = root.fields.find("published_at"); it != root.fields.end() && it->second.type == ledger_json::Value::Type::String)
             res.published_at = Utf8ToWide(it->second.text);
-        if (auto it = root.fields.find("assets"); it != root.fields.end() && it->second.type == ledger_json::Value::Type::Array) {
-            const ledger_json::Value* chosen = nullptr;
-            for (const char* suffix : { "-win64.zip", ".zip" }) {
-                const size_t slen = strlen(suffix);
-                for (const auto& item : it->second.elements) {
-                    if (item.type != ledger_json::Value::Type::Object) continue;
-                    auto nit = item.fields.find("name");
-                    if (nit == item.fields.end() || nit->second.type != ledger_json::Value::Type::String) continue;
-                    const std::string low = LowerAscii(nit->second.text);
-                    if (low.size() >= slen && low.compare(low.size() - slen, slen, suffix) == 0) {
-                        chosen = &item;
-                        break;
-                    }
-                }
-                if (chosen) break;
-            }
-            if (chosen) {
-                if (auto nit = chosen->fields.find("name"); nit != chosen->fields.end() && nit->second.type == ledger_json::Value::Type::String)
-                    res.asset_name = Utf8ToWide(nit->second.text);
-                if (auto dit = chosen->fields.find("digest"); dit != chosen->fields.end() && dit->second.type == ledger_json::Value::Type::String)
-                    res.asset_digest = Utf8ToWide(dit->second.text);
-            }
+        if (auto it = root.fields.find("release_url"); it != root.fields.end() && it->second.type == ledger_json::Value::Type::String) {
+            const std::wstring cand = Utf8ToWide(it->second.text);
+            if (IsAllowedGithubReleaseUrl(cand)) res.release_url = cand;
+        } else {
+            res.release_url = L"https://github.com/Bud-Open/wwmi-dx12-rt/releases/tag/" + res.latest_version;
         }
+
+        const auto& assets = root.at("assets");
+        if (assets.type != ledger_json::Value::Type::Object) throw std::runtime_error("invalid assets object");
+        const auto& win = assets.at("win-x64");
+        if (win.type != ledger_json::Value::Type::Object) throw std::runtime_error("missing win-x64 asset");
+
+        const std::string aname = TrimAscii(win.at("name").string());
+        if (aname != "WWMI-DX12-RT-win64.zip") throw std::runtime_error("unexpected win-x64 archive name");
+        if (win.at("format").string() != "zip") throw std::runtime_error("unexpected win-x64 archive format");
+        const std::string aroot = TrimAscii(win.at("root").string());
+        if (aroot.empty() || aroot.find('/') != std::string::npos || aroot.find('\\') != std::string::npos ||
+            aroot == "." || aroot == "..")
+            throw std::runtime_error("invalid asset root prefix");
+
+        uint64_t abytes = 0, ubytes = 0, fcount = 0;
+        if (!ParseJsonUint64(win.at("bytes"), abytes) || abytes == 0 || abytes > kMaxArchiveBytes)
+            throw std::runtime_error("asset bytes out of range");
+        if (!ParseJsonUint64(win.at("unpacked_bytes"), ubytes) || ubytes == 0 || ubytes > kMaxUnpackedBytes)
+            throw std::runtime_error("asset unpacked_bytes out of range");
+        if (!ParseJsonUint64(win.at("file_count"), fcount) || fcount == 0 || fcount > kMaxArchiveFiles)
+            throw std::runtime_error("asset file_count out of range");
+        const std::string asha = LowerAscii(TrimAscii(win.at("sha256").string()));
+        if (!IsHex(asha, 64)) throw std::runtime_error("invalid archive sha256");
+
+        const auto& files_arr = win.at("files");
+        if (files_arr.type != ledger_json::Value::Type::Array || files_arr.elements.size() != fcount)
+            throw std::runtime_error("files array length mismatch");
+
+        std::unordered_set<std::string> seen_low;
+        std::unordered_set<std::string> exact_paths;
+        uint64_t sum_bytes = 0;
+        res.files.reserve(files_arr.elements.size());
+        for (const auto& item : files_arr.elements) {
+            if (item.type != ledger_json::Value::Type::Object) throw std::runtime_error("invalid file item");
+            std::string rel;
+            std::string perr;
+            if (!mini_unzip::detail::ValidateAndStripPath(item.at("path").string(), "", false, rel, perr))
+                throw std::runtime_error("unsafe manifest path: " + perr);
+            const std::string low = LowerAscii(rel);
+            if (!seen_low.insert(low).second) throw std::runtime_error("duplicate manifest path: " + rel);
+            uint64_t fbytes = 0;
+            if (!ParseJsonUint64(item.at("bytes"), fbytes) || fbytes > kMaxArchiveBytes)
+                throw std::runtime_error("invalid file bytes: " + rel);
+            const std::string fsha = LowerAscii(TrimAscii(item.at("sha256").string()));
+            if (!IsHex(fsha, 64)) throw std::runtime_error("invalid file sha256: " + rel);
+            sum_bytes += fbytes;
+            exact_paths.insert(rel);
+            res.files.push_back(ManifestFileSpec{ std::move(rel), fbytes, std::move(fsha) });
+        }
+        if (sum_bytes != ubytes) throw std::runtime_error("manifest file bytes sum mismatch");
+
+        for (const char* req : {
+            "host/ReShade64-game-forward.dll",
+            "reshade-addons/wwmi_dx12.addon64",
+            "reshade-addons/zz_wwmi_rt_pack.addon64",
+            "reshade-addons/wwmi_dx12/dxc/dxcompiler.dll",
+            "reshade-addons/wwmi_dx12/dxc/dxil.dll",
+            "reshade-addons/wwmi_dx12/Bc7Half.cso",
+            "reshade-addons/wwmi_dx12/BufCopy.cso",
+            "reshade-addons/wwmi_dx12/IbVbHash.cso",
+        }) {
+            if (exact_paths.find(req) == exact_paths.end())
+                throw std::runtime_error(std::string("manifest missing required runtime file: ") + req);
+        }
+
+        res.asset_name = Utf8ToWide(aname);
+        res.asset_root = aroot;
+        res.asset_bytes = abytes;
+        res.unpacked_bytes = ubytes;
+        res.asset_sha256 = asha;
+        res.asset_digest = L"sha256:" + Utf8ToWide(asha);
+        res.asset_url = std::wstring(kGithubDownloadPrefix) + res.latest_version + L"/" + res.asset_name;
+        std::wstring h_chk, p_chk, e_chk;
+        if (!ValidateUpdateHopUrlW(res.asset_url, true, h_chk, p_chk, e_chk))
+            throw std::runtime_error("pinned asset url failed validation");
+
         const auto cmp = CompareSemVer(current_version, latest);
         res.update_available = (cmp.has_value() && *cmp < 0);
+        res.from_manifest = true;
         res.ok = true;
     } catch (const std::exception& e) {
         res.error = g_zh_ui
-            ? (L"解析 GitHub 更新信息失败：" + Utf8ToWide(e.what()))
-            : (L"Failed to parse GitHub release metadata: " + Utf8ToWide(e.what()));
+            ? (L"解析更新清单失败：" + Utf8ToWide(e.what()))
+            : (L"Failed to parse update manifest: " + Utf8ToWide(e.what()));
     }
     return res;
+}
+
+UpdateCheckResult CheckLatestReleaseWinHttp(const std::string& current_version, DWORD timeout_ms = 8000)
+{
+    std::vector<uint8_t> raw;
+    std::wstring err;
+    if (!WinHttpFetchVerified(kUpdateManifestUrl, kMaxManifestBytes, timeout_ms, raw, nullptr, nullptr, err)) {
+        UpdateCheckResult fail;
+        fail.current_version = Utf8ToWide(current_version.empty() ? "dev" : current_version);
+        fail.error = err;
+        return fail;
+    }
+    const std::string body(reinterpret_cast<const char*>(raw.data()), raw.size());
+    return ParseUpdateManifestJson(body, current_version);
+}
+
+bool VerifySlotMatchesManifestWin(const fs::path& slot_dir, const UpdateCheckResult& manifest)
+{
+    std::error_code ec;
+    if (manifest.files.empty() || !fs::is_directory(slot_dir, ec) || fs::is_symlink(slot_dir, ec)) return false;
+
+    std::unordered_map<std::string, const ManifestFileSpec*> expected;
+    expected.reserve(manifest.files.size());
+    for (const auto& spec : manifest.files) expected[spec.path] = &spec;
+
+    std::unordered_set<std::string> actual;
+    actual.reserve(manifest.files.size());
+    try {
+        for (const auto& entry : fs::recursive_directory_iterator(slot_dir, fs::directory_options::none, ec)) {
+            if (ec) return false;
+            if (entry.is_symlink(ec) || ec) return false;
+            if (entry.is_directory(ec)) continue;
+            if (!entry.is_regular_file(ec) || ec) return false;
+            const fs::path rel_p = fs::relative(entry.path(), slot_dir, ec);
+            if (ec) return false;
+            std::string rel = WideToUtf8(rel_p.wstring());
+            for (char& c : rel) if (c == '\\') c = '/';
+            if (expected.find(rel) == expected.end()) return false;
+            actual.insert(std::move(rel));
+        }
+        if (ec || actual.size() != expected.size()) return false;
+    } catch (...) {
+        return false;
+    }
+
+    for (const auto& spec : manifest.files) {
+        std::wstring rel_w = Utf8ToWide(spec.path);
+        for (wchar_t& c : rel_w) if (c == L'/') c = L'\\';
+        const fs::path p = slot_dir / rel_w;
+        try {
+            if (!RegularFileOrMissing(p)) return false;
+            if (fs::file_size(p, ec) != spec.bytes || ec) return false;
+            if (Sha256Hex(ReadFileChecked(p)) != spec.sha256) return false;
+        } catch (...) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fs::path PublishStagedSlotLockedWin(
+    const fs::path& base,
+    const std::string& slot_rel,
+    const fs::path& stage_dir,
+    const UpdateCheckResult& manifest)
+{
+    const fs::path final_slot = ResolveSlotDir(base, slot_rel);
+    const fs::path stage_parent = base / L"runtime\\staging";
+    std::error_code ec;
+    fs::create_directories(stage_parent, ec);
+    if (VerifySlotMatchesManifestWin(final_slot, manifest)) {
+        if (!stage_dir.empty() && fs::exists(stage_dir, ec)) {
+            const fs::path redundant = stage_parent / (L"redundant-" + stage_dir.filename().wstring());
+            MoveFileExW(stage_dir.c_str(), redundant.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+        }
+        return final_slot;
+    }
+    fs::create_directories(base / L"versions");
+    if (fs::exists(final_slot, ec) || fs::is_symlink(final_slot, ec)) {
+        const fs::path broken = stage_parent / (L"replaced-broken-" + final_slot.filename().wstring() + L"-" + Utf8ToWide(NewToken().substr(0, 6)));
+        MoveFileExW(final_slot.c_str(), broken.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+    }
+    if (!MoveFileExW(stage_dir.c_str(), final_slot.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH))
+        WinError("无法提交已校验的版本槽目录", final_slot);
+    return final_slot;
+}
+
+bool ExtractUpdateZipToStagingWin(
+    const std::vector<uint8_t>& zip_bytes,
+    const UpdateCheckResult& manifest,
+    const fs::path& base_root,
+    std::string& slot_rel_out,
+    fs::path& stage_dir_out,
+    std::wstring& err_out)
+{
+    try {
+        if (!manifest.ok || !manifest.from_manifest)
+            throw std::runtime_error(TrA("无效的更新清单。", "Invalid update manifest."));
+        if (zip_bytes.size() != manifest.asset_bytes)
+            throw std::runtime_error(TrA("下载的更新包长度与清单不符，已中止。", "Downloaded archive size does not match manifest."));
+        if (Sha256HexBytes(zip_bytes.data(), zip_bytes.size()) != manifest.asset_sha256)
+            throw std::runtime_error(TrA("下载的更新包 SHA-256 校验失败，已中止安装。", "Downloaded archive SHA-256 mismatch; aborted."));
+
+        const fs::path base = CanonicalPath(base_root);
+        slot_rel_out = SlotNameForRelease(manifest.latest_version_utf8, manifest.commit, manifest.asset_sha256);
+
+        std::unordered_map<std::string, ManifestFileSpec> expected;
+        expected.reserve(manifest.files.size());
+        for (const auto& f : manifest.files) expected[f.path] = f;
+
+        const fs::path stage_parent = base / L"runtime\\staging";
+        fs::create_directories(stage_parent);
+        const fs::path stage_dir = stage_parent / (L"slot-" + Utf8ToWide(NewToken().substr(0, 12)));
+        fs::create_directories(stage_dir);
+
+        std::unordered_set<std::string> extracted;
+        extracted.reserve(expected.size());
+
+        mini_unzip::Limits limits{};
+        limits.max_zip_bytes = kMaxArchiveBytes;
+        limits.max_unpacked_bytes = std::min<uint64_t>(kMaxUnpackedBytes, manifest.unpacked_bytes);
+        limits.max_single_file_bytes = kMaxArchiveBytes;
+        limits.max_entries = kMaxArchiveFiles * 2;
+
+        mini_unzip::EntryStats stats{};
+        std::string uz_err;
+        const bool uz_ok = mini_unzip::ExtractZipBuffer(
+            zip_bytes.data(), zip_bytes.size(), manifest.asset_root, limits,
+            [&](const std::string& rel, const std::vector<uint8_t>& content, std::string& cb_err) -> bool {
+                auto it = expected.find(rel);
+                if (it == expected.end()) {
+                    cb_err = "archive contains unlisted file: " + rel;
+                    return false;
+                }
+                if (content.size() != it->second.bytes) {
+                    cb_err = "file byte length mismatch: " + rel;
+                    return false;
+                }
+                if (Sha256HexBytes(content.data(), content.size()) != it->second.sha256) {
+                    cb_err = "file SHA-256 mismatch: " + rel;
+                    return false;
+                }
+                std::wstring rel_w = Utf8ToWide(rel);
+                for (wchar_t& c : rel_w) if (c == L'/') c = L'\\';
+                const fs::path dst = stage_dir / rel_w;
+                std::error_code ec;
+                fs::create_directories(dst.parent_path(), ec);
+                if (!InDirectory(CanonicalPath(dst.parent_path()), CanonicalPath(stage_dir))) {
+                    cb_err = "extracted path escapes staging directory: " + rel;
+                    return false;
+                }
+                WriteNewFileBytes(dst, content.data(), content.size());
+                extracted.insert(rel);
+                return true;
+            },
+            stats, uz_err);
+
+        if (!uz_ok || extracted.size() != expected.size()) {
+            const fs::path failed = stage_parent / (L"failed-" + stage_dir.filename().wstring());
+            MoveFileExW(stage_dir.c_str(), failed.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+            throw std::runtime_error(uz_ok ? "archive missing manifest-declared file(s)" : uz_err);
+        }
+
+        stage_dir_out = stage_dir;
+        return true;
+    } catch (const std::exception& e) {
+        err_out = Utf8ToWide(e.what());
+        return false;
+    }
+}
+
+std::string CurrentEffectiveVersionUtf8(const fs::path& base_root)
+{
+    try {
+        const auto led = ReadLedger(base_root);
+        if (led.active() && !led.installed_version.empty()) return led.installed_version;
+    } catch (...) {
+    }
+    return ReadPackageProvenance(base_root).version;
+}
+
+bool PerformVerifiedSelfUpdateWin(
+    const fs::path& base_root,
+    const UpdateCheckResult& manifest,
+    const std::vector<uint8_t>* preloaded_zip,
+    const std::function<void(int, uint64_t, uint64_t)>& stage_progress_cb,
+    const std::atomic<bool>* cancel_flag,
+    bool& exe_replaced_out,
+    std::wstring& msg_out,
+    std::atomic<bool>* critical_phase_flag = nullptr)
+{
+    exe_replaced_out = false;
+    struct CriticalGuard {
+        std::atomic<bool>* f = nullptr;
+        void enter() { if (f) f->store(true); }
+        ~CriticalGuard() { if (f) f->store(false); }
+    } crit{ critical_phase_flag };
+
+    if (!manifest.ok || !manifest.from_manifest) {
+        msg_out = !manifest.error.empty() ? manifest.error : TrW(L"更新清单无效。", L"Invalid update manifest.");
+        return false;
+    }
+    if (manifest.requires_manual_upgrade) {
+        msg_out = g_zh_ui
+            ? (L"新版本 " + manifest.latest_version + L" 需要新版安装器协议，请从 GitHub Releases 手动下载。")
+            : (L"Release " + manifest.latest_version + L" requires a newer updater protocol; please download from GitHub Releases.");
+        return false;
+    }
+    if (!manifest.update_available && preloaded_zip == nullptr) {
+        msg_out = TrW(L"当前已是最新版本，无需更新。", L"You are already on the latest release.");
+        return true;
+    }
+    if (IsGameRunning()) {
+        msg_out = TrW(L"检测到《鸣潮》正在运行，请先退出游戏后再一键升级。",
+            L"Wuthering Waves is currently running. Close the game before updating.");
+        return false;
+    }
+
+    std::vector<uint8_t> downloaded;
+    const std::vector<uint8_t>* zip_ptr = preloaded_zip;
+    if (!zip_ptr) {
+        if (stage_progress_cb) stage_progress_cb(0, 0, manifest.asset_bytes);
+        std::wstring dl_err;
+        const bool dl_ok = WinHttpFetchVerified(
+            manifest.asset_url, kMaxArchiveBytes, 30000, downloaded,
+            [&](uint64_t done, uint64_t total) {
+                if (stage_progress_cb) stage_progress_cb(0, done, total ? total : manifest.asset_bytes);
+            },
+            cancel_flag, dl_err);
+        if (!dl_ok) {
+            msg_out = dl_err;
+            return false;
+        }
+        zip_ptr = &downloaded;
+    }
+    if (cancel_flag && cancel_flag->load()) {
+        msg_out = TrW(L"已取消下载更新。", L"Update download cancelled.");
+        return false;
+    }
+
+    if (stage_progress_cb) stage_progress_cb(1, manifest.asset_bytes, manifest.asset_bytes);
+    std::string slot_rel;
+    fs::path stage_dir;
+    std::wstring ex_err;
+    if (!ExtractUpdateZipToStagingWin(*zip_ptr, manifest, base_root, slot_rel, stage_dir, ex_err)) {
+        msg_out = ex_err;
+        return false;
+    }
+    if (cancel_flag && cancel_flag->load()) {
+        const fs::path aborted = CanonicalPath(base_root) / L"runtime\\staging" / (L"cancelled-" + stage_dir.filename().wstring());
+        MoveFileExW(stage_dir.c_str(), aborted.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+        msg_out = TrW(L"已取消更新。", L"Update cancelled.");
+        return false;
+    }
+
+    crit.enter();
+    if (stage_progress_cb) stage_progress_cb(2, manifest.asset_bytes, manifest.asset_bytes);
+    fs::path slot_dir;
+    LedgerInfo cur_led{};
+    try { cur_led = ReadLedger(base_root); } catch (...) {}
+    if (cur_led.state == LedgerInfo::State::Installed) {
+        if (!SwitchBaseRootSlot(base_root, slot_rel, manifest.latest_version_utf8, manifest.commit, false, msg_out, &stage_dir, &manifest, &slot_dir))
+            return false;
+    } else {
+        try {
+            const fs::path base = CanonicalPath(base_root);
+            const BaseRootMutexLocks blocks({ base });
+            slot_dir = PublishStagedSlotLockedWin(base, slot_rel, stage_dir, manifest);
+            SaveStagedReleaseWin(base, slot_rel, manifest.latest_version_utf8, manifest.commit);
+        } catch (const std::exception& e) {
+            msg_out = Utf8ToWide(e.what());
+            return false;
+        }
+        msg_out = g_zh_ui
+            ? (L"已下载并校验 " + manifest.latest_version + L" 至版本槽 " + Utf8ToWide(slot_rel) + L"；请点击「一键安装启用」自动挂载该新版本。")
+            : (L"Downloaded and verified " + manifest.latest_version + L" into " + Utf8ToWide(slot_rel) + L"; click Install & Enable to mount this new version.");
+    }
+
+    TrySelfReplaceSetupExe(slot_dir, base_root, exe_replaced_out);
+    if (exe_replaced_out) {
+        msg_out += TrW(
+            L"\r\n\r\n安装器本体已同步更新，下次打开将自动运行新版配置器。",
+            L"\r\n\r\nSetup executable was also updated in place; next launch will run the new version.");
+    }
+    return true;
 }
 
 std::wstring FormatUpdateDialogMessage(const UpdateCheckResult& r)
@@ -3209,14 +4308,28 @@ std::wstring FormatUpdateDialogMessage(const UpdateCheckResult& r)
        << TrW(L"最新发布：", L"Latest release: ") << (r.latest_version.empty() ? TrW(L"未知", L"Unknown") : r.latest_version.c_str()) << L"\r\n";
     if (!r.published_at.empty())
         ss << TrW(L"发布时间：", L"Published at: ") << r.published_at << L"\r\n";
-    if (!r.asset_name.empty())
-        ss << TrW(L"推荐压缩包：", L"Windows archive: ") << r.asset_name << L"\r\n";
-    if (!r.asset_digest.empty())
-        ss << TrW(L"校验摘要：", L"Digest: ") << r.asset_digest << L"\r\n";
+    if (!r.asset_name.empty()) {
+        ss << TrW(L"更新安装包：", L"Windows archive: ") << r.asset_name;
+        if (r.asset_bytes > 0) {
+            wchar_t sz_buf[32]{};
+            swprintf_s(sz_buf, L" (%.1f MB)", static_cast<double>(r.asset_bytes) / (1024.0 * 1024.0));
+            ss << sz_buf;
+        }
+        ss << L"\r\n";
+    }
+    if (!r.asset_digest.empty()) {
+        const std::wstring short_sha = r.asset_digest.size() > 31
+            ? (r.asset_digest.substr(0, 31) + L"...")
+            : r.asset_digest;
+        ss << TrW(L"校验摘要：", L"Digest: ") << short_sha << L"\r\n";
+    }
     ss << L"\r\n";
-    if (r.update_available) {
-        ss << TrW(L"发现新版本！建议下载后解压至新目录，运行新版安装器一键并排升级（支持随时回滚）。",
-                  L"A newer version is available! Download and extract into a new folder, then run Setup for side-by-side upgrade (with rollback).");
+    if (r.requires_manual_upgrade) {
+        ss << TrW(L"该版本升级了安装器协议，请打开 GitHub Releases 手动下载新版安装包。",
+                  L"This release requires a newer updater protocol; open GitHub Releases to download manually.");
+    } else if (r.update_available) {
+        ss << TrW(L"发现新版本！点击「一键下载并升级」将在应用内自动完成 SHA-256 校验、版本槽部署与切换（完整保留旧版一键回滚）。",
+                  L"A newer version is available! Click Download & Update for verified in-app slot upgrade (with one-click rollback).");
     } else if (!ParseSemVer(WideToUtf8(r.current_version)).has_value()) {
         ss << TrW(L"当前为开发/自定义版本，请对照上方最新正式版自行判断是否更新。",
                   L"Current build is a dev/custom version; compare against the latest release above.");
@@ -3246,7 +4359,8 @@ void CliPrint(const std::wstring& w)
 int RunCli(int argc, wchar_t** argv, const fs::path& base_root)
 {
     std::wstring action = L"doctor";
-    fs::path game_arg, wwmi_arg, migrate_from_arg, to_arg;
+    fs::path game_arg, wwmi_arg, migrate_from_arg, to_arg, manifest_arg, archive_arg;
+    std::wstring mode_arg = L"status";
     for (int i = 1; i < argc; ++i) {
         const std::wstring a = argv[i];
         if (a == L"--cli" && i + 1 < argc) action = argv[++i];
@@ -3254,17 +4368,61 @@ int RunCli(int argc, wchar_t** argv, const fs::path& base_root)
         else if (a == L"--wwmi" && i + 1 < argc) wwmi_arg = argv[++i];
         else if (a == L"--migrate-from" && i + 1 < argc) migrate_from_arg = argv[++i];
         else if (a == L"--to" && i + 1 < argc) to_arg = argv[++i];
+        else if (a == L"--manifest" && i + 1 < argc) manifest_arg = argv[++i];
+        else if (a == L"--archive" && i + 1 < argc) archive_arg = argv[++i];
+        else if (a == L"--mode" && i + 1 < argc) mode_arg = argv[++i];
         else if (a == L"--lang" && i + 1 < argc) g_zh_ui = DetectChineseUi(argv[++i]);
     }
     if (action == L"check-update") {
-        const auto pkg = ReadPackageProvenance(base_root);
-        const auto res = CheckLatestReleaseWinHttp(pkg.version);
+        const auto res = CheckLatestReleaseWinHttp(CurrentEffectiveVersionUtf8(base_root));
         if (!res.ok) {
             CliPrint(L"CLI_ERR: " + res.error);
             return 1;
         }
         CliPrint(FormatUpdateDialogMessage(res) + L"\r\n" + TrW(L"发布页面：", L"Release page: ") + res.release_url);
         return 0;
+    }
+    if (action == L"auto-check") {
+        if (mode_arg == L"on" || mode_arg == L"off") {
+            SaveAutoCheckPref(base_root, mode_arg == L"on");
+        }
+        const bool cur = LoadAutoCheckPref(base_root);
+        CliPrint(L"CLI_OK auto_check=" + std::wstring(cur ? L"on" : L"off"));
+        return 0;
+    }
+    if (action == L"update") {
+        const auto res = CheckLatestReleaseWinHttp(CurrentEffectiveVersionUtf8(base_root));
+        if (!res.ok) {
+            CliPrint(L"CLI_ERR: " + res.error);
+            return 1;
+        }
+        bool replaced = false;
+        std::wstring msg;
+        const bool ok = PerformVerifiedSelfUpdateWin(base_root, res, nullptr, nullptr, nullptr, replaced, msg);
+        CliPrint((ok ? L"CLI_OK: " : L"CLI_ERR: ") + msg);
+        return ok ? 0 : 1;
+    }
+    if (action == L"apply-local-update") {
+        try {
+            if (manifest_arg.empty() || archive_arg.empty())
+                throw std::runtime_error("missing --manifest or --archive");
+            const std::string mtext = ReadFileChecked(manifest_arg);
+            const auto res = ParseUpdateManifestJson(mtext, CurrentEffectiveVersionUtf8(base_root));
+            if (!res.ok) {
+                CliPrint(L"CLI_ERR: " + res.error);
+                return 1;
+            }
+            const std::string zraw = ReadFileChecked(archive_arg);
+            const std::vector<uint8_t> zbytes(zraw.begin(), zraw.end());
+            bool replaced = false;
+            std::wstring msg;
+            const bool ok = PerformVerifiedSelfUpdateWin(base_root, res, &zbytes, nullptr, nullptr, replaced, msg);
+            CliPrint((ok ? L"CLI_OK: " : L"CLI_ERR: ") + msg);
+            return ok ? 0 : 1;
+        } catch (const std::exception& e) {
+            CliPrint(L"CLI_ERR: " + Utf8ToWide(e.what()));
+            return 1;
+        }
     }
     if (action == L"rollback") {
         std::wstring msg;
@@ -3312,6 +4470,7 @@ enum CtrlId : int {
     IDC_BTN_INSTALL = 107,
     IDC_BTN_UNINSTALL = 108,
     IDC_BTN_MORE = 114,
+    IDC_BTN_UPDATE_NOW = 115,
 };
 
 enum MenuId : int {
@@ -3321,9 +4480,24 @@ enum MenuId : int {
     IDM_OPEN_MODS = 204,
     IDM_OPEN_LOGS = 205,
     IDM_INIT_WWMI = 206,
+    IDM_TOGGLE_AUTO_CHECK = 207,
 };
 
-constexpr UINT WM_APP_UPDATE_RESULT = WM_APP + 1;
+constexpr UINT WM_APP_UPDATE_RESULT   = WM_APP + 1;
+constexpr UINT WM_APP_UPDATE_PROGRESS = WM_APP + 2;
+constexpr UINT WM_APP_UPDATE_DONE     = WM_APP + 3;
+
+struct UpdateProgressMsg {
+    int stage = 0; // 0=downloading, 1=verifying/extracting, 2=switching
+    uint64_t done_bytes = 0;
+    uint64_t total_bytes = 0;
+};
+
+struct UpdateDoneMsg {
+    bool ok = false;
+    bool exe_replaced = false;
+    std::wstring message;
+};
 
 namespace ui_theme {
 constexpr COLORREF kWindowBg     = RGB(17, 17, 20);   // #111114
@@ -3551,6 +4725,7 @@ struct GuiState {
     HWND     btn_install = nullptr;
     HWND     btn_uninstall = nullptr;
     HWND     btn_more = nullptr;
+    HWND     btn_update_now = nullptr;
     HWND     hover_btn = nullptr;
 
     std::wstring pkg_version;
@@ -3560,7 +4735,21 @@ struct GuiState {
     std::vector<UiHealthRow> health_rows;
     bool         can_rollback = false;
     bool         can_uninstall = false;
+    bool         auto_check_updates = true;
+    bool         no_auto_update_flag = false;
+    bool         preview_update_flag = false;
     bool         update_checking = false;
+    bool         show_update_bar = false;
+    bool         update_applying = false;
+    int          update_stage = 0;
+    int          update_pct = 0;
+    std::wstring update_bar_title;
+    std::wstring update_bar_sub;
+    std::optional<UpdateCheckResult> available_update;
+    std::shared_ptr<std::atomic<bool>> update_cancel;
+    std::shared_ptr<std::atomic<bool>> update_critical;
+    std::thread  update_worker;
+    bool         close_after_update = false;
     int          modal_depth = 0;
     std::unique_ptr<UpdateCheckResult> deferred_update_res;
     std::shared_ptr<std::atomic<HWND>> live_hwnd;
@@ -3663,13 +4852,14 @@ void DrawFlatButton(const DRAWITEMSTRUCT* dis, GuiState* st)
     const int bh = dis->rcItem.bottom - dis->rcItem.top;
     if (bw <= 0 || bh <= 0) return;
 
-    const bool is_primary = (dis->CtlID == IDC_BTN_INSTALL || dis->CtlID == IDOK);
+    const bool is_update_btn = (dis->CtlID == IDC_BTN_UPDATE_NOW);
+    const bool is_primary = (dis->CtlID == IDC_BTN_INSTALL || dis->CtlID == IDOK || (is_update_btn && !(st && st->update_applying)));
     const bool in_card = (dis->CtlID == IDC_BTN_BROWSE_GAME || dis->CtlID == IDC_BTN_BROWSE_WWMI);
     const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
     const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
     const bool hovered = (!disabled && st && st->hover_btn == dis->hwndItem);
 
-    COLORREF bg_under = in_card ? ui_theme::kCardBg : ui_theme::kWindowBg;
+    COLORREF bg_under = is_update_btn ? ui_theme::kGoldSoftBg : (in_card ? ui_theme::kCardBg : ui_theme::kWindowBg);
     COLORREF fill = ui_theme::kSecBg;
     COLORREF border = ui_theme::kSecBorder;
     COLORREF text_fg = ui_theme::kTextPrimary;
@@ -3753,14 +4943,30 @@ void RefreshGuiReport(HWND hwnd, GuiState* st)
 
     std::error_code ec;
     if (led_ok) {
+        if (led.active() && !led.installed_version.empty()) {
+            st->pkg_version = Utf8ToWide(led.installed_version);
+        }
         st->can_uninstall = (led.state == LedgerInfo::State::Installed || led.state == LedgerInfo::State::Installing);
-        if (led.state == LedgerInfo::State::Installed && !led.upgraded_from.empty()) {
+        if (led.state == LedgerInfo::State::Installed && led.has_previous_slot) {
+            try {
+                const fs::path prev_slot = ResolveSlotDir(st->base_root, led.previous_slot);
+                st->can_rollback = fs::is_regular_file(prev_slot / L"host\\ReShade64-game-forward.dll", ec);
+            } catch (...) {
+                st->can_rollback = false;
+            }
+        } else if (led.state == LedgerInfo::State::Installed && !led.upgraded_from.empty()) {
             const fs::path prev(Utf8ToWide(led.upgraded_from));
-            st->can_rollback = IsValidAbsoluteWinPath(prev.wstring()) &&
-                fs::is_regular_file(prev / L"host\\ReShade64-game-forward.dll", ec);
+            if (IsValidAbsoluteWinPath(prev.wstring())) {
+                LedgerInfo prev_led{};
+                try { prev_led = ReadLedger(prev); } catch (...) {}
+                st->can_rollback = fs::is_regular_file(ResolveFolderActiveHostDll(prev, prev_led), ec);
+            }
         } else if (led.state == LedgerInfo::State::RollingBack && !led.rollback_target.empty()) {
-            st->can_rollback = IsValidAbsoluteWinPath(led.rollback_target.wstring()) &&
-                fs::is_regular_file(led.rollback_target / L"host\\ReShade64-game-forward.dll", ec);
+            if (IsValidAbsoluteWinPath(led.rollback_target.wstring())) {
+                LedgerInfo prev_led{};
+                try { prev_led = ReadLedger(led.rollback_target); } catch (...) {}
+                st->can_rollback = fs::is_regular_file(ResolveFolderActiveHostDll(led.rollback_target, prev_led), ec);
+            }
         }
     }
 
@@ -3774,7 +4980,7 @@ void RefreshGuiReport(HWND hwnd, GuiState* st)
         st->status_tone = 3;
         st->status_pill_text = TrW(L"未定位游戏", L"Game Not Found");
         st->health_rows.push_back({
-            UiHealthRow::Kind::Err, L"\u2715",
+            UiHealthRow::Kind::Err, L"\u00D7",
             TrW(L"未找到 Client-Win64-Shipping.exe，请点击上方「浏览」选择《鸣潮》目录。",
                 L"Client-Win64-Shipping.exe not found. Click Browse above to select Wuthering Waves.")
         });
@@ -3818,12 +5024,17 @@ void RefreshGuiReport(HWND hwnd, GuiState* st)
                     L"Ready: game bootstrap configured. Launch Wuthering Waves in DX12 mode (no background process needed).")
             });
             if (st->can_rollback) {
-                const fs::path prev(Utf8ToWide(led.upgraded_from));
+                std::wstring prev_label;
+                if (led.has_previous_slot) {
+                    prev_label = led.previous_version.empty() ? TrW(L"上一版本", L"previous version") : Utf8ToWide(led.previous_version);
+                } else {
+                    prev_label = fs::path(Utf8ToWide(led.upgraded_from)).filename().wstring();
+                }
                 st->health_rows.push_back({
                     UiHealthRow::Kind::Info, L"\u2190",
                     g_zh_ui
-                        ? (L"升级前的旧版目录已保留（" + prev.filename().wstring() + L"），可在右下「更多操作」中一键回滚。")
-                        : (L"Previous folder preserved (" + prev.filename().wstring() + L"); roll back anytime via More menu.")
+                        ? (L"升级前的旧版已保留（" + prev_label + L"），可在右下「更多操作」中一键回滚。")
+                        : (L"Previous version preserved (" + prev_label + L"); roll back anytime via More menu.")
                 });
             }
         } else if (info.mount_state == MountState::RollingBack) {
@@ -3839,7 +5050,7 @@ void RefreshGuiReport(HWND hwnd, GuiState* st)
         } else if (info.mount_state == MountState::Conflict || info.mount_state == MountState::ActiveElsewhere) {
             st->status_tone = 3;
             st->status_pill_text = TrW(L"目录冲突", L"Conflict");
-            st->health_rows.push_back({ UiHealthRow::Kind::Err, L"\u2715", info.message });
+            st->health_rows.push_back({ UiHealthRow::Kind::Err, L"\u00D7", info.message });
         } else {
             st->health_rows.push_back({
                 UiHealthRow::Kind::Ok, L"\u2713",
@@ -3870,7 +5081,7 @@ void RefreshGuiReport(HWND hwnd, GuiState* st)
             });
         } else if (rfx > 1) {
             st->health_rows.push_back({
-                UiHealthRow::Kind::Err, L"\u2715",
+                UiHealthRow::Kind::Err, L"\u00D7",
                 g_zh_ui
                     ? (L"检测到 " + std::to_wstring(rfx) + L" 份重复的 RabbitFX.ini！请只保留 1 份以免着色器冲突。")
                     : (L"Detected " + std::to_wstring(rfx) + L" duplicate RabbitFX.ini copies! Keep only ONE.")
@@ -3905,11 +5116,52 @@ void RefreshGuiReport(HWND hwnd, GuiState* st)
 
     if (st->btn_install) {
         SetWindowTextW(st->btn_install, primary_label.c_str());
+        EnableWindow(st->btn_install, st->update_applying ? FALSE : TRUE);
         InvalidateRect(st->btn_install, nullptr, FALSE);
     }
     if (st->btn_uninstall) {
-        EnableWindow(st->btn_uninstall, st->can_uninstall ? TRUE : FALSE);
+        EnableWindow(st->btn_uninstall, (!st->update_applying && st->can_uninstall) ? TRUE : FALSE);
         InvalidateRect(st->btn_uninstall, nullptr, FALSE);
+    }
+    if (st->btn_more) {
+        EnableWindow(st->btn_more, st->update_applying ? FALSE : TRUE);
+        InvalidateRect(st->btn_more, nullptr, FALSE);
+    }
+    if (st->btn_browse_game) EnableWindow(st->btn_browse_game, st->update_applying ? FALSE : TRUE);
+    if (st->btn_browse_wwmi) EnableWindow(st->btn_browse_wwmi, st->update_applying ? FALSE : TRUE);
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void SyncUpdateBarLayout(HWND hwnd, GuiState* st)
+{
+    if (!hwnd || !st) return;
+    const auto s = [&](int v) { return st->sc(v); };
+    const int target_cw = s(720);
+    const int target_ch = s(st->show_update_bar ? 440 : 384);
+    RECT cr{};
+    GetClientRect(hwnd, &cr);
+    if ((cr.right - cr.left) != target_cw || (cr.bottom - cr.top) != target_ch) {
+        RECT wr{ 0, 0, target_cw, target_ch };
+        const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+        const DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+        AdjustWindowRectEx(&wr, style, FALSE, ex_style);
+        SetWindowPos(hwnd, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    const int fy = s(st->show_update_bar ? 384 : 328);
+    const int fh = s(38);
+    if (st->btn_install) MoveWindow(st->btn_install, s(20), fy, s(208), fh, TRUE);
+    if (st->btn_uninstall) MoveWindow(st->btn_uninstall, s(240), fy, s(88), fh, TRUE);
+    if (st->btn_more) MoveWindow(st->btn_more, target_cw - s(132), fy, s(112), fh, TRUE);
+    if (st->btn_update_now) {
+        if (st->show_update_bar) {
+            MoveWindow(st->btn_update_now, target_cw - s(142), s(331), s(112), s(30), TRUE);
+            SetWindowTextW(st->btn_update_now,
+                st->update_applying ? TrW(L"取消", L"Cancel") : TrW(L"一键升级", L"Update Now"));
+            ShowWindow(st->btn_update_now, SW_SHOW);
+            InvalidateRect(st->btn_update_now, nullptr, FALSE);
+        } else {
+            ShowWindow(st->btn_update_now, SW_HIDE);
+        }
     }
     InvalidateRect(hwnd, nullptr, FALSE);
 }
@@ -3958,7 +5210,7 @@ void PaintMainWindow(HWND hwnd, HDC hdc, GuiState* st)
     // Right subtle subtitle
     c.Text(st->font_small, ui_theme::kTextMuted,
         TrW(L"DX12 + 光追 Mod 引导", L"DX12 + RT Mod Loader"),
-        RECT{ cw - s(180), hdr_y + s(3), cw - s(20), hdr_y + s(23) }, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        RECT{ cw - s(220), hdr_y + s(3), cw - s(22), hdr_y + s(23) }, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
 
     // 2. Path Configuration Card
     c.RoundRectAA(s(20), s(58), cw - s(40), s(98), static_cast<float>(s(10)), ui_theme::kCardBg, ui_theme::kCardBorder, 1.0f);
@@ -3977,7 +5229,7 @@ void PaintMainWindow(HWND hwnd, HDC hdc, GuiState* st)
         TrW(L"环境检测（游戏目录仅写入 2 个引导文件，不改动游戏本体）", L"Environment Check (only 2 bootstrap files in Win64)"),
         RECT{ s(34), hc_y + s(8), cw - s(210), hc_y + s(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     c.Text(st->font_small, ui_theme::kGoldSoftFg, st->health_right_tag,
-        RECT{ cw - s(240), hc_y + s(8), cw - s(34), hc_y + s(28) }, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        RECT{ cw - s(260), hc_y + s(8), cw - s(36), hc_y + s(28) }, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
     c.HLine(s(32), cw - s(32), hc_y + s(34), ui_theme::kCardBorder);
 
     int ry = hc_y + s(44);
@@ -3997,6 +5249,25 @@ void PaintMainWindow(HWND hwnd, HDC hdc, GuiState* st)
         const int use_h = std::min(std::max(needed_h, s(20)), row_max_y - ry);
         c.Text(st->font_regular, ui_theme::kTextPrimary, row.text, RECT{ s(56), ry, cw - s(36), ry + use_h }, DT_LEFT | DT_WORDBREAK);
         ry += use_h + s(8);
+    }
+
+    // 4. Adaptive Seamless Update Strip (only shown when update available or in progress)
+    if (st->show_update_bar) {
+        const int ub_y = s(322), ub_h = s(48);
+        c.RoundRectAA(s(20), ub_y, cw - s(40), ub_h, static_cast<float>(s(10)), ui_theme::kGoldSoftBg, ui_theme::kGoldSoftBdr, 1.0f);
+        c.CircleAA(static_cast<float>(s(35)), static_cast<float>(ub_y + s(16)), static_cast<float>(s(4)), ui_theme::kGold);
+        const int text_r = cw - s(154);
+        c.Text(st->font_bold, ui_theme::kGoldSoftFg, st->update_bar_title,
+            RECT{ s(46), ub_y + s(6), text_r, ub_y + s(25) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (st->update_applying) {
+            const int bar_x = s(46), bar_y = ub_y + s(32), bar_w = std::max(s(80), text_r - s(56)), bar_h = s(6);
+            c.RoundRectAA(bar_x, bar_y, bar_w, bar_h, static_cast<float>(s(3)), ui_theme::kInputBg, ui_theme::kCardBorder, 0.0f);
+            const int fill_w = std::max(s(6), (bar_w * std::clamp(st->update_pct, 0, 100)) / 100);
+            c.RoundRectAA(bar_x, bar_y, fill_w, bar_h, static_cast<float>(s(3)), ui_theme::kGold, ui_theme::kGold, 0.0f);
+        } else {
+            c.Text(st->font_small, ui_theme::kTextMuted, st->update_bar_sub,
+                RECT{ s(46), ub_y + s(25), text_r, ub_y + s(43) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
     }
 
     BitBlt(hdc, 0, 0, cw, ch, c.dc, 0, 0, SRCCOPY);
@@ -4242,8 +5513,10 @@ void ShowMoreMenu(HWND hwnd, GuiState* st)
     AppendMenuW(menu, MF_STRING | (st->can_rollback ? MF_ENABLED : MF_GRAYED), IDM_ROLLBACK,
         TrW(L"回滚至升级前旧版", L"Roll Back to Previous Version"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | (st->update_checking ? MF_GRAYED : MF_ENABLED), IDM_CHECK_UPDATE,
+    AppendMenuW(menu, MF_STRING | ((st->update_checking || st->update_applying) ? MF_GRAYED : MF_ENABLED), IDM_CHECK_UPDATE,
         TrW(L"检查更新 (GitHub Releases)", L"Check for Updates (GitHub)"));
+    AppendMenuW(menu, MF_STRING | (st->auto_check_updates ? MF_CHECKED : MF_UNCHECKED), IDM_TOGGLE_AUTO_CHECK,
+        TrW(L"启动时自动检查更新", L"Auto-check updates on launch"));
     AppendMenuW(menu, MF_STRING, IDM_REFRESH, TrW(L"重新检测环境", L"Refresh Health Check"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_OPEN_MODS, TrW(L"打开 Mods 目录", L"Open Mods Folder"));
@@ -4302,15 +5575,41 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         st->btn_browse_wwmi = mk_btn(TrW(L"浏览", L"Browse"), cw - s(96), s(112), s(64), s(30), IDC_BTN_BROWSE_WWMI);
 
         const int fy = s(328), fh = s(38);
-        st->btn_install   = mk_btn(TrW(L"一键安装启用", L"Install & Enable"), s(20), fy, s(208), fh, IDC_BTN_INSTALL);
-        st->btn_uninstall = mk_btn(TrW(L"卸载", L"Uninstall"), s(240), fy, s(88), fh, IDC_BTN_UNINSTALL);
-        st->btn_more      = mk_btn(TrW(L"更多操作", L"More"), cw - s(132), fy, s(112), fh, IDC_BTN_MORE);
+        st->btn_install    = mk_btn(TrW(L"一键安装启用", L"Install & Enable"), s(20), fy, s(208), fh, IDC_BTN_INSTALL);
+        st->btn_uninstall  = mk_btn(TrW(L"卸载", L"Uninstall"), s(240), fy, s(88), fh, IDC_BTN_UNINSTALL);
+        st->btn_more       = mk_btn(TrW(L"更多操作", L"More"), cw - s(132), fy, s(112), fh, IDC_BTN_MORE);
+        st->btn_update_now = mk_btn(TrW(L"一键升级", L"Update Now"), cw - s(142), s(331), s(112), s(30), IDC_BTN_UPDATE_NOW);
+        ShowWindow(st->btn_update_now, SW_HIDE);
 
+        st->auto_check_updates = LoadAutoCheckPref(st->base_root);
         const fs::path g = AutoDiscoverGameWin64(st->base_root);
         const fs::path w = AutoDiscoverWwmiDir(st->base_root, g);
         if (!g.empty()) SetWindowTextW(st->edit_game, g.c_str());
         if (!w.empty()) SetWindowTextW(st->edit_wwmi, w.c_str());
         RefreshGuiReport(hwnd, st);
+
+        if (st->preview_update_flag) {
+            st->show_update_bar = true;
+            st->update_bar_title = g_zh_ui
+                ? (L"发现新版本 " + st->pkg_version + L" \u2192 v1.0.6（17.7 MB）")
+                : (L"Update available: " + st->pkg_version + L" -> v1.0.6 (17.7 MB)");
+            st->update_bar_sub = TrW(
+                L"原地无感升级，自动 SHA-256 校验并完整保留一键回滚",
+                L"Verified in-app slot upgrade with automatic one-click rollback");
+            SyncUpdateBarLayout(hwnd, st);
+        } else if (st->auto_check_updates && !st->no_auto_update_flag) {
+            st->update_checking = true;
+            const std::string cur_ver = CurrentEffectiveVersionUtf8(st->base_root);
+            auto live = st->live_hwnd;
+            std::thread([cur_ver, live]() {
+                auto* res = new UpdateCheckResult(CheckLatestReleaseWinHttp(cur_ver, 5000));
+                res->is_auto_check = true;
+                const HWND target = live ? live->load() : nullptr;
+                if (!target || !PostMessageW(target, WM_APP_UPDATE_RESULT, 0, reinterpret_cast<LPARAM>(res))) {
+                    delete res;
+                }
+            }).detach();
+        }
         return 0;
     }
     case WM_ERASEBKGND:
@@ -4477,18 +5776,124 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             std::error_code ec;
             fs::create_directories(logs, ec);
             ShellExecuteW(hwnd, L"open", logs.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        } else if (id == IDM_CHECK_UPDATE && !st->update_checking) {
+        } else if (id == IDM_TOGGLE_AUTO_CHECK) {
+            st->auto_check_updates = !st->auto_check_updates;
+            try { SaveAutoCheckPref(st->base_root, st->auto_check_updates); } catch (...) {}
+        } else if (id == IDC_BTN_UPDATE_NOW) {
+            if (st->update_applying) {
+                if (st->update_critical && st->update_critical->load()) return 0;
+                if (st->update_cancel) st->update_cancel->store(true);
+                st->update_bar_title = TrW(L"正在取消更新...", L"Cancelling update...");
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (!st->available_update || !st->available_update->ok) return 0;
+            if (st->available_update->requires_manual_upgrade) {
+                if (IsAllowedGithubReleaseUrl(st->available_update->release_url))
+                    ShellExecuteW(hwnd, L"open", st->available_update->release_url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                return 0;
+            }
+            if (st->update_worker.joinable()) st->update_worker.join();
+            st->update_applying = true;
+            st->close_after_update = false;
+            st->update_pct = 5;
+            st->update_stage = 0;
+            st->update_cancel = std::make_shared<std::atomic<bool>>(false);
+            st->update_critical = std::make_shared<std::atomic<bool>>(false);
+            st->update_bar_title = g_zh_ui
+                ? (L"正在下载 " + st->available_update->latest_version + L"...")
+                : (L"Downloading " + st->available_update->latest_version + L"...");
+            SyncUpdateBarLayout(hwnd, st);
+            RefreshGuiReport(hwnd, st);
+
+            const fs::path base = st->base_root;
+            const UpdateCheckResult manifest_copy = *st->available_update;
+            auto live = st->live_hwnd;
+            auto cancel = st->update_cancel;
+            auto critical = st->update_critical;
+            st->update_worker = std::thread([base, manifest_copy, live, cancel, critical]() {
+                bool replaced = false;
+                std::wstring msg;
+                const bool ok = PerformVerifiedSelfUpdateWin(
+                    base, manifest_copy, nullptr,
+                    [live](int stage, uint64_t done, uint64_t total) {
+                        const HWND t = live ? live->load() : nullptr;
+                        if (!t) return;
+                        auto* p = new UpdateProgressMsg{ stage, done, total };
+                        if (!PostMessageW(t, WM_APP_UPDATE_PROGRESS, 0, reinterpret_cast<LPARAM>(p))) delete p;
+                    },
+                    cancel.get(), replaced, msg, critical.get());
+                const HWND t = live ? live->load() : nullptr;
+                auto* d = new UpdateDoneMsg{ ok, replaced, std::move(msg) };
+                if (!t || !PostMessageW(t, WM_APP_UPDATE_DONE, 0, reinterpret_cast<LPARAM>(d))) delete d;
+            });
+        } else if (id == IDM_CHECK_UPDATE && !st->update_checking && !st->update_applying) {
             st->update_checking = true;
-            const std::string cur_ver = ReadPackageProvenance(st->base_root).version;
+            const std::string cur_ver = CurrentEffectiveVersionUtf8(st->base_root);
             auto live = st->live_hwnd;
             std::thread([cur_ver, live]() {
-                auto* res = new UpdateCheckResult(CheckLatestReleaseWinHttp(cur_ver));
+                auto* res = new UpdateCheckResult(CheckLatestReleaseWinHttp(cur_ver, 8000));
+                res->is_auto_check = false;
                 const HWND target = live ? live->load() : nullptr;
                 if (!target || !PostMessageW(target, WM_APP_UPDATE_RESULT, 0, reinterpret_cast<LPARAM>(res))) {
                     delete res;
                 }
             }).detach();
         }
+        return 0;
+    }
+    case WM_APP_UPDATE_PROGRESS: {
+        std::unique_ptr<UpdateProgressMsg> p(reinterpret_cast<UpdateProgressMsg*>(lp));
+        if (!st || !p || !st->update_applying) return 0;
+        st->update_stage = p->stage;
+        if (p->stage == 0) {
+            const int dl_pct = (p->total_bytes > 0) ? static_cast<int>((p->done_bytes * 70ull) / p->total_bytes) : 10;
+            st->update_pct = std::clamp(dl_pct, 5, 70);
+            wchar_t mb_buf[64]{};
+            swprintf_s(mb_buf, L" (%.1f / %.1f MB)",
+                static_cast<double>(p->done_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(p->total_bytes) / (1024.0 * 1024.0));
+            const std::wstring ver = st->available_update ? st->available_update->latest_version : L"";
+            st->update_bar_title = (g_zh_ui ? (L"正在下载 " + ver) : (L"Downloading " + ver)) + mb_buf;
+        } else if (p->stage == 1) {
+            st->update_pct = 82;
+            st->update_bar_title = TrW(L"正在进行 SHA-256 校验与安全解压...", L"Verifying SHA-256 & extracting slot...");
+        } else {
+            st->update_pct = 94;
+            st->update_bar_title = TrW(L"正在原子切换版本槽与 Win64 引导桥...", L"Switching version slot & Win64 bootstrap...");
+            if (st->btn_update_now) EnableWindow(st->btn_update_now, FALSE);
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_APP_UPDATE_DONE: {
+        std::unique_ptr<UpdateDoneMsg> d(reinterpret_cast<UpdateDoneMsg*>(lp));
+        if (!st || !d) return 0;
+        if (st->update_worker.joinable()) st->update_worker.join();
+        st->update_applying = false;
+        st->update_cancel.reset();
+        st->update_critical.reset();
+        if (st->btn_update_now) EnableWindow(st->btn_update_now, TRUE);
+        if (st->close_after_update) {
+            st->close_after_update = false;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (d->ok) {
+            st->show_update_bar = false;
+            st->available_update.reset();
+        } else if (st->available_update) {
+            wchar_t sz_buf[32]{};
+            swprintf_s(sz_buf, L"%.1f MB", static_cast<double>(st->available_update->asset_bytes) / (1024.0 * 1024.0));
+            st->update_bar_title = g_zh_ui
+                ? (L"发现新版本 " + st->available_update->current_version + L" \u2192 " + st->available_update->latest_version + L"（" + sz_buf + L"）")
+                : (L"Update available: " + st->available_update->current_version + L" -> " + st->available_update->latest_version + L" (" + sz_buf + L")");
+        }
+        SyncUpdateBarLayout(hwnd, st);
+        RefreshGuiReport(hwnd, st);
+        ShowObsidianDialog(hwnd, st, TrW(L"应用内升级", L"In-App Update"),
+            d->ok ? TrW(L"升级完成", L"Update Complete") : TrW(L"升级未完成", L"Update Failed"),
+            d->ok ? 2 : 3, d->message, TrW(L"确定", L"OK"));
         return 0;
     }
     case WM_APP_UPDATE_RESULT: {
@@ -4499,49 +5904,87 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             st->deferred_update_res = std::move(res);
             return 0;
         }
-        if (!res->ok) {
-            ShowObsidianDialog(hwnd, st, TrW(L"检查更新", L"Check for Updates"),
-                TrW(L"查询失败", L"Check Failed"), 3, res->error, TrW(L"确定", L"OK"));
+        if (res->is_auto_check) {
+            // Silent auto-check on launch: never annoy offline users; surface Obsidian Gold strip only when an update exists.
+            if (st && res->ok && res->update_available) {
+                st->available_update = *res;
+                st->show_update_bar = true;
+                wchar_t sz_buf[32]{};
+                swprintf_s(sz_buf, L"%.1f MB", static_cast<double>(res->asset_bytes) / (1024.0 * 1024.0));
+                st->update_bar_title = g_zh_ui
+                    ? (L"发现新版本 " + res->current_version + L" \u2192 " + res->latest_version + L"（" + sz_buf + L"）")
+                    : (L"Update available: " + res->current_version + L" -> " + res->latest_version + L" (" + sz_buf + L")");
+                st->update_bar_sub = res->requires_manual_upgrade
+                    ? TrW(L"该版本更新了安装器协议，请点击右侧打开下载页", L"Newer updater protocol required; click to open GitHub Releases")
+                    : TrW(L"原地无感升级，自动 SHA-256 校验并完整保留一键回滚", L"Verified in-app slot upgrade with automatic one-click rollback");
+                SyncUpdateBarLayout(hwnd, st);
+            }
             return 0;
+        }
+        if (!res->ok) {
+            const bool open_fb = ShowObsidianDialog(hwnd, st, TrW(L"检查更新", L"Check for Updates"),
+                TrW(L"查询失败", L"Check Failed"), 3, res->error,
+                TrW(L"打开 GitHub", L"Open GitHub"), TrW(L"关闭", L"Close"));
+            if (open_fb) ShellExecuteW(hwnd, L"open", kGithubFallbackUrl, nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
+        }
+        if (st && res->update_available) {
+            st->available_update = *res;
+            st->show_update_bar = true;
+            wchar_t sz_buf[32]{};
+            swprintf_s(sz_buf, L"%.1f MB", static_cast<double>(res->asset_bytes) / (1024.0 * 1024.0));
+            st->update_bar_title = g_zh_ui
+                ? (L"发现新版本 " + res->current_version + L" \u2192 " + res->latest_version + L"（" + sz_buf + L"）")
+                : (L"Update available: " + res->current_version + L" -> " + res->latest_version + L" (" + sz_buf + L")");
+            st->update_bar_sub = res->requires_manual_upgrade
+                ? TrW(L"该版本更新了安装器协议，请点击右侧打开下载页", L"Newer updater protocol required; click to open GitHub Releases")
+                : TrW(L"原地无感升级，自动 SHA-256 校验并完整保留一键回滚", L"Verified in-app slot upgrade with automatic one-click rollback");
+            SyncUpdateBarLayout(hwnd, st);
         }
         const std::wstring badge = res->update_available
             ? (g_zh_ui ? (L"发现新版本 · " + res->current_version + L" \u2192 " + res->latest_version)
-                       : (L"Update Available · " + res->current_version + L" \u2192 " + res->latest_version))
+                       : (L"Update Available · " + res->current_version + L" -> " + res->latest_version))
             : (g_zh_ui ? (L"已是最新版本 · " + res->current_version)
                        : (L"Up to Date · " + res->current_version));
-        std::wostringstream body;
-        body << TrW(L"当前版本：", L"Current version: ") << res->current_version << L"\r\n"
-             << TrW(L"最新发布：", L"Latest release: ") << res->latest_version << L"\r\n";
-        if (!res->published_at.empty())
-            body << TrW(L"发布时间：", L"Published: ") << res->published_at << L"\r\n";
-        if (!res->asset_name.empty())
-            body << TrW(L"推荐安装包：", L"Package: ") << res->asset_name << L"\r\n";
-        if (!res->asset_digest.empty()) {
-            const std::wstring short_sha = res->asset_digest.size() > 31
-                ? (res->asset_digest.substr(0, 31) + L"...")
-                : res->asset_digest;
-            body << TrW(L"校验摘要：", L"Digest: ") << short_sha << L"\r\n";
-        }
-        body << L"\r\n";
-        if (res->update_available) {
-            body << TrW(L"下载后解压至新目录并运行新版安装器，即可一键并排升级（自动保留旧版以便随时回滚）。",
-                        L"Download and extract into a new folder, then run Setup for side-by-side upgrade (with rollback).");
-        } else {
-            body << TrW(L"当前已是最新正式版本，无需更新。", L"You are already on the latest release.");
-        }
-        const bool open_url = ShowObsidianDialog(
+        const bool can_in_app = (res->update_available && res->from_manifest && !res->requires_manual_upgrade);
+        const bool accepted = ShowObsidianDialog(
             hwnd, st, TrW(L"检查更新", L"Check for Updates"),
-            badge, res->update_available ? 1 : 2, body.str(),
-            res->update_available ? TrW(L"打开下载页", L"Open Release") : TrW(L"查看发布页", L"Open Releases"),
-            TrW(L"暂不打开", L"Close"));
-        if (open_url && IsAllowedGithubReleaseUrl(res->release_url)) {
-            ShellExecuteW(hwnd, L"open", res->release_url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            badge, res->update_available ? 1 : 2, FormatUpdateDialogMessage(*res),
+            can_in_app ? TrW(L"一键下载并升级", L"Download & Update")
+                       : (res->update_available ? TrW(L"打开下载页", L"Open Release") : TrW(L"查看发布页", L"Open Releases")),
+            TrW(L"暂不更新", L"Close"));
+        if (accepted) {
+            if (can_in_app) {
+                SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDC_BTN_UPDATE_NOW, BN_CLICKED), 0);
+            } else if (IsAllowedGithubReleaseUrl(res->release_url)) {
+                ShellExecuteW(hwnd, L"open", res->release_url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
         }
         return 0;
     }
+    case WM_CLOSE:
+        if (st && st->update_applying) {
+            st->close_after_update = true;
+            if (st->update_critical && st->update_critical->load()) {
+                st->update_bar_title = TrW(
+                    L"正在完成最后一步原子切换，完成后自动关闭...",
+                    L"Finishing atomic slot switch before closing...");
+            } else {
+                if (st->update_cancel) st->update_cancel->store(true);
+                st->update_bar_title = TrW(
+                    L"正在安全取消下载并退出...",
+                    L"Cancelling download safely before exit...");
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        DestroyWindow(hwnd);
+        return 0;
     case WM_DESTROY:
         if (st) {
             if (st->live_hwnd) st->live_hwnd->store(nullptr);
+            if (st->update_cancel) st->update_cancel->store(true);
+            if (st->update_worker.joinable()) st->update_worker.join();
             if (st->font_title) DeleteObject(st->font_title);
             if (st->font_bold) DeleteObject(st->font_bold);
             if (st->font_regular) DeleteObject(st->font_regular);
@@ -4565,11 +6008,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
     const fs::path base_root = SelfBaseRoot();
 
     bool cli_mode = false;
+    bool no_auto_update = false;
+    bool preview_update = false;
     for (int i = 1; i < argc; ++i) {
         if (wcscmp(argv[i], L"--cli") == 0) {
             cli_mode = true;
         } else if (wcscmp(argv[i], L"--lang") == 0 && i + 1 < argc) {
             g_zh_ui = DetectChineseUi(argv[++i]);
+        } else if (wcscmp(argv[i], L"--no-auto-update") == 0) {
+            no_auto_update = true;
+        } else if (wcscmp(argv[i], L"--preview-update") == 0) {
+            preview_update = true;
         }
     }
     if (cli_mode) {
@@ -4589,6 +6038,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
 
     GuiState st{};
     st.base_root = base_root;
+    st.no_auto_update_flag = no_auto_update;
+    st.preview_update_flag = preview_update;
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);

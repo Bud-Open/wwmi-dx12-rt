@@ -155,6 +155,7 @@ private:
                 if (input_.substr(0, literal.size()) == literal) {
                     input_.remove_prefix(literal.size());
                     v.type = literal == "null" ? Value::Type::Null : Value::Type::Other;
+                    v.text = std::string(literal);
                     return v;
                 }
             }

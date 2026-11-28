@@ -504,7 +504,10 @@ void WwmiRotateSessionLogs(const std::filesystem::path& logs_dir, int max_logs)
     }
 }
 
-void WwmiBootstrapStandaloneConfig(const std::filesystem::path& base_root, const std::filesystem::path& ini_file)
+void WwmiBootstrapStandaloneConfig(
+    const std::filesystem::path& base_root,
+    const std::filesystem::path& slot_root,
+    const std::filesystem::path& ini_file)
 {
     const std::filesystem::path ini_dir = ini_file.parent_path();
     std::error_code             ec;
@@ -595,7 +598,10 @@ void WwmiBootstrapStandaloneConfig(const std::filesystem::path& base_root, const
         } else {
             const std::filesystem::path user_seed = std::filesystem::path(s_resolved_runtime_dir) / L"seed";
             std::filesystem::create_directories(user_seed, ec);
-            const std::filesystem::path pkg_seed = base_root / L"seed";
+            const std::filesystem::path slot_seed = !slot_root.empty() ? (slot_root / L"seed") : std::filesystem::path{};
+            const std::filesystem::path base_seed = base_root / L"seed";
+            const std::filesystem::path pkg_seed =
+                (!slot_seed.empty() && std::filesystem::is_directory(slot_seed, ec)) ? slot_seed : base_seed;
             if (std::filesystem::is_directory(pkg_seed, ec))
                 resolved_seeds = pkg_seed.wstring() + L";" + user_seed.wstring();
             else
@@ -747,10 +753,11 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE ww
     const auto get_mounted_base = wwmi_host_module ? reinterpret_cast<MountedBasePath>(
         GetProcAddress(wwmi_host_module, "WWMIGetMountedBasePath")) : nullptr;
     const wchar_t *mounted_base = get_mounted_base ? get_mounted_base() : nullptr;
-    const std::filesystem::path base_root = mounted_base ? std::filesystem::path(mounted_base) :
+    const std::filesystem::path slot_root =
         (_wcsicmp(addon_dir.filename().c_str(), L"reshade-addons") == 0 && addon_dir.has_parent_path())
             ? addon_dir.parent_path()
             : addon_dir;
+    const std::filesystem::path base_root = mounted_base ? std::filesystem::path(mounted_base) : slot_root;
     const std::filesystem::path exe_file = WwmiModuleFilePath(nullptr);
     const std::filesystem::path exe_dir = exe_file.parent_path();
     const std::filesystem::path resolved_ini = WwmiResolveIniFile(addon_dir, base_root, exe_dir);
@@ -775,7 +782,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE ww
     s_ini_base_dir = resolved_ini.parent_path();
 
     // Bootstrap standalone INI/default paths into process-local environment when launched directly without wrapper scripts.
-    WwmiBootstrapStandaloneConfig(base_root, resolved_ini);
+    WwmiBootstrapStandaloneConfig(base_root, slot_root, resolved_ini);
     s_mounted_runtime_dir = mounted_base ? base_root / L"runtime" : std::filesystem::path{};
     if (mounted_base) {
         std::error_code ec;

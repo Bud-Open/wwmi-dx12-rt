@@ -63,8 +63,11 @@ WINDOWS_GUIDE = """\
    - In-place refresh (for v1.0.2/v1.0.3 overwrite users): extracting over the same folder
      (keeping `runtime\\install-ledger.json`, `ReShade.ini`, `wwmi_dx12.ini`) and running Setup
      once refreshes `Win64\\dxgi.dll` and preserves your settings (does not keep old binaries for rollback).
-   - Check for Updates: click [Check Updates] (opt-in manual check; zero automatic network
-     requests) to check GitHub Releases and verify archives with `SHA256SUMS.txt`.
+   - Seamless In-App Updates: `WWMI-DX12-RT-Setup.exe` checks `update-manifest.json` on launch
+     (can be toggled off under [More -> Auto-check updates on launch]; the in-game `dxgi.dll`
+     always stays 100% offline). When a newer release is available, click [Update Now] to download,
+     verify SHA-256 checksums, deploy into an isolated `versions\\<ver>\\` slot, and switch cleanly
+     while keeping your settings, caches, Mods, third-party add-ons, and one-click rollback intact.
    - Click [Uninstall / Restore] at any time to cleanly remove the 2 bootstrap files from Win64.
 5. Coexisting with Existing ReShade / Third-Party Add-ons (e.g. RenoDX):
    - WWMI-DX12-RT requires its paired `dxgi.dll` (do NOT replace it with stock ReShade `dxgi.dll`).
@@ -96,7 +99,7 @@ WINDOWS_GUIDE = """\
    - 推荐并排升级：将新版压缩包解压到**新的独立目录**（如 D:\\Tools\\WWMI-DX12-RT-v1.0.4），双击运行新版 `WWMI-DX12-RT-Setup.exe` 点击【并排升级】。工具会核验旧目录（含 v1.0.2/v1.0.3 老版）账本、配对宿主 DLL 与 Win64 双文件 SHA-256，自动迁移你的 `ReShade.ini` 自定义项、`wwmi_dx12.ini` 用户参数与生效 `wwmi_dir`、兼容缓存与第三方 `*.addon64`，默认沿用已有 `WWMI` Mod 目录并完整保留旧目录。
    - 一键回滚（支持回滚至 v1.0.2 / v1.0.3）：在新版 `WWMI-DX12-RT-Setup.exe` 中点击【回滚旧版】（或命令行执行 `WWMI-DX12-RT-Setup.exe --cli rollback`），即可自动恢复旧目录的引导桥与账本。
    - 原地覆盖刷新：v1.0.2 / v1.0.3 老用户也可直接解压覆盖原目录（保留 `runtime\\install-ledger.json` 与 `ReShade.ini`/`wwmi_dx12.ini`），覆盖后运行一次新版 `WWMI-DX12-RT-Setup.exe` 点【原地刷新】即可同步更新 `Win64\\dxgi.dll` 并写入新版本号（覆盖方式不保留旧载荷回滚）。
-   - 手动检查更新：点击【检查更新】（仅手动触发，启动与安装零联网）可查询 GitHub Releases 最新版本，下载后可用 `SHA256SUMS.txt` 核验完整性。
+   - 应用内无感升级：打开 `WWMI-DX12-RT-Setup.exe` 时自动异步检查 `update-manifest.json`（可在【更多操作】关闭，游戏进程内 `dxgi.dll` 始终保持 100% 离线零联网）。发现新版本时点击【一键升级】，即可自动完成下载、SHA-256 校验、独立 `versions\\<版本>\\` 槽位部署与无缝切换，完整保留外部配置、缓存、Mod 与一键回滚能力。
    - 随时点击【一键卸载还原】，即可安全清除 Win64 中的 2 个引导文件恢复纯净原厂目录。
 5. 与现有 ReShade / 第三方插件（如 RenoDX）共存：
    - WWMI-DX12-RT 必须使用本包配对的 `dxgi.dll`（切勿用官方原版 ReShade `dxgi.dll` 替换）。
@@ -137,7 +140,8 @@ LINUX_GUIDE = """\
 - Side-by-side upgrade (explicit --base-root):     ./wwmi-dx12-setup install --base-root ~/Tools/WWMI-DX12-RT-v1.0.4
 - Roll back to preserved previous folder:          ./wwmi-dx12-setup rollback --base-root ~/Tools/WWMI-DX12-RT-v1.0.4
 - Safe uninstall & restore:                        ./wwmi-dx12-setup uninstall
-- Opt-in update check (GitHub Releases):           ./wwmi-dx12-setup check-update
+- In-app verified update (keeps LD_PRELOAD fixed): ./wwmi-dx12-setup update
+- Check for updates (GitHub Releases manifest):    ./wwmi-dx12-setup check-update
 
 [Upgrading (incl. v1.0.2 / v1.0.3) & Rollback]
 - Default In-Place Refresh: Linux setup defaults `--base-root` to the XDG/Flatpak runtime
@@ -179,7 +183,8 @@ LINUX_GUIDE = """\
 - 指定目录并排升级（可回滚）：  `./wwmi-dx12-setup install --base-root ~/Tools/WWMI-DX12-RT-v1.0.4`
 - 一键回滚至旧版目录：          `./wwmi-dx12-setup rollback --base-root ~/Tools/WWMI-DX12-RT-v1.0.4`
 - 一键安全卸载还原：            `./wwmi-dx12-setup uninstall`
-- 手动检查新版本（零自动联网）：`./wwmi-dx12-setup check-update`
+- 一键在线升级（路径不变）：    `./wwmi-dx12-setup update`
+- 检查新版本（直连清单零限流）：`./wwmi-dx12-setup check-update`
 
 【升级（含 v1.0.2 / v1.0.3 老用户）与一键回滚】
 - 默认原地刷新：Linux 版默认挂载根固定在 XDG/Flatpak 目录（与解压目录无关），直接运行 `./wwmi-dx12-setup install` 会在原挂载根原地刷新载荷，自动保留 `ReShade.ini`、`wwmi_dx12.ini`、缓存与 `WWMI` 目录（v1.0.2 / v1.0.3 老用户零配置直接可用）。
@@ -266,6 +271,71 @@ def build_provenance(manifest: dict | None, version: str | None = None) -> dict:
 def write_sha256sums(archives: Sequence[Path], out_path: Path) -> Path:
     lines = [f"{core.sha256_file(archive)}  {archive.name}\n" for archive in archives]
     out_path.write_text("".join(lines), encoding="utf-8", newline="\n")
+    return out_path
+
+
+def build_asset_manifest_entry(
+    src_dir: Path,
+    archive_path: Path,
+    fmt: str,
+    executable_relpaths: set[str] | None = None,
+) -> dict:
+    exec_set = executable_relpaths or set()
+    files: list[dict] = []
+    unpacked_bytes = 0
+    for p in sorted(src_dir.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(src_dir).as_posix()
+        size = p.stat().st_size
+        unpacked_bytes += size
+        entry: dict = {
+            "path": rel,
+            "bytes": size,
+            "sha256": core.sha256_file(p),
+        }
+        if rel in exec_set:
+            entry["executable"] = True
+        files.append(entry)
+    return {
+        "name": archive_path.name,
+        "format": fmt,
+        "root": src_dir.name,
+        "bytes": archive_path.stat().st_size,
+        "sha256": core.sha256_file(archive_path),
+        "unpacked_bytes": unpacked_bytes,
+        "file_count": len(files),
+        "files": files,
+    }
+
+
+def build_update_manifest(
+    prov_obj: dict,
+    assets: dict[str, dict],
+    published_at: str | None = None,
+) -> dict:
+    version = str(prov_obj.get("version") or "dev").strip() or "dev"
+    commit = str(prov_obj.get("repository_commit") or "").strip()
+    pub = published_at or _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    release_url = (
+        f"https://github.com/Bud-Open/wwmi-dx12-rt/releases/tag/{version}"
+        if core.parse_semver(version) is not None
+        else core.GITHUB_FALLBACK_RELEASE_URL
+    )
+    return {
+        "schema_version": 1,
+        "min_updater_protocol": 1,
+        "repo": "Bud-Open/wwmi-dx12-rt",
+        "version": version,
+        "commit": commit,
+        "published_at": pub,
+        "release_url": release_url,
+        "assets": assets,
+    }
+
+
+def write_update_manifest(manifest: dict, out_path: Path) -> Path:
+    out_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
     return out_path
 
 
@@ -361,6 +431,7 @@ def main() -> int:
     prov_obj = build_provenance(manifest, version=args.version)
     provenance = json.dumps(prov_obj, ensure_ascii=False, indent=2) + "\n"
     built_archives: list[Path] = []
+    manifest_assets: dict[str, dict] = {}
 
     print(f"Release packages built successfully (version: {prov_obj['version']}):")
     if build_win:
@@ -373,6 +444,7 @@ def main() -> int:
         win_zip = dist_base / "WWMI-DX12-RT-win64.zip"
         make_zip(win_dir, win_zip)
         built_archives.append(win_zip)
+        manifest_assets["win-x64"] = build_asset_manifest_entry(win_dir, win_zip, "zip")
         print(f"  [Windows] {win_zip} ({win_zip.stat().st_size:,} bytes)")
 
     if build_linux:
@@ -401,11 +473,15 @@ def main() -> int:
         lin_tar = dist_base / "WWMI-DX12-RT-linux.tar.gz"
         make_targz(lin_dir, lin_tar)
         built_archives.append(lin_tar)
+        manifest_assets["linux-x64"] = build_asset_manifest_entry(lin_dir, lin_tar, "tar.gz", LINUX_EXECUTABLES)
         print(f"  [Linux]   {lin_tar} ({lin_tar.stat().st_size:,} bytes)")
 
     if built_archives:
         sums_path = write_sha256sums(built_archives, dist_base / "SHA256SUMS.txt")
         print(f"  [SHA256]  {sums_path}")
+        manifest_obj = build_update_manifest(prov_obj, manifest_assets)
+        manifest_path = write_update_manifest(manifest_obj, dist_base / "update-manifest.json")
+        print(f"  [Manifest] {manifest_path}")
     return 0
 
 

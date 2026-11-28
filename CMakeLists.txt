@@ -126,7 +126,7 @@ if(WIN32 AND WWMI_BUILD_RUNTIME
     if(CMAKE_HOST_UNIX)
         # xwin on case-sensitive Linux hosts provides canonical lowercase .lib filenames
         set_property(TARGET Windows PROPERTY INTERFACE_LINK_LIBRARIES
-            d3dcompiler.lib dxguid.lib shlwapi.lib version.lib wininet.lib
+            d3dcompiler.lib dxguid.lib shlwapi.lib version.lib
             winmm.lib ws2_32.lib xinput9_1_0.lib
         )
     endif()

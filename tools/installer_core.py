@@ -26,10 +26,13 @@ import shlex
 import shutil
 import stat
 import sys
+import tarfile
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Sequence
@@ -117,6 +120,24 @@ def is_newer_version(current_version: str | None, latest_version: str | None) ->
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/Bud-Open/wwmi-dx12-rt/releases/latest"
 GITHUB_ALLOWED_URL_PREFIX = "https://github.com/Bud-Open/wwmi-dx12-rt/"
 GITHUB_FALLBACK_RELEASE_URL = "https://github.com/Bud-Open/wwmi-dx12-rt/releases/latest"
+UPDATE_MANIFEST_URL = "https://github.com/Bud-Open/wwmi-dx12-rt/releases/latest/download/update-manifest.json"
+GITHUB_DOWNLOAD_BASE_URL = "https://github.com/Bud-Open/wwmi-dx12-rt/releases/download/"
+ALLOWED_UPDATE_REDIRECT_HOSTS = frozenset({
+    "github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+})
+UPDATER_PROTOCOL_VERSION = 1
+MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_UNPACKED_BYTES = 128 * 1024 * 1024
+MAX_ARCHIVE_FILES = 1024
+MAX_REDIRECT_HOPS = 5
+_WIN_RESERVED_NAMES = frozenset({
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+})
 
 
 def is_allowed_github_release_url(url: str | None) -> bool:
@@ -125,6 +146,293 @@ def is_allowed_github_release_url(url: str | None) -> bool:
     if not url.startswith(GITHUB_ALLOWED_URL_PREFIX):
         return False
     return not any(c.isspace() or ord(c) < 32 or c in ('"', "'") for c in url)
+
+
+def validate_update_hop_url(url: str, *, is_initial_hop: bool = False) -> str:
+    """Strictly validate HTTPS URL and exact GitHub/CDN host allowlist for each redirect hop."""
+    if not isinstance(url, str) or not url or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url):
+        raise RuntimeError(tr("更新 URL 非法，已中止。", "Invalid update URL; aborted."))
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() != "https":
+        raise RuntimeError(tr("拒绝非 HTTPS 更新链接。", "Refused non-HTTPS update URL."))
+    if parsed.username or parsed.password:
+        raise RuntimeError(tr("拒绝包含凭据的更新链接。", "Refused update URL containing embedded credentials."))
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError(tr("更新链接端口无效。", "Invalid port in update URL.")) from exc
+    if port not in (None, 443):
+        raise RuntimeError(tr("拒绝非 443 端口的更新链接。", "Refused update URL on non-443 port."))
+    host = (parsed.hostname or "").lower()
+    if is_initial_hop:
+        if host != "github.com" or not parsed.path.startswith("/Bud-Open/wwmi-dx12-rt/releases/"):
+            raise RuntimeError(tr(f"初始更新链接不在允许仓库内：{url}", f"Initial update URL outside allowed repo: {url}"))
+    else:
+        if host not in ALLOWED_UPDATE_REDIRECT_HOSTS:
+            raise RuntimeError(tr(f"重定向目标主机不在白名单内：{host}", f"Redirect host not in allowlist: {host}"))
+        if host == "github.com" and not parsed.path.startswith("/Bud-Open/wwmi-dx12-rt/releases/"):
+            raise RuntimeError(tr(f"重定向路径越出允许仓库范围：{parsed.path}", f"Redirect path escaped allowed repo: {parsed.path}"))
+    return url
+
+
+class _NoAutoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open_https_verified(
+    initial_url: str,
+    *,
+    timeout: float = 15.0,
+    headers: dict[str, str] | None = None,
+    urlopen_fn=None,
+):
+    """Fetch HTTPS resource manually validating every redirect hop (max 5 hops, no credential forwarding)."""
+    url = validate_update_hop_url(initial_url, is_initial_hop=True)
+    req_headers = {"User-Agent": "WWMI-DX12-RT-Setup"}
+    if headers:
+        req_headers.update(headers)
+    if urlopen_fn is not None:
+        req = urllib.request.Request(url, headers=req_headers, method="GET")
+        return urlopen_fn(req, timeout=timeout)
+
+    opener = urllib.request.build_opener(_NoAutoRedirectHandler())
+    for hop in range(MAX_REDIRECT_HOPS + 1):
+        req = urllib.request.Request(url, headers=req_headers, method="GET")
+        try:
+            return opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                loc = exc.headers.get("Location") if exc.headers else None
+                exc.close()
+                if not loc or hop >= MAX_REDIRECT_HOPS:
+                    raise RuntimeError(tr("更新下载重定向次数过多或缺少目标地址。", "Too many update redirects or missing Location header.")) from exc
+                next_url = urllib.parse.urljoin(url, loc.strip())
+                url = validate_update_hop_url(next_url, is_initial_hop=False)
+                continue
+            raise
+    raise RuntimeError(tr("更新请求重定向超限。", "Update redirect limit exceeded."))
+
+
+def validate_archive_rel_path(raw: str, required_root: str | None = None, *, is_dir: bool = False) -> str:
+    """Validate and strip archive member path against Zip/Tar-Slip, ADS, backslashes, and Windows device names."""
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("归档内存在空路径")
+    if any(ord(c) < 32 or ord(c) == 127 or c in ("\\", ":", "*", "?", '"', "<", ">", "|") for c in raw):
+        raise ValueError(f"归档路径含非法字符：{raw}")
+    if raw.startswith("/"):
+        raise ValueError(f"归档内拒绝绝对路径：{raw}")
+    trimmed = raw.rstrip("/") if is_dir else raw
+    if not is_dir and trimmed.endswith("/"):
+        raise ValueError(f"文件项不得以斜杠结尾：{raw}")
+    parts = trimmed.split("/")
+    for seg in parts:
+        if not seg or seg in (".", ".."):
+            raise ValueError(f"归档内存在越界路径段：{raw}")
+        if seg.endswith((" ", ".")):
+            raise ValueError(f"归档路径段尾含空格或点号：{raw}")
+        stem = seg.split(".", 1)[0].lower()
+        if stem in _WIN_RESERVED_NAMES:
+            raise ValueError(f"归档路径含 Windows 保留设备名：{raw}")
+    start_idx = 0
+    if required_root:
+        if parts[0] != required_root:
+            raise ValueError(f"归档条目越出预期顶层目录 {required_root}：{raw}")
+        start_idx = 1
+        if is_dir and len(parts) == 1:
+            return ""
+        if start_idx >= len(parts):
+            raise ValueError(f"剥离顶层目录后路径为空：{raw}")
+    return "/".join(parts[start_idx:])
+
+
+def _validate_slot_rel_path(slot_rel: str | None) -> str:
+    """Validate optional ledger active_slot / previous_slot: '' (flat root) or 'versions/<safe_name>'."""
+    if slot_rel is None or slot_rel == "":
+        return ""
+    if not isinstance(slot_rel, str):
+        raise ValueError("版本槽字段类型无效")
+    norm = slot_rel.replace("\\", "/").strip("/")
+    parts = norm.split("/")
+    if len(parts) != 2 or parts[0] != "versions" or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", parts[1]):
+        raise ValueError(f"版本槽路径不在允许范围内：{slot_rel}")
+    if parts[1] in (".", "..") or parts[1].endswith((" ", ".")):
+        raise ValueError(f"版本槽名称非法：{slot_rel}")
+    return f"versions/{parts[1]}"
+
+
+def resolve_slot_dir(base_root: Path, slot_rel: str | None) -> Path:
+    """Resolve managed slot path under base_root (empty slot_rel resolves to flat base_root)."""
+    base_res = base_root.resolve()
+    clean = _validate_slot_rel_path(slot_rel)
+    if not clean:
+        return base_res
+    target = (base_res / clean).resolve()
+    versions_dir = (base_res / "versions").resolve()
+    if not target.is_relative_to(versions_dir) or target == versions_dir:
+        raise ValueError(f"版本槽逃逸出 versions 目录：{slot_rel}")
+    return target
+
+
+def slot_name_for_release(version: str, commit: str | None, archive_sha256: str) -> str:
+    safe_ver = re.sub(r"[^A-Za-z0-9._-]", "_", (version or "dev").strip())[:32] or "dev"
+    suffix_src = (commit or "").strip() if re.fullmatch(r"[0-9a-fA-F]{7,40}", (commit or "").strip()) else archive_sha256
+    suffix = suffix_src[:8].lower()
+    return _validate_slot_rel_path(f"versions/{safe_ver}-{suffix}")
+
+
+def setup_prefs_path(base_root: Path) -> Path:
+    return base_root.resolve() / "runtime/setup-prefs.json"
+
+
+def load_setup_prefs(base_root: Path) -> dict:
+    defaults = {"schema_version": 1, "auto_check_updates": True}
+    path = setup_prefs_path(base_root)
+    try:
+        if not _regular_file(path):
+            return dict(defaults)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("auto_check_updates"), bool):
+            defaults["auto_check_updates"] = data["auto_check_updates"]
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return defaults
+
+
+def save_setup_prefs(base_root: Path, auto_check_updates: bool) -> dict:
+    prefs = {"schema_version": 1, "auto_check_updates": bool(auto_check_updates)}
+    path = setup_prefs_path(base_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, prefs)
+    return prefs
+
+
+def parse_update_manifest(
+    data: dict,
+    current_version: str | None,
+    platform_kind: str | None = None,
+) -> dict:
+    """Parse and strictly validate update-manifest.json emitted by scripts/package_release.py."""
+    if not isinstance(data, dict):
+        raise ValueError("更新清单格式无效（非 JSON 对象）")
+    if type(data.get("schema_version")) is not int or data["schema_version"] != 1:
+        raise ValueError("不支持的更新清单版本")
+    if data.get("repo") != "Bud-Open/wwmi-dx12-rt":
+        raise ValueError("更新清单仓库标识不匹配")
+    min_proto = data.get("min_updater_protocol", 1)
+    if type(min_proto) is not int or min_proto < 1:
+        raise ValueError("更新清单协议版本字段无效")
+
+    latest_version = str(data.get("version") or "").strip()
+    if parse_semver(latest_version) is None:
+        raise ValueError(f"更新清单版本号无效：{latest_version}")
+    commit = str(data.get("commit") or "").strip()
+    if commit and not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit):
+        raise ValueError("更新清单 commit 哈希格式无效")
+    published_at = str(data.get("published_at") or "").strip()
+    raw_rel_url = data.get("release_url")
+    release_url = (
+        raw_rel_url
+        if is_allowed_github_release_url(raw_rel_url)
+        else f"https://github.com/Bud-Open/wwmi-dx12-rt/releases/tag/{latest_version}"
+    )
+
+    p_kind = platform_kind or ("windows" if sys.platform == "win32" else "linux-proton")
+    asset_key = "win-x64" if p_kind == "windows" else "linux-x64"
+    expected_name = "WWMI-DX12-RT-win64.zip" if p_kind == "windows" else "WWMI-DX12-RT-linux.tar.gz"
+    expected_fmt = "zip" if p_kind == "windows" else "tar.gz"
+
+    cur_str = (current_version or "dev").strip() or "dev"
+    update_available = is_newer_version(cur_str, latest_version)
+    requires_manual = min_proto > UPDATER_PROTOCOL_VERSION
+
+    assets = data.get("assets")
+    if not isinstance(assets, dict) or asset_key not in assets or not isinstance(assets[asset_key], dict):
+        raise ValueError(f"更新清单缺少平台资产：{asset_key}")
+    asset = assets[asset_key]
+
+    asset_name = str(asset.get("name") or "").strip()
+    if asset_name != expected_name:
+        raise ValueError(f"更新资产文件名不符合预期：{asset_name}")
+    if asset.get("format") != expected_fmt:
+        raise ValueError(f"更新资产归档格式不符合预期：{asset.get('format')}")
+    root_prefix = str(asset.get("root") or "").strip()
+    if not root_prefix or "/" in root_prefix or "\\" in root_prefix or root_prefix in (".", ".."):
+        raise ValueError(f"更新资产顶层目录名无效：{root_prefix}")
+    arc_bytes = asset.get("bytes")
+    if type(arc_bytes) is not int or arc_bytes <= 0 or arc_bytes > MAX_ARCHIVE_BYTES:
+        raise ValueError("更新资产压缩包大小超出允许范围")
+    arc_sha = str(asset.get("sha256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", arc_sha):
+        raise ValueError("更新资产压缩包 SHA-256 格式无效")
+    unpacked_bytes = asset.get("unpacked_bytes")
+    if type(unpacked_bytes) is not int or unpacked_bytes <= 0 or unpacked_bytes > MAX_UNPACKED_BYTES:
+        raise ValueError("更新资产解压总大小超出允许范围")
+    file_count = asset.get("file_count")
+    raw_files = asset.get("files")
+    if (
+        type(file_count) is not int
+        or not isinstance(raw_files, list)
+        or file_count <= 0
+        or file_count > MAX_ARCHIVE_FILES
+        or len(raw_files) != file_count
+    ):
+        raise ValueError("更新资产文件清单数量无效或超限")
+
+    validated_files: list[dict] = []
+    seen_lower: set[str] = set()
+    sum_bytes = 0
+    for item in raw_files:
+        if not isinstance(item, dict):
+            raise ValueError("文件清单条目格式无效")
+        rel = validate_archive_rel_path(str(item.get("path") or ""), required_root=None, is_dir=False)
+        low = rel.lower()
+        if low in seen_lower:
+            raise ValueError(f"文件清单存在重复或大小写冲突路径：{rel}")
+        seen_lower.add(low)
+        fbytes = item.get("bytes")
+        if type(fbytes) is not int or fbytes < 0 or fbytes > MAX_ARCHIVE_BYTES:
+            raise ValueError(f"文件大小无效：{rel}")
+        fsha = str(item.get("sha256") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", fsha):
+            raise ValueError(f"文件 SHA-256 无效：{rel}")
+        sum_bytes += fbytes
+        validated_files.append({
+            "path": rel,
+            "bytes": fbytes,
+            "sha256": fsha,
+            "executable": bool(item.get("executable", False)),
+        })
+    if sum_bytes != unpacked_bytes:
+        raise ValueError("文件清单累计大小与 unpacked_bytes 不一致")
+    present_paths = {f["path"] for f in validated_files}
+    for req_rel in REQUIRED_PAYLOAD:
+        if req_rel not in present_paths:
+            raise ValueError(f"更新清单缺少必需运行时文件：{req_rel}")
+
+    pinned_url = f"{GITHUB_DOWNLOAD_BASE_URL}{latest_version}/{asset_name}"
+    validate_update_hop_url(pinned_url, is_initial_hop=True)
+    return {
+        "source": "manifest",
+        "current_version": cur_str,
+        "latest_version": latest_version,
+        "commit": commit,
+        "update_available": update_available,
+        "requires_manual_upgrade": requires_manual,
+        "min_updater_protocol": min_proto,
+        "release_url": release_url,
+        "published_at": published_at,
+        "asset_name": asset_name,
+        "asset_format": expected_fmt,
+        "asset_root": root_prefix,
+        "asset_bytes": arc_bytes,
+        "asset_sha256": arc_sha,
+        "asset_digest": f"sha256:{arc_sha}",
+        "asset_url": pinned_url,
+        "unpacked_bytes": unpacked_bytes,
+        "file_count": file_count,
+        "files": validated_files,
+    }
 
 
 def parse_github_release_payload(
@@ -191,32 +499,347 @@ def check_latest_release(
     timeout: float = 8.0,
     urlopen_fn=None,
 ) -> dict:
-    """Opt-in manual HTTPS check against GitHub Releases API (never called automatically)."""
-    req = urllib.request.Request(
-        GITHUB_RELEASE_API_URL,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "WWMI-DX12-RT-Setup",
-        },
-        method="GET",
-    )
-    opener = urlopen_fn or urllib.request.urlopen
+    """Check GitHub Releases via direct update-manifest.json redirect (bypasses api.github.com 60/hr limit)."""
     try:
-        with opener(req, timeout=timeout) as resp:
-            raw = resp.read(1 << 20)
-    except (OSError, urllib.error.URLError, TimeoutError) as exc:
+        with _open_https_verified(
+            UPDATE_MANIFEST_URL,
+            timeout=timeout,
+            headers={"Accept": "application/json"},
+            urlopen_fn=urlopen_fn,
+        ) as resp:
+            raw = resp.read(MAX_MANIFEST_BYTES + 1)
+    except (OSError, urllib.error.URLError, TimeoutError, RuntimeError) as exc:
         raise RuntimeError(tr(
             f"无法连接 GitHub 检查更新：{exc}",
-            f"Failed to contact GitHub Releases API: {exc}",
+            f"Failed to contact GitHub Releases: {exc}",
         )) from exc
+    if len(raw) > MAX_MANIFEST_BYTES:
+        raise RuntimeError(tr("更新清单体积超出安全上限。", "Update manifest exceeds maximum allowed size."))
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+        if isinstance(data, dict) and "schema_version" in data and isinstance(data.get("assets"), dict):
+            return parse_update_manifest(data, current_version, platform_kind)
         return parse_github_release_payload(data, current_version, platform_kind)
     except (UnicodeDecodeError, ValueError) as exc:
         raise RuntimeError(tr(
             f"解析 GitHub 更新信息失败：{exc}",
             f"Failed to parse GitHub release metadata: {exc}",
         )) from exc
+
+
+def download_verified_asset(
+    manifest_info: dict,
+    dest_path: Path,
+    *,
+    timeout: float = 30.0,
+    urlopen_fn=None,
+    progress_cb=None,
+    cancel_check=None,
+) -> Path:
+    """Stream-download pinned release archive validating HTTPS redirects, exact byte count, and SHA-256."""
+    url = str(manifest_info.get("asset_url") or "")
+    expected_bytes = int(manifest_info.get("asset_bytes") or 0)
+    expected_sha = str(manifest_info.get("asset_sha256") or "").lower()
+    if not url or expected_bytes <= 0 or expected_bytes > MAX_ARCHIVE_BYTES or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+        raise RuntimeError(tr("更新清单缺少有效的资产下载与校验信息。", "Update manifest lacks valid asset download/digest metadata."))
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_path.with_name(f".{dest_path.name}.{uuid.uuid4().hex[:12]}.dl")
+    h = hashlib.sha256()
+    total_read = 0
+    try:
+        with _open_https_verified(url, timeout=timeout, urlopen_fn=urlopen_fn) as resp:
+            with tmp_path.open("xb") as f:
+                while True:
+                    if cancel_check and cancel_check():
+                        raise RuntimeError(tr("用户已取消更新下载。", "Update download cancelled by user."))
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total_read += len(chunk)
+                    if total_read > expected_bytes or total_read > MAX_ARCHIVE_BYTES:
+                        raise RuntimeError(tr("下载体积超出清单声明长度，已中止。", "Downloaded size exceeded manifest byte length; aborted."))
+                    f.write(chunk)
+                    h.update(chunk)
+                    if progress_cb:
+                        progress_cb(total_read, expected_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+        if total_read != expected_bytes:
+            raise RuntimeError(tr(
+                f"下载不完整（预期 {expected_bytes} 字节，实得 {total_read} 字节）。",
+                f"Incomplete download (expected {expected_bytes} bytes, got {total_read} bytes).",
+            ))
+        actual_sha = h.hexdigest()
+        if actual_sha != expected_sha:
+            raise RuntimeError(tr(
+                "下载压缩包 SHA-256 校验不匹配，已中止安装。",
+                "Downloaded archive SHA-256 checksum mismatch; installation aborted.",
+            ))
+        os.replace(tmp_path, dest_path)
+        return dest_path
+    except BaseException:
+        if tmp_path.exists():
+            try:
+                aborted = dest_path.parent / "aborted"
+                aborted.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(tmp_path), str(aborted / tmp_path.name))
+            except OSError:
+                pass
+        raise
+
+
+def verify_slot_against_manifest(slot_dir: Path, manifest_info: dict) -> bool:
+    """Return True iff slot_dir contains the EXACT set of regular files in manifest_info with matching bytes and SHA-256."""
+    files = manifest_info.get("files") or []
+    if not files or not slot_dir.is_dir() or slot_dir.is_symlink():
+        return False
+    expected = {entry["path"]: entry for entry in files}
+    actual_rels: set[str] = set()
+    try:
+        for p in slot_dir.rglob("*"):
+            if p.is_symlink():
+                return False
+            if p.is_dir():
+                continue
+            if not p.is_file():
+                return False
+            rel = p.relative_to(slot_dir).as_posix()
+            actual_rels.add(rel)
+    except OSError:
+        return False
+    if actual_rels != set(expected.keys()):
+        return False
+    for rel, entry in expected.items():
+        p = slot_dir / rel
+        try:
+            if not _regular_file(p):
+                return False
+            if p.stat().st_size != entry["bytes"]:
+                return False
+            if sha256_file(p) != entry["sha256"]:
+                return False
+        except (OSError, RuntimeError):
+            return False
+    return True
+
+
+def _staged_release_path(base_root: Path) -> Path:
+    return base_root / "runtime/staged-release.json"
+
+
+def load_staged_release(base_root: Path) -> dict | None:
+    p = _staged_release_path(base_root)
+    if not _regular_file(p):
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("active"):
+        return None
+    try:
+        slot = _validate_slot_rel_path(data.get("slot"))
+    except ValueError:
+        return None
+    ver = str(data.get("version") or "").strip()
+    if not slot or not ver:
+        return None
+    return {
+        "slot": slot,
+        "version": ver,
+        "commit": str(data.get("commit") or "").strip() or None,
+    }
+
+
+def save_staged_release(base_root: Path, slot_rel: str, version: str, commit: str | None) -> Path:
+    clean_slot = _validate_slot_rel_path(slot_rel)
+    p = _staged_release_path(base_root)
+    _write_json(p, {
+        "schema_version": 1,
+        "active": True,
+        "slot": clean_slot,
+        "version": str(version),
+        "commit": commit or None,
+        "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    })
+    return p
+
+
+def clear_staged_release(base_root: Path) -> None:
+    p = _staged_release_path(base_root)
+    if not p.exists():
+        return
+    try:
+        _write_json(p, {
+            "schema_version": 1,
+            "active": False,
+            "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        })
+    except OSError:
+        pass
+
+
+def _extract_archive_to_staging_dir(
+    archive_path: Path,
+    manifest_info: dict,
+    base_res: Path,
+    *,
+    progress_cb=None,
+) -> tuple[str, Path]:
+    """Verify archive SHA-256 and extract every manifest-verified member into an isolated staging dir (does not touch versions/)."""
+    expected_bytes = int(manifest_info["asset_bytes"])
+    expected_sha = str(manifest_info["asset_sha256"]).lower()
+    if not _regular_file(archive_path) or archive_path.stat().st_size != expected_bytes or sha256_file(archive_path) != expected_sha:
+        raise RuntimeError(tr("本地归档包 SHA-256 校验失败，拒绝解压。", "Archive SHA-256 verification failed; refusing to extract."))
+
+    slot_rel = slot_name_for_release(manifest_info["latest_version"], manifest_info.get("commit"), expected_sha)
+    req_root = str(manifest_info["asset_root"])
+    fmt = str(manifest_info["asset_format"])
+    expected_map = {f["path"]: f for f in manifest_info["files"]}
+
+    stage_parent = base_res / "runtime/staging"
+    stage_parent.mkdir(parents=True, exist_ok=True)
+    stage_dir = stage_parent / f"slot-{uuid.uuid4().hex[:12]}"
+    stage_dir.mkdir(mode=0o755, parents=True)
+
+    seen_lower: set[str] = set()
+    extracted_paths: set[str] = set()
+    total_unpacked = 0
+
+    def _write_verified_member(rel: str, data: bytes, is_exec: bool) -> None:
+        nonlocal total_unpacked
+        low = rel.lower()
+        if low in seen_lower:
+            raise RuntimeError(f"归档存在重复或大小写冲突文件：{rel}")
+        seen_lower.add(low)
+        spec = expected_map.get(rel)
+        if spec is None:
+            raise RuntimeError(f"归档包含清单未声明的文件：{rel}")
+        if len(data) != spec["bytes"]:
+            raise RuntimeError(f"文件长度与清单不符：{rel}")
+        total_unpacked += len(data)
+        if total_unpacked > MAX_UNPACKED_BYTES or total_unpacked > int(manifest_info["unpacked_bytes"]):
+            raise RuntimeError("归档解压总大小超过上限")
+        if hashlib.sha256(data).hexdigest() != spec["sha256"]:
+            raise RuntimeError(f"文件 SHA-256 与清单不符：{rel}")
+        dst = (stage_dir / rel).resolve()
+        if not dst.is_relative_to(stage_dir.resolve()):
+            raise RuntimeError(f"解压路径越界：{rel}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        _write_new_file(dst, data)
+        if is_exec or spec.get("executable"):
+            try:
+                dst.chmod(0o755)
+            except OSError:
+                pass
+        extracted_paths.add(rel)
+        if progress_cb:
+            progress_cb(len(extracted_paths), len(expected_map))
+
+    try:
+        if fmt == "tar.gz":
+            with tarfile.open(archive_path, "r:gz") as tf:
+                members = tf.getmembers()
+                if len(members) > MAX_ARCHIVE_FILES * 2:
+                    raise RuntimeError("归档成员总数超限")
+                for m in members:
+                    if m.isdir():
+                        validate_archive_rel_path(m.name, req_root, is_dir=True)
+                        continue
+                    if not m.isfile() or m.issym() or m.islnk() or m.isdev() or m.isfifo():
+                        raise RuntimeError(f"拒绝归档中的链接或特殊文件：{m.name}")
+                    rel = validate_archive_rel_path(m.name, req_root, is_dir=False)
+                    if m.size > MAX_ARCHIVE_BYTES:
+                        raise RuntimeError(f"归档单文件体积超限：{rel}")
+                    fobj = tf.extractfile(m)
+                    if fobj is None:
+                        raise RuntimeError(f"无法读取归档成员：{rel}")
+                    data = fobj.read(m.size + 1)
+                    if len(data) != m.size:
+                        raise RuntimeError(f"归档成员实际读取长度不符：{rel}")
+                    _write_verified_member(rel, data, bool(m.mode & 0o111))
+        elif fmt == "zip":
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                infos = zf.infolist()
+                if len(infos) > MAX_ARCHIVE_FILES * 2:
+                    raise RuntimeError("归档成员总数超限")
+                for info in infos:
+                    if info.flag_bits & 0x1:
+                        raise RuntimeError("拒绝加密 ZIP 条目")
+                    if info.create_system == 3:
+                        mode_type = (info.external_attr >> 16) & 0xF000
+                        if mode_type not in (0, 0x8000, 0x4000):
+                            raise RuntimeError(f"拒绝 ZIP 中的符号链接或特殊文件：{info.filename}")
+                    if info.is_dir():
+                        validate_archive_rel_path(info.filename, req_root, is_dir=True)
+                        continue
+                    rel = validate_archive_rel_path(info.filename, req_root, is_dir=False)
+                    if info.file_size > MAX_ARCHIVE_BYTES:
+                        raise RuntimeError(f"ZIP 单文件体积超限：{rel}")
+                    data = zf.read(info)
+                    _write_verified_member(rel, data, False)
+        else:
+            raise RuntimeError(f"不支持的归档格式：{fmt}")
+
+        if extracted_paths != set(expected_map.keys()):
+            missing = sorted(set(expected_map.keys()) - extracted_paths)
+            raise RuntimeError(f"解压后缺少清单声明文件：{missing[:3]}")
+
+        return slot_rel, stage_dir
+    except BaseException:
+        if stage_dir.exists():
+            try:
+                failed = stage_parent / f"failed-{stage_dir.name}"
+                shutil.move(str(stage_dir), str(failed))
+            except OSError:
+                pass
+        raise
+
+
+def _publish_staged_slot_locked(
+    base_res: Path,
+    slot_rel: str,
+    stage_dir: Path,
+    manifest_info: dict,
+) -> Path:
+    """Publish a verified staging directory into base_res/versions/<slot> while caller holds base_root lock."""
+    final_slot = resolve_slot_dir(base_res, slot_rel)
+    stage_parent = base_res / "runtime/staging"
+    stage_parent.mkdir(parents=True, exist_ok=True)
+    if final_slot.is_dir() and verify_slot_against_manifest(final_slot, manifest_info):
+        if stage_dir.exists():
+            try:
+                redundant = stage_parent / f"redundant-{stage_dir.name}"
+                shutil.move(str(stage_dir), str(redundant))
+            except OSError:
+                pass
+        return final_slot
+    (base_res / "versions").mkdir(parents=True, exist_ok=True)
+    if final_slot.exists() or final_slot.is_symlink():
+        old_broken = stage_parent / f"replaced-broken-{final_slot.name}-{uuid.uuid4().hex[:8]}"
+        shutil.move(str(final_slot), str(old_broken))
+    shutil.move(str(stage_dir), str(final_slot))
+    return final_slot
+
+
+def extract_verified_update_slot(
+    archive_path: Path,
+    manifest_info: dict,
+    base_root: Path,
+    *,
+    progress_cb=None,
+) -> tuple[str, Path]:
+    """Verify archive SHA-256, safely extract into base_root/versions/<slot> under base_root lock, and verify every file hash."""
+    base_res = base_root.resolve()
+    slot_rel, stage_dir = _extract_archive_to_staging_dir(archive_path, manifest_info, base_res, progress_cb=progress_cb)
+    with _base_root_locks(base_res):
+        final_slot = _publish_staged_slot_locked(base_res, slot_rel, stage_dir, manifest_info)
+    return slot_rel, final_slot
 
 
 def is_chinese_locale() -> bool:
@@ -741,6 +1364,10 @@ def load_install_ledger(base_root: Path) -> dict | None:
                             raise ValueError("recovery_backup 路径不在允许的恢复目录内")
         elif ledger["state"] != "uninstalled":
             raise ValueError("未知账本状态")
+        if "active_slot" in ledger and ledger["active_slot"] is not None:
+            _validate_slot_rel_path(ledger["active_slot"])
+        if "previous_slot" in ledger and ledger["previous_slot"] is not None:
+            _validate_slot_rel_path(ledger["previous_slot"])
         return ledger
     except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise RuntimeError(
@@ -1020,7 +1647,8 @@ def detect_verified_win64_owner(
             )
         owned_hashes[name] = actual_sha
 
-    host_dll_a = candidate / "host/ReShade64-game-forward.dll"
+    slot_root_a = resolve_slot_dir(candidate, ledger_a.get("active_slot"))
+    host_dll_a = slot_root_a / "host/ReShade64-game-forward.dll"
     if not _regular_file(host_dll_a) or sha256_file(host_dll_a) != owned_hashes["dxgi.dll"]:
         return None, tr(
             f"旧目录 {candidate} 缺少匹配的 host/ReShade64-game-forward.dll，无法验证 Win64/dxgi.dll 归属，拒绝覆盖。",
@@ -1786,12 +2414,19 @@ def _base_root_locks(*roots: Path | None):
         yield
 
 
-def build_external_reshade_ini() -> str:
+def _is_managed_slot_addon_token(norm_lower: str) -> bool:
+    parts = norm_lower.split("/")
+    return len(parts) == 3 and parts[0] == "versions" and parts[2] == "reshade-addons"
+
+
+def build_external_reshade_ini(addon_rel_path: str = "reshade-addons") -> str:
+    clean = addon_rel_path.replace("/", "\\").strip("\\") or "reshade-addons"
+    val = f"{clean},reshade-addons" if clean.lower() != "reshade-addons" else "reshade-addons"
     return (
         "[INSTALL]\n"
         "Logging=0\n\n"
         "[ADDON]\n"
-        "AddonPath=reshade-addons\n\n"
+        f"AddonPath={val}\n\n"
         "[OVERLAY]\n"
         "TutorialProgress=4\n"
     )
@@ -1837,14 +2472,17 @@ def _split_addon_path_tokens(raw: str) -> list[str]:
     return out
 
 
-def merge_external_reshade_ini(existing_text: str | None) -> str:
-    """Preserve user ReShade.ini customizations across upgrades while ensuring reshade-addons is searched first."""
+def merge_external_reshade_ini(existing_text: str | None, addon_rel_path: str = "reshade-addons") -> str:
+    """Preserve user ReShade.ini customizations across upgrades while routing AddonPath to active slot first."""
+    clean_primary = addon_rel_path.replace("/", "\\").strip("\\") or "reshade-addons"
+    is_slot = clean_primary.lower() != "reshade-addons"
+    default_line = f"AddonPath={clean_primary},reshade-addons" if is_slot else "AddonPath=reshade-addons"
     if not existing_text:
-        return build_external_reshade_ini()
+        return build_external_reshade_ini(clean_primary)
     if existing_text.startswith("\ufeff"):
         existing_text = existing_text[1:]
     if not existing_text.strip():
-        return build_external_reshade_ini()
+        return build_external_reshade_ini(clean_primary)
     eol = "\r\n" if "\r\n" in existing_text else "\n"
     lines = existing_text.splitlines()
     in_addon = False
@@ -1871,24 +2509,24 @@ def merge_external_reshade_ini(existing_text: str | None) -> str:
             _, _, val = lines[idx].partition("=")
             for tok in _split_addon_path_tokens(val):
                 norm = tok.replace("\\", "/").rstrip("/").lower()
-                if norm == "reshade-addons":
+                if norm == "reshade-addons" or _is_managed_slot_addon_token(norm):
                     continue
                 if norm not in seen_extras:
                     seen_extras.add(norm)
                     extras.append(tok.replace(",", ",,"))
         first_idx = addon_path_indices[0]
-        merged_val = "reshade-addons"
+        merged_val = f"{clean_primary},reshade-addons" if is_slot else "reshade-addons"
         for extra in extras:
             merged_val += (", " if extra.startswith(",") else ",") + extra
         lines[first_idx] = f"AddonPath={merged_val}"
         for dup_idx in reversed(addon_path_indices[1:]):
             lines.pop(dup_idx)
     elif addon_header_idx >= 0:
-        lines.insert(addon_header_idx + 1, "AddonPath=reshade-addons")
+        lines.insert(addon_header_idx + 1, default_line)
     else:
         if lines and lines[-1].strip():
             lines.append("")
-        lines.extend(["[ADDON]", "AddonPath=reshade-addons"])
+        lines.extend(["[ADDON]", default_line])
     return eol.join(lines) + eol
 
 
@@ -2052,7 +2690,7 @@ def _is_relative_reshade_path(token: str) -> bool:
     if not t:
         return False
     norm = t.replace("\\", "/").rstrip("/").lower()
-    if norm in ("reshade-addons", "."):
+    if norm in ("reshade-addons", ".") or _is_managed_slot_addon_token(norm):
         return False
     if t.startswith(("/", "\\", "%")):
         return False
@@ -2576,6 +3214,70 @@ def install_mount(
             for sub in ("runtime/logs", "runtime/cache/shaders", "runtime/seed", "runtime/recovery", "seed"):
                 (base_root / sub).mkdir(parents=True, exist_ok=True)
 
+            # Preserve active slot + rollback metadata on in-place Reapply/Repair,
+            # OR activate a pre-staged self-update release on initial Install.
+            active_slot_keep = ""
+            keep_prev_slot = False
+            prev_slot_keep = ""
+            prev_ver_keep: str | None = None
+            prev_commit_keep: str | None = None
+            eff_install_ver = pkg_version
+            eff_install_commit = pkg_commit
+            addon_rel_for_ini = "reshade-addons"
+            used_staged_release = False
+
+            if verified_owner is None:
+                cand_slot = ""
+                if old_ledger and isinstance(old_ledger.get("active_slot"), str) and old_ledger["active_slot"].strip():
+                    try:
+                        cand_slot = _validate_slot_rel_path(old_ledger["active_slot"])
+                    except ValueError:
+                        cand_slot = ""
+                if cand_slot:
+                    sdir = resolve_slot_dir(base_root, cand_slot)
+                    if _regular_file(sdir / "host/ReShade64-game-forward.dll") and _regular_file(sdir / "reshade-addons/wwmi_dx12.addon64"):
+                        active_slot_keep = cand_slot
+                        dxgi_data = (sdir / "host/ReShade64-game-forward.dll").read_bytes()
+                        if old_ledger.get("installed_version"):
+                            eff_install_ver = str(old_ledger["installed_version"])
+                        if "installed_commit" in old_ledger:
+                            eff_install_commit = old_ledger.get("installed_commit")
+                        if "previous_slot" in old_ledger and old_ledger["previous_slot"] is not None:
+                            try:
+                                prev_slot_keep = _validate_slot_rel_path(old_ledger["previous_slot"])
+                                keep_prev_slot = True
+                                prev_ver_keep = old_ledger.get("previous_version")
+                                prev_commit_keep = old_ledger.get("previous_commit")
+                            except ValueError:
+                                keep_prev_slot = False
+                        addon_rel_for_ini = f"{active_slot_keep.replace('/', chr(92))}\\reshade-addons"
+                elif not old_ledger or old_ledger.get("state") not in ACTIVE_STATES:
+                    staged = load_staged_release(base_root)
+                    if staged is not None:
+                        sdir = resolve_slot_dir(base_root, staged["slot"])
+                        if (
+                            _regular_file(sdir / "host/ReShade64-game-forward.dll")
+                            and _regular_file(sdir / "reshade-addons/wwmi_dx12.addon64")
+                            and (staged["version"] == pkg_version or is_newer_version(pkg_version, staged["version"]))
+                        ):
+                            active_slot_keep = staged["slot"]
+                            dxgi_data = (sdir / "host/ReShade64-game-forward.dll").read_bytes()
+                            eff_install_ver = staged["version"]
+                            eff_install_commit = staged.get("commit")
+                            addon_rel_for_ini = f"{active_slot_keep.replace('/', chr(92))}\\reshade-addons"
+                            used_staged_release = True
+                if active_slot_keep and p_kind == "linux-proton":
+                    sdir = resolve_slot_dir(base_root, active_slot_keep)
+                    slot_so = sdir / "lib/wine-filename-utf8.so"
+                    fixed_so = base_root / "lib/wine-filename-utf8.so"
+                    flat_so_bkp = base_root / "runtime/flat-backup/lib/wine-filename-utf8.so"
+                    if _regular_file(fixed_so) and not _regular_file(flat_so_bkp):
+                        flat_so_bkp.parent.mkdir(parents=True, exist_ok=True)
+                        _atomic_write(flat_so_bkp, fixed_so.read_bytes())
+                    if _regular_file(slot_so) and fixed_so != slot_so:
+                        fixed_so.parent.mkdir(parents=True, exist_ok=True)
+                        _atomic_write(fixed_so, slot_so.read_bytes())
+
             # Merge external ReShade.ini (prefer existing B/ReShade.ini; otherwise migrate from A/ReShade.ini)
             ext_reshade_path = base_root / "ReShade.ini"
             reshade_source_text: str | None = None
@@ -2583,7 +3285,7 @@ def install_mount(
                 reshade_source_text = ext_reshade_path.read_text(encoding="utf-8", errors="ignore")
             elif verified_owner is not None and _regular_file(verified_owner.base_root / "ReShade.ini"):
                 reshade_source_text = (verified_owner.base_root / "ReShade.ini").read_text(encoding="utf-8", errors="ignore")
-            merged_reshade = merge_external_reshade_ini(reshade_source_text)
+            merged_reshade = merge_external_reshade_ini(reshade_source_text, addon_rel_path=addon_rel_for_ini)
             _atomic_write(ext_reshade_path, merged_reshade.encode("utf-8"))
             if verified_owner is not None:
                 migration_warnings.extend(
@@ -2703,8 +3405,8 @@ def install_mount(
                 "schema_version": 1, "state": "installing", "pending_id": pending_id,
                 "platform_kind": p_kind, "base_root": str(base_root),
                 "win64_dir": str(win64_dir), "wwmi_dir": str(effective_wwmi),
-                "installed_version": pkg_version,
-                "installed_commit": pkg_commit,
+                "installed_version": eff_install_ver,
+                "installed_commit": eff_install_commit,
                 "win64_files": [
                     {
                         "relative": name,
@@ -2718,6 +3420,14 @@ def install_mount(
                 ],
                 "extra_managed_files": old_ledger.get("extra_managed_files", []) if old_ledger else [],
             }
+            if active_slot_keep:
+                ledger["active_slot"] = active_slot_keep
+            if keep_prev_slot:
+                ledger["previous_slot"] = prev_slot_keep
+                if prev_ver_keep is not None:
+                    ledger["previous_version"] = prev_ver_keep
+                if prev_commit_keep is not None:
+                    ledger["previous_commit"] = prev_commit_keep
             if previous_owner_root is not None:
                 ledger["previous_owner"] = str(previous_owner_root)
             if preserved_upgraded_from is not None:
@@ -2805,6 +3515,8 @@ def install_mount(
             if preserved_upgraded_from is not None:
                 ledger["upgraded_from"] = preserved_upgraded_from
             _write_json(ledger_path, ledger)
+            if used_staged_release:
+                clear_staged_release(base_root)
 
             if previous_owner_root is not None:
                 warn = _mark_previous_owner_migrated(previous_owner_root, base_root)
@@ -2823,6 +3535,451 @@ def install_mount(
             return result
 
 
+def _prune_unused_slots(
+    base_root: Path,
+    keep_slots: set[str],
+    staging_root: Path,
+) -> list[str]:
+    """Move obsolete versions/* slots (neither active nor rollback target) into staging_root (never raw rmtree)."""
+    versions_dir = base_root.resolve() / "versions"
+    if not versions_dir.is_dir():
+        return []
+    keep_names = {Path(s).name for s in keep_slots if s}
+    obsolete = [
+        p for p in sorted(versions_dir.iterdir(), key=lambda item: item.name.lower())
+        if p.is_dir() and p.name not in keep_names
+    ]
+    if not obsolete:
+        return []
+    stage_files_for_removal(obsolete, staging_root, "wwmi-dx12-old-slots")
+    return [p.name for p in obsolete]
+
+
+def _resolve_folder_active_host(folder: Path, led: dict | None) -> Path:
+    """Resolve the active ReShade64 host DLL for a folder, honoring active_slot if present."""
+    if led and isinstance(led.get("active_slot"), str) and led["active_slot"].strip():
+        try:
+            slot_dir = resolve_slot_dir(folder, led["active_slot"])
+            slot_host = slot_dir / "host/ReShade64-game-forward.dll"
+            if _regular_file(slot_host):
+                return slot_host
+        except ValueError:
+            pass
+    return folder / "host/ReShade64-game-forward.dll"
+
+
+def _switch_base_root_slot(
+    base_root: Path,
+    target_slot_rel: str,
+    target_version: str,
+    target_commit: str | None,
+    *,
+    is_rollback: bool = False,
+    dry_run: bool = False,
+    staging_root: Path | None = None,
+    check_processes: bool = True,
+    staged_slot_dir: Path | None = None,
+    staged_manifest: dict | None = None,
+) -> dict:
+    """Transactionally switch an installed base_root between flat root ('') and versions/<slot> preserving all user data."""
+    base_res = base_root.resolve()
+    clean_slot = _validate_slot_rel_path(target_slot_rel)
+    slot_dir = resolve_slot_dir(base_res, clean_slot)
+    if staged_slot_dir is None:
+        host_dll_pre = slot_dir / "host/ReShade64-game-forward.dll"
+        if not _regular_file(host_dll_pre) or not _regular_file(slot_dir / "reshade-addons/wwmi_dx12.addon64"):
+            raise RuntimeError(tr(
+                f"目标版本槽缺少核心运行时文件，拒绝切换：{slot_dir}",
+                f"Target version slot is missing core runtime binaries; refusing switch: {slot_dir}",
+            ))
+    ledger_cur = load_install_ledger(base_res)
+    if not ledger_cur or ledger_cur.get("state") != "installed":
+        raise RuntimeError(tr(
+            f"当前目录 {base_res} 未处于已安装状态，请先执行首次安装。",
+            f"Current folder {base_res} is not installed yet; run initial Install first.",
+        ))
+    p_kind = ledger_cur.get("platform_kind") or ("windows" if sys.platform == "win32" else "linux-proton")
+    win64_dir = Path(ledger_cur["win64_dir"]).resolve()
+    if Path(ledger_cur["win64_dir"]) != win64_dir:
+        raise RuntimeError(f"原 Win64 目录现在指向其他位置，拒绝切换：{ledger_cur['win64_dir']}")
+    if check_processes and (running := running_watched_processes()):
+        raise RuntimeError(f"检测到游戏正在运行（{', '.join(running)}），请先正常退出游戏后重试")
+
+    if dry_run:
+        _owned_bootstrap(win64_dir, ledger_cur, base_root=base_res)
+        return {
+            "mode": "dry-run",
+            "action": "rollback" if is_rollback else "slot_update",
+            "base_root": str(base_res),
+            "win64_dir": str(win64_dir),
+            "from_slot": ledger_cur.get("active_slot", ""),
+            "to_slot": clean_slot,
+            "from_version": format_installed_version(ledger_cur),
+            "target_version": target_version,
+        }
+
+    stage_root = staging_root or default_staging_root(base_res)
+    with _win64_lock(win64_dir), _base_root_locks(base_res):
+        ledger_cur = load_install_ledger(base_res)
+        if not ledger_cur or ledger_cur.get("state") != "installed":
+            raise RuntimeError(tr("加锁后账本状态已变化，请重试。", "Ledger state changed while acquiring lock; retry."))
+        if Path(ledger_cur["win64_dir"]).resolve() != win64_dir:
+            raise RuntimeError(tr("Win64 目录在加锁期间发生变化，拒绝切换。", "Win64 target changed while acquiring lock."))
+        if check_processes and (running := running_watched_processes()):
+            raise RuntimeError(f"检测到游戏正在运行（{', '.join(running)}），请先正常退出游戏后重试")
+
+        if staged_slot_dir is not None and staged_manifest is not None:
+            slot_dir = _publish_staged_slot_locked(base_res, clean_slot, staged_slot_dir, staged_manifest)
+
+        host_dll = slot_dir / "host/ReShade64-game-forward.dll"
+        if not _regular_file(host_dll) or not _regular_file(slot_dir / "reshade-addons/wwmi_dx12.addon64"):
+            raise RuntimeError(tr(
+                f"目标版本槽缺少核心运行时文件，拒绝切换：{slot_dir}",
+                f"Target version slot is missing core runtime binaries; refusing switch: {slot_dir}",
+            ))
+
+        owned = _owned_bootstrap(win64_dir, ledger_cur, base_root=base_res)
+        if len(owned) != len(BOOTSTRAP_FILES):
+            raise RuntimeError(tr(
+                "当前 Win64 引导文件不完整，请先修复安装后再升级或回滚。",
+                "Current Win64 bootstrap files are incomplete; repair install before updating or rolling back.",
+            ))
+
+        old_slot = _validate_slot_rel_path(ledger_cur.get("active_slot"))
+        old_ver = format_installed_version(ledger_cur)
+        old_commit = ledger_cur.get("installed_commit")
+
+        engine_base = format_engine_path(base_res, p_kind)
+        dxgi_data = host_dll.read_bytes()
+        stub_data = build_win64_stub_reshade_ini(engine_base).encode("utf-8")
+        bootstrap = dict(zip(BOOTSTRAP_FILES, (dxgi_data, stub_data)))
+        expected_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in bootstrap.items()}
+
+        addon_rel = f"{clean_slot.replace('/', chr(92))}\\reshade-addons" if clean_slot else "reshade-addons"
+        ext_reshade_path = base_res / "ReShade.ini"
+        old_reshade_bytes = ext_reshade_path.read_bytes() if _regular_file(ext_reshade_path) else None
+        merged_reshade = merge_external_reshade_ini(
+            old_reshade_bytes.decode("utf-8", errors="ignore") if old_reshade_bytes is not None else None,
+            addon_rel_path=addon_rel,
+        ).encode("utf-8")
+
+        slot_utf8_so = slot_dir / "lib/wine-filename-utf8.so"
+        fixed_utf8_so = base_res / "lib/wine-filename-utf8.so"
+        flat_shim_backup = base_res / "runtime/flat-backup/lib/wine-filename-utf8.so"
+        old_utf8_bytes = fixed_utf8_so.read_bytes() if (p_kind == "linux-proton" and _regular_file(fixed_utf8_so)) else None
+        if p_kind == "linux-proton" and old_slot == "" and clean_slot != "" and old_utf8_bytes is not None and not _regular_file(flat_shim_backup):
+            flat_shim_backup.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(flat_shim_backup, old_utf8_bytes)
+        new_utf8_bytes: bytes | None = None
+        if p_kind == "linux-proton":
+            if clean_slot == "" and _regular_file(flat_shim_backup):
+                new_utf8_bytes = flat_shim_backup.read_bytes()
+            elif _regular_file(slot_utf8_so):
+                new_utf8_bytes = slot_utf8_so.read_bytes()
+
+        pending_id = uuid.uuid4().hex
+        recovery_dir, recovery_backups = _create_recovery_backup(win64_dir, BOOTSTRAP_FILES, base_res, pending_id)
+        if old_reshade_bytes is not None:
+            _write_recovery_file(recovery_dir / "external-ReShade.ini", old_reshade_bytes)
+
+        def _apply_rollback_metadata(target_dict: dict) -> None:
+            if is_rollback:
+                target_dict.pop("previous_slot", None)
+                target_dict.pop("previous_version", None)
+                target_dict.pop("previous_commit", None)
+                target_dict["rolled_back_from_slot"] = old_slot
+            elif old_slot != clean_slot:
+                target_dict["previous_slot"] = old_slot
+                target_dict["previous_version"] = old_ver
+                if old_commit:
+                    target_dict["previous_commit"] = old_commit
+                else:
+                    target_dict.pop("previous_commit", None)
+            # When old_slot == clean_slot (idempotent same-slot re-apply), preserve existing previous_* metadata.
+
+        pending_ledger = dict(ledger_cur)
+        pending_ledger.update(
+            schema_version=1,
+            state="installing",
+            pending_id=pending_id,
+            installed_version=target_version,
+            installed_commit=target_commit,
+            active_slot=clean_slot,
+            recovery_dir=str(recovery_dir),
+            win64_files=[
+                {
+                    "relative": name,
+                    "path": str(win64_dir / name),
+                    "sha256": expected_hashes[name],
+                    "size": len(data),
+                    "previous_sha256": owned[name],
+                    "recovery_backup": str(recovery_backups[name]),
+                }
+                for name, data in bootstrap.items()
+            ],
+        )
+        _apply_rollback_metadata(pending_ledger)
+        _write_json(_ledger_path(base_res), pending_ledger)
+
+        final_ledger = dict(ledger_cur)
+        final_ledger.pop("pending_id", None)
+        final_ledger.pop("recovery_dir", None)
+        final_ledger.update(
+            schema_version=1,
+            state="installed",
+            installed_version=target_version,
+            installed_commit=target_commit,
+            active_slot=clean_slot,
+            install_mode="slot_rollback" if is_rollback else "slot_update",
+            installed_at=_dt.datetime.now(_dt.timezone.utc).isoformat(),
+            win64_files=[
+                {
+                    "relative": name,
+                    "path": str(win64_dir / name),
+                    "sha256": expected_hashes[name],
+                    "size": len(data),
+                }
+                for name, data in bootstrap.items()
+            ],
+        )
+        _apply_rollback_metadata(final_ledger)
+
+        try:
+            _atomic_write(ext_reshade_path, merged_reshade)
+            if new_utf8_bytes is not None and (old_utf8_bytes is None or new_utf8_bytes != old_utf8_bytes):
+                fixed_utf8_so.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write(fixed_utf8_so, new_utf8_bytes)
+            for name, data in bootstrap.items():
+                if owned.get(name) == expected_hashes[name]:
+                    continue
+                temp = win64_dir / f".wwmi-{pending_id}-{name}.tmp"
+                _write_new_file(temp, data)
+                os.replace(temp, win64_dir / name)
+            _write_json(_ledger_path(base_res), final_ledger)
+        except BaseException:
+            if old_reshade_bytes is not None:
+                try:
+                    _atomic_write(ext_reshade_path, old_reshade_bytes)
+                except OSError:
+                    pass
+            if old_utf8_bytes is not None:
+                try:
+                    _atomic_write(fixed_utf8_so, old_utf8_bytes)
+                except OSError:
+                    pass
+            for name in reversed(BOOTSTRAP_FILES):
+                bkp = recovery_backups.get(name)
+                if bkp and bkp.is_file():
+                    try:
+                        rb_tmp = win64_dir / f".wwmi-rollback-{uuid.uuid4().hex[:12]}-{name}.tmp"
+                        _write_recovery_file(rb_tmp, bkp.read_bytes())
+                        os.replace(rb_tmp, win64_dir / name)
+                    except OSError:
+                        pass
+            aborted_dir = recovery_dir / "aborted-tmp"
+            for name in BOOTSTRAP_FILES:
+                leftover = win64_dir / f".wwmi-{pending_id}-{name}.tmp"
+                if os.path.lexists(leftover):
+                    try:
+                        aborted_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(leftover), str(aborted_dir / leftover.name))
+                    except OSError:
+                        pass
+            try:
+                if all(_regular_file(win64_dir / n) and sha256_file(win64_dir / n) == h for n, h in owned.items()):
+                    _write_json(_ledger_path(base_res), ledger_cur)
+            except (OSError, RuntimeError):
+                pass
+            raise
+
+        clear_staged_release(base_res)
+        keep = {clean_slot}
+        if final_ledger.get("previous_slot"):
+            keep.add(str(final_ledger["previous_slot"]))
+        pruned = _prune_unused_slots(base_res, keep, stage_root)
+
+        res: dict = {
+            "state": "rolled_back" if is_rollback else "updated",
+            "from_root": str(base_res),
+            "to_root": str(slot_dir),
+            "base_root": str(base_res),
+            "win64_dir": str(win64_dir),
+            "from_slot": old_slot,
+            "active_slot": clean_slot,
+            "from_version": old_ver,
+            "installed_version": target_version,
+            "target_version": target_version,
+            "pruned_slots": pruned,
+        }
+        if p_kind == "linux-proton":
+            res["proton_launch_options"], res["proton_preload_warning"] = proton_launch_options(base_res, False)
+        return res
+
+
+def apply_slot_update(
+    base_root: Path,
+    slot_rel: str,
+    manifest_info: dict,
+    *,
+    dry_run: bool = False,
+    staging_root: Path | None = None,
+    check_processes: bool = True,
+    staged_slot_dir: Path | None = None,
+) -> dict:
+    """Activate a manifest-verified version slot on an already-installed base_root."""
+    return _switch_base_root_slot(
+        base_root=base_root,
+        target_slot_rel=slot_rel,
+        target_version=str(manifest_info["latest_version"]),
+        target_commit=manifest_info.get("commit") or None,
+        is_rollback=False,
+        dry_run=dry_run,
+        staging_root=staging_root,
+        check_processes=check_processes,
+        staged_slot_dir=staged_slot_dir,
+        staged_manifest=manifest_info if staged_slot_dir is not None else None,
+    )
+
+
+def sync_portable_linux_tools(slot_dir: Path, tool_root: Path) -> list[str]:
+    """Refresh portable Linux CLI/GUI scripts from slot_dir when tool_root is NOT a git checkout."""
+    root_res = tool_root.resolve()
+    if (root_res / ".git").exists():
+        return []
+    updated: list[str] = []
+    for rel, is_exec in (
+        ("wwmi-dx12-setup", True),
+        ("scripts/wwmi-dx12-setup.py", True),
+        ("tools/installer_core.py", False),
+        ("tools/texlook_tool.py", True),
+        ("tools/migrate_hash_free.py", True),
+        ("BUILD-PROVENANCE.json", False),
+    ):
+        src = slot_dir / rel
+        dst = root_res / rel
+        if not _regular_file(src) or dst == src:
+            continue
+        src_bytes = src.read_bytes()
+        if _regular_file(dst) and sha256_file(dst) == hashlib.sha256(src_bytes).hexdigest():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(dst, src_bytes)
+        if is_exec:
+            try:
+                dst.chmod(0o755)
+            except OSError:
+                pass
+        updated.append(rel)
+    return updated
+
+
+def perform_self_update(
+    base_root: Path,
+    *,
+    current_version: str | None = None,
+    platform_kind: str | None = None,
+    tool_root: Path | None = None,
+    dry_run: bool = False,
+    check_processes: bool = True,
+    staging_root: Path | None = None,
+    urlopen_fn=None,
+    progress_cb=None,
+    cancel_check=None,
+    manifest_info: dict | None = None,
+) -> dict:
+    """End-to-end verified in-app self-update: check manifest -> download -> extract slot -> atomic switch."""
+    base_res = base_root.resolve()
+    p_kind = platform_kind or ("windows" if sys.platform == "win32" else "linux-proton")
+    ledger = load_install_ledger(base_res)
+    eff_cur = current_version
+    if not eff_cur:
+        if ledger and ledger.get("state") in ACTIVE_STATES and ledger.get("installed_version"):
+            eff_cur = str(ledger["installed_version"])
+        else:
+            eff_cur = read_package_provenance(tool_root or base_res)["version"] or "dev"
+
+    info = manifest_info or check_latest_release(eff_cur, platform_kind=p_kind, urlopen_fn=urlopen_fn)
+    if info.get("source") != "manifest":
+        raise RuntimeError(tr(
+            "当前最新 Release 不含 update-manifest.json，请从浏览器手动下载。",
+            "Latest release does not include update-manifest.json; download manually from GitHub Releases.",
+        ))
+    if info.get("requires_manual_upgrade"):
+        raise RuntimeError(tr(
+            f"新版本 {info['latest_version']} 需要更新安装器协议（v{info['min_updater_protocol']}），请打开 GitHub Releases 手动下载。",
+            f"Release {info['latest_version']} requires a newer updater protocol (v{info['min_updater_protocol']}); download manually from GitHub Releases.",
+        ))
+    if not info.get("update_available"):
+        return {
+            "state": "up_to_date",
+            "current_version": eff_cur,
+            "latest_version": info["latest_version"],
+            "release_url": info["release_url"],
+        }
+    if dry_run:
+        return {
+            "mode": "dry-run",
+            "state": "update_available",
+            "current_version": eff_cur,
+            "latest_version": info["latest_version"],
+            "asset_name": info["asset_name"],
+            "asset_bytes": info["asset_bytes"],
+            "asset_sha256": info["asset_sha256"],
+            "asset_url": info["asset_url"],
+        }
+
+    dl_dir = base_res / "runtime/staging" / f"dl-{uuid.uuid4().hex[:10]}"
+    archive_path = dl_dir / info["asset_name"]
+    download_verified_asset(
+        info,
+        archive_path,
+        urlopen_fn=urlopen_fn,
+        progress_cb=progress_cb,
+        cancel_check=cancel_check,
+    )
+    if cancel_check and cancel_check():
+        raise RuntimeError(tr("更新已被用户取消。", "Update cancelled by user."))
+    slot_rel, stage_dir = _extract_archive_to_staging_dir(archive_path, info, base_res)
+    # Stage downloaded archive out after slot extraction verified 100%
+    stage_root = staging_root or default_staging_root(base_res)
+    if archive_path.exists():
+        try:
+            stage_files_for_removal([dl_dir], stage_root, "wwmi-dx12-update-dl")
+        except RuntimeError:
+            pass
+    if cancel_check and cancel_check():
+        raise RuntimeError(tr("更新已被用户取消。", "Update cancelled by user."))
+
+    ledger = load_install_ledger(base_res)
+    if ledger and ledger.get("state") == "installed":
+        res = apply_slot_update(
+            base_res,
+            slot_rel,
+            info,
+            dry_run=False,
+            staging_root=stage_root,
+            check_processes=check_processes,
+            staged_slot_dir=stage_dir,
+        )
+        slot_dir = Path(res["to_root"])
+    else:
+        with _base_root_locks(base_res):
+            slot_dir = _publish_staged_slot_locked(base_res, slot_rel, stage_dir, info)
+            save_staged_release(base_res, slot_rel, str(info["latest_version"]), info.get("commit") or None)
+        res = {
+            "state": "staged_not_installed",
+            "base_root": str(base_res),
+            "active_slot": slot_rel,
+            "to_root": str(slot_dir),
+            "installed_version": info["latest_version"],
+            "target_version": info["latest_version"],
+        }
+
+    if p_kind == "linux-proton" and tool_root is not None:
+        res["updated_tools"] = sync_portable_linux_tools(slot_dir, tool_root)
+    return res
+
+
 def rollback_mount(
     base_root: Path,
     target_root: Path | None = None,
@@ -2830,7 +3987,7 @@ def rollback_mount(
     staging_root: Path | None = None,
     check_processes: bool = True,
 ) -> dict:
-    """Roll back an installed mount from NEW folder B back to previous folder A (crash-resumable, works for v1.0.2/v1.0.3 A)."""
+    """Roll back an installed mount: supports in-root version slot rollback AND cross-folder v1.0.2/v1.0.3/v1.0.4 rollback."""
     base_root = base_root.resolve()
     ledger_b = load_install_ledger(base_root)
     if not ledger_b or ledger_b.get("state") not in ("installed", "rolling_back"):
@@ -2838,6 +3995,25 @@ def rollback_mount(
             f"当前目录 {base_root} 未处于已安装或待恢复回滚状态，无法执行回滚。",
             f"Current folder {base_root} is not in an active installed or rolling_back state; cannot roll back.",
         ))
+    if (
+        target_root is None
+        and ledger_b["state"] == "installed"
+        and "previous_slot" in ledger_b
+        and ledger_b["previous_slot"] is not None
+    ):
+        prev_slot = _validate_slot_rel_path(ledger_b["previous_slot"])
+        prev_ver = str(ledger_b.get("previous_version") or "").strip() or tr("上一版本", "Previous version")
+        prev_commit = ledger_b.get("previous_commit")
+        return _switch_base_root_slot(
+            base_root=base_root,
+            target_slot_rel=prev_slot,
+            target_version=prev_ver,
+            target_commit=prev_commit,
+            is_rollback=True,
+            dry_run=dry_run,
+            staging_root=staging_root,
+            check_processes=check_processes,
+        )
     if ledger_b["state"] == "rolling_back":
         recorded_target = Path(ledger_b["rollback_target"]).resolve()
         if target_root is not None and target_root.resolve() != recorded_target:
@@ -2858,7 +4034,8 @@ def rollback_mount(
         raise RuntimeError(tr("回滚目标目录不能与当前目录相同。", "Rollback target cannot be the same as the current folder."))
     if not target_a.is_dir():
         raise RuntimeError(tr(f"旧版目录不存在，无法回滚：{target_a}", f"Previous folder does not exist: {target_a}"))
-    host_dll_a = target_a / "host/ReShade64-game-forward.dll"
+    pre_ledger_a_for_host = load_install_ledger(target_a)
+    host_dll_a = _resolve_folder_active_host(target_a, pre_ledger_a_for_host)
     if not _regular_file(host_dll_a):
         raise RuntimeError(tr(
             f"旧版目录缺少 host/ReShade64-game-forward.dll，无法回滚：{target_a}",
@@ -2964,6 +4141,12 @@ def rollback_mount(
             _ensure_restore_source_finalized(base_root, ledger_b)
 
             ledger_a = load_install_ledger(target_a)
+            host_dll_a = _resolve_folder_active_host(target_a, ledger_a)
+            if not _regular_file(host_dll_a):
+                raise RuntimeError(tr(
+                    f"旧版目录缺少 host/ReShade64-game-forward.dll，无法回滚：{target_a}",
+                    f"Previous folder is missing host/ReShade64-game-forward.dll; cannot roll back: {target_a}",
+                ))
             already_committed_a = _validate_target_a(ledger_a, resuming_rollback, ledger_b)
 
             abandoned = _pending_files(win64_dir, ledger_b)

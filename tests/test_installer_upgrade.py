@@ -459,7 +459,7 @@ class TestInstallerUpgrade(unittest.TestCase):
         self.assertEqual(info_lin["asset_name"], "WWMI-DX12-RT-linux.tar.gz")
         self.assertEqual(info_lin["asset_digest"], "sha256:bbbb")
         self.assertEqual(info_lin["release_url"], "https://github.com/Bud-Open/wwmi-dx12-rt/releases/tag/v1.0.5")
-        self.assertEqual(captured_reqs[0][0], core.GITHUB_RELEASE_API_URL)
+        self.assertEqual(captured_reqs[0][0], core.UPDATE_MANIFEST_URL)
 
         info_win = core.check_latest_release("v1.0.5", "windows", urlopen_fn=fake_urlopen)
         self.assertFalse(info_win["update_available"])

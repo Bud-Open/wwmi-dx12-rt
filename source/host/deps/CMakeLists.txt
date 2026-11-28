@@ -349,7 +349,6 @@ if(WIN32)
       dxguid.lib
       ShLwApi.lib
       Version.lib
-      wininet.lib
       WinMM.lib
       WS2_32.lib
       Xinput9_1_0.lib

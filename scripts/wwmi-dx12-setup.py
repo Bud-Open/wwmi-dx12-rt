@@ -285,10 +285,17 @@ def format_update_check_text(info: dict) -> str:
     ]
     if info.get("published_at"):
         lines.append(f"  {core.tr('发布时间', 'Published At   ')} : {info['published_at']}")
-    if info.get("update_available"):
+    if info.get("requires_manual_upgrade"):
         lines.append(core.tr(
-            "  状态：发现新版本！可前往 GitHub Releases 下载并解压至新目录执行并排升级。",
-            "  Status: A newer release is available! Download from GitHub Releases and extract side-by-side to upgrade.",
+            "  状态：发现新版本，但该版本更新了安装器协议，请从 GitHub Releases 手动下载。",
+            "  Status: Newer release requires a newer updater protocol; download manually from GitHub Releases.",
+        ))
+    elif info.get("update_available"):
+        size_mb = (info["asset_bytes"] / (1024 * 1024)) if info.get("asset_bytes") else 0.0
+        size_hint = f" ({size_mb:.1f} MB)" if size_mb > 0 else ""
+        lines.append(core.tr(
+            f"  状态：发现新版本！可执行 `./wwmi-dx12-setup update` 原地一键无感升级{size_hint}（保留回滚）。",
+            f"  Status: A newer release is available! Run `./wwmi-dx12-setup update` for verified in-app upgrade{size_hint} (with rollback).",
         ))
     elif core.parse_semver(info.get("current_version")) is None:
         lines.append(core.tr(
@@ -308,14 +315,94 @@ def format_update_check_text(info: dict) -> str:
     return "\n".join(lines)
 
 
+def _current_effective_version(base_root: Path) -> str:
+    try:
+        led = core.load_install_ledger(base_root)
+        if led and led.get("state") in core.ACTIVE_STATES and led.get("installed_version"):
+            return str(led["installed_version"])
+    except RuntimeError:
+        pass
+    return core.read_package_provenance(REPO_ROOT)["version"] or "dev"
+
+
 def cmd_check_update(args: argparse.Namespace) -> int:
-    current_version = core.read_package_provenance(REPO_ROOT)["version"] or "dev"
+    _, _, base_root, _ = resolve_defaults(args)
+    current_version = _current_effective_version(base_root)
     p_kind = "windows" if sys.platform == "win32" else "linux-proton"
     info = core.check_latest_release(current_version, platform_kind=p_kind)
     if getattr(args, "json", False):
         print(json.dumps(info, indent=2, ensure_ascii=False))
     else:
         print(format_update_check_text(info))
+    return 0
+
+
+def _run_self_update(args: argparse.Namespace, *, manifest_info: dict | None = None) -> tuple[int, str]:
+    _, _, base_root, _ = resolve_defaults(args)
+    p_kind = "windows" if sys.platform == "win32" else "linux-proton"
+    dry_run = getattr(args, "dry_run", False)
+
+    def _prog(done: int, total: int) -> None:
+        if total > 0 and sys.stderr.isatty():
+            pct = int(done * 100 / total)
+            print(f"\r{core.tr('正在下载更新包', 'Downloading update')}: {pct}% ({done / (1024 * 1024):.1f}/{total / (1024 * 1024):.1f} MB)", end="", file=sys.stderr, flush=True)
+
+    res = core.perform_self_update(
+        base_root,
+        platform_kind=p_kind,
+        tool_root=REPO_ROOT,
+        dry_run=dry_run,
+        progress_cb=_prog if not dry_run else None,
+        manifest_info=manifest_info,
+    )
+    if not dry_run and sys.stderr.isatty():
+        print("", file=sys.stderr)
+    if dry_run:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0, core.tr("更新预检完成（未修改文件）。", "Update dry-run complete (no files modified).")
+    if res.get("state") == "up_to_date":
+        msg = core.tr(
+            f"当前已是最新版本（{res['current_version']}），无需更新。",
+            f"Already up to date ({res['current_version']}).",
+        )
+        print(msg)
+        return 0, msg
+    if res.get("state") == "staged_not_installed":
+        msg = core.tr(
+            f"已下载校验新版 {res['installed_version']} 至版本槽 {res['active_slot']}；当前尚未挂载 Win64，请执行 install 完成首次启用。",
+            f"Downloaded and verified {res['installed_version']} into {res['active_slot']}; run install to enable in Win64.",
+        )
+        print(msg)
+        return 0, msg
+    lines = [core.tr(
+        f"无感升级完成：{res.get('from_version')} -> {res['installed_version']}（目录路径未变，已保留一键回滚）",
+        f"Seamless upgrade complete: {res.get('from_version')} -> {res['installed_version']} (folder path unchanged; rollback preserved)",
+    )]
+    lines.append(f"  - {core.tr('当前活动槽', 'Active slot')}: {res['active_slot']}")
+    if res.get("updated_tools"):
+        lines.append(f"  - {core.tr('同步更新工具脚本', 'Updated setup scripts')}: {', '.join(res['updated_tools'])}")
+    msg = "\n".join(lines)
+    print(msg)
+    return 0, msg
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    rc, _ = _run_self_update(args)
+    return rc
+
+
+def cmd_auto_check(args: argparse.Namespace) -> int:
+    _, _, base_root, _ = resolve_defaults(args)
+    mode = getattr(args, "mode", "status")
+    if mode == "status":
+        prefs = core.load_setup_prefs(base_root)
+        st = core.tr("已开启", "enabled") if prefs["auto_check_updates"] else core.tr("已关闭", "disabled")
+        print(core.tr(f"启动时自动检查更新：{st}", f"Auto-check updates on launch: {st}"))
+        return 0
+    enabled = (mode == "on")
+    core.save_setup_prefs(base_root, enabled)
+    st = core.tr("已开启", "enabled") if enabled else core.tr("已关闭", "disabled")
+    print(core.tr(f"已更新设置 — 启动时自动检查更新：{st}", f"Updated preference — auto-check updates on launch: {st}"))
     return 0
 
 
@@ -397,7 +484,12 @@ def cmd_gui(args: argparse.Namespace) -> int:
         loaded_ledger = core.load_install_ledger(base_root)
         if loaded_ledger and loaded_ledger.get("state") in core.ACTIVE_STATES:
             installed_ver_line = f"{core.tr('已安装版本', 'Installed Ver')}: {core.format_installed_version(loaded_ledger)}\n"
-            if loaded_ledger.get("state") == "installed" and loaded_ledger.get("upgraded_from"):
+            if loaded_ledger.get("state") == "installed" and "previous_slot" in loaded_ledger and loaded_ledger["previous_slot"] is not None:
+                prev_slot_dir = core.resolve_slot_dir(base_root, loaded_ledger["previous_slot"])
+                if prev_slot_dir.is_dir() and (prev_slot_dir / "host/ReShade64-game-forward.dll").is_file():
+                    prev_v = loaded_ledger.get("previous_version") or core.tr("上一版本", "previous version")
+                    can_rollback_prev = f"{prev_v} ({loaded_ledger['previous_slot'] or core.tr('初始根槽', 'initial root')})"
+            elif loaded_ledger.get("state") == "installed" and loaded_ledger.get("upgraded_from"):
                 cand_prev = Path(loaded_ledger["upgraded_from"])
                 if cand_prev.is_dir() and (cand_prev / "host/ReShade64-game-forward.dll").is_file():
                     can_rollback_prev = str(cand_prev)
@@ -405,9 +497,27 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 cand_prev = Path(loaded_ledger["rollback_target"])
                 if cand_prev.is_dir() and (cand_prev / "host/ReShade64-game-forward.dll").is_file():
                     can_rollback_prev = str(cand_prev)
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         pass
+
+    prefs = core.load_setup_prefs(base_root)
+    auto_update_info: dict | None = None
+    auto_update_banner = ""
+    if prefs.get("auto_check_updates", True) and not getattr(args, "no_auto_update", False):
+        try:
+            eff_ver = _current_effective_version(base_root)
+            cand_info = core.check_latest_release(eff_ver, "windows" if sys.platform == "win32" else "linux-proton", timeout=2.5)
+            if cand_info.get("update_available"):
+                auto_update_info = cand_info
+                auto_update_banner = core.tr(
+                    f"[发现新版本] {eff_ver} -> {cand_info['latest_version']}（可直接在下方一键无感升级）\n",
+                    f"[Update Available] {eff_ver} -> {cand_info['latest_version']} (select Update below for one-click upgrade)\n",
+                )
+        except Exception:
+            pass
+
     summary = (
+        f"{auto_update_banner}"
         f"{core.tr('当前包版本', 'Package Version')}: {pkg_ver}\n"
         f"{installed_ver_line}"
         f"{core.tr('当前状态', 'Status')}: {state} ({state_msg})\n"
@@ -451,16 +561,33 @@ def cmd_gui(args: argparse.Namespace) -> int:
         else ""
     )
     opt_doctor = core.tr("运行环境与 RabbitFX 健康自检", "Run environment & RabbitFX health check")
-    opt_update = core.tr("检查更新（打开 GitHub 发布页）", "Check for Updates (Open GitHub Releases)")
+    opt_self_update = (
+        core.tr(
+            f"一键无感升级至 {auto_update_info['latest_version']}（应用内下载校验并切换，保留回滚）",
+            f"One-Click Update to {auto_update_info['latest_version']} (verified in-app slot upgrade)",
+        )
+        if auto_update_info
+        else core.tr("检查并一键在线升级（GitHub Releases）", "Check & One-Click Update (GitHub Releases)")
+    )
+    opt_toggle_auto = core.tr(
+        f"启动自动查更新：当前【{'开' if prefs.get('auto_check_updates', True) else '关'}】（点击切换）",
+        f"Auto-check updates on launch: {'ON' if prefs.get('auto_check_updates', True) else 'OFF'} (toggle)",
+    )
 
     kdialog = shutil.which("kdialog")
     zenity = shutil.which("zenity")
 
     if kdialog:
-        menu_items = ["install", opt_install]
+        menu_items: list[str] = []
+        if auto_update_info:
+            menu_items.extend(["update", opt_self_update])
+        menu_items.extend(["install", opt_install])
         if can_rollback_prev:
             menu_items.extend(["rollback", opt_rollback])
-        menu_items.extend(["uninstall", opt_uninstall, "doctor", opt_doctor, "check-update", opt_update])
+        menu_items.extend(["uninstall", opt_uninstall, "doctor", opt_doctor])
+        if not auto_update_info:
+            menu_items.extend(["update", opt_self_update])
+        menu_items.extend(["toggle-auto", opt_toggle_auto])
         choice = subprocess.run(
             [
                 kdialog,
@@ -500,8 +627,13 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 msg = "\n".join(f"[{f.level.upper()}] {f.message}" for f in rep.findings)
                 subprocess.run([kdialog, "--msgbox", msg])
                 return 0
-            if act == "check-update":
-                info = core.check_latest_release(pkg_ver, "windows" if sys.platform == "win32" else "linux-proton")
+            if act == "update":
+                info = auto_update_info or core.check_latest_release(_current_effective_version(base_root), "windows" if sys.platform == "win32" else "linux-proton")
+                if info.get("update_available") and info.get("source") == "manifest" and not info.get("requires_manual_upgrade"):
+                    args.dry_run = False
+                    rc, msg = _run_self_update(args, manifest_info=info)
+                    subprocess.run([kdialog, "--error" if rc else "--msgbox", msg])
+                    return rc
                 msg = format_update_check_text(info) + core.tr(
                     "\n\n是否在浏览器中打开 GitHub Releases 发布页？",
                     "\n\nOpen the GitHub Releases page in your browser?",
@@ -510,15 +642,27 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 if ans.returncode == 0:
                     _open_release_url(info["release_url"])
                 return 0
+            if act == "toggle-auto":
+                new_val = not prefs.get("auto_check_updates", True)
+                core.save_setup_prefs(base_root, new_val)
+                st_str = core.tr("已开启", "enabled") if new_val else core.tr("已关闭", "disabled")
+                subprocess.run([kdialog, "--msgbox", core.tr(f"启动时自动检查更新已切换为：{st_str}", f"Auto-check updates on launch is now: {st_str}")])
+                return 0
         except Exception as exc:
             subprocess.run([kdialog, "--error", str(exc)])
             return 1
 
     elif zenity:
-        z_items = ["install", opt_install]
+        z_items: list[str] = []
+        if auto_update_info:
+            z_items.extend(["update", opt_self_update])
+        z_items.extend(["install", opt_install])
         if can_rollback_prev:
             z_items.extend(["rollback", opt_rollback])
-        z_items.extend(["uninstall", opt_uninstall, "doctor", opt_doctor, "check-update", opt_update])
+        z_items.extend(["uninstall", opt_uninstall, "doctor", opt_doctor])
+        if not auto_update_info:
+            z_items.extend(["update", opt_self_update])
+        z_items.extend(["toggle-auto", opt_toggle_auto])
         choice = subprocess.run(
             [
                 zenity,
@@ -529,7 +673,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 f"--column={core.tr('操作说明', 'Description')}",
                 *z_items,
                 "--width=680",
-                "--height=400",
+                "--height=420",
             ],
             capture_output=True,
             text=True,
@@ -561,8 +705,13 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 msg = "\n".join(f"[{f.level.upper()}] {f.message}" for f in rep.findings)
                 subprocess.run([zenity, "--info", f"--text={msg}"])
                 return 0
-            if act == "check-update":
-                info = core.check_latest_release(pkg_ver, "windows" if sys.platform == "win32" else "linux-proton")
+            if act == "update":
+                info = auto_update_info or core.check_latest_release(_current_effective_version(base_root), "windows" if sys.platform == "win32" else "linux-proton")
+                if info.get("update_available") and info.get("source") == "manifest" and not info.get("requires_manual_upgrade"):
+                    args.dry_run = False
+                    rc, msg = _run_self_update(args, manifest_info=info)
+                    subprocess.run([zenity, "--error" if rc else "--info", f"--text={msg}"])
+                    return rc
                 msg = format_update_check_text(info) + core.tr(
                     "\n\n是否在浏览器中打开 GitHub Releases 发布页？",
                     "\n\nOpen the GitHub Releases page in your browser?",
@@ -570,6 +719,12 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 ans = subprocess.run([zenity, "--question", f"--text={msg}"])
                 if ans.returncode == 0:
                     _open_release_url(info["release_url"])
+                return 0
+            if act == "toggle-auto":
+                new_val = not prefs.get("auto_check_updates", True)
+                core.save_setup_prefs(base_root, new_val)
+                st_str = core.tr("已开启", "enabled") if new_val else core.tr("已关闭", "disabled")
+                subprocess.run([zenity, "--info", f"--text={core.tr(f'启动时自动检查更新已切换为：{st_str}', f'Auto-check updates on launch is now: {st_str}')}"])
                 return 0
         except Exception as exc:
             subprocess.run([zenity, "--error", f"--text={exc}"])
@@ -603,8 +758,8 @@ def cmd_gui(args: argparse.Namespace) -> int:
         args.json = False
         return cmd_doctor(args)
     if sel == "4":
-        args.json = False
-        return cmd_check_update(args)
+        args.dry_run = False
+        return cmd_update(args)
     return 0
 
 
@@ -645,8 +800,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_un.add_argument("--dry-run", action="store_true", help="Preview files to stage without moving them")
 
     p_rb = sub.add_parser("rollback", parents=[shared],
-                          help="Roll back an upgraded install to its preserved previous folder (supports v1.0.2/v1.0.3)")
-    p_rb.add_argument("--to", help="Explicit previous folder to restore (defaults to ledger upgraded_from)")
+                          help="Roll back an upgraded install to its preserved previous slot or folder")
+    p_rb.add_argument("--to", help="Explicit previous folder to restore (defaults to previous slot or upgraded_from)")
     p_rb.add_argument("--dry-run", action="store_true", help="Validate rollback plan without writing files")
 
     p_init = sub.add_parser("init-wwmi", parents=[shared], help="Initialize a standard WWMI folder skeleton")
@@ -654,9 +809,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_gui = sub.add_parser("gui", parents=[shared], help="Launch interactive GUI wizard (kdialog/zenity) or TUI")
     add_install_options(p_gui, "default")
+    p_gui.add_argument("--no-auto-update", action="store_true", help="Skip automatic manifest check on launch")
     p_upd = sub.add_parser("check-update", parents=[shared],
-                           help="Opt-in check against GitHub Releases for a newer WWMI-DX12-RT version")
+                           help="Check GitHub Releases update-manifest.json for a newer WWMI-DX12-RT version")
     p_upd.add_argument("--json", action="store_true", help="Output update info as JSON")
+    p_self = sub.add_parser("update", parents=[shared],
+                            help="Download, verify SHA-256, and seamlessly switch to the latest version slot")
+    p_self.add_argument("--dry-run", action="store_true", help="Check manifest and preview update without downloading")
+    p_ac = sub.add_parser("auto-check", parents=[shared],
+                          help="Configure automatic update check on Setup launch (on / off / status)")
+    p_ac.add_argument("mode", nargs="?", choices=("status", "on", "off"), default="status")
     sub.add_parser("desktop-entry", parents=[shared], help="Create a desktop menu entry in ~/.local/share/applications")
     return p
 
@@ -685,6 +847,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_gui(args)
     if cmd == "check-update":
         return cmd_check_update(args)
+    if cmd == "update":
+        return cmd_update(args)
+    if cmd == "auto-check":
+        return cmd_auto_check(args)
     if cmd == "desktop-entry":
         return cmd_desktop_entry(args)
     parser.print_help()
