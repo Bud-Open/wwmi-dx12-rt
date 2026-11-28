@@ -19,6 +19,7 @@ typedef struct WWMI_DescriptorSpan_v1 {
 
 enum {
     WWMI_DESCRIPTOR_CONTENT_VERSION = 2,
+    WWMI_DESCRIPTOR_BATCH_VERSION = 3,
     WWMI_DESCRIPTOR_UNKNOWN = 0,
     WWMI_DESCRIPTOR_SRV = 1,
     WWMI_DESCRIPTOR_UAV = 2,
@@ -45,12 +46,18 @@ typedef void (*WWMI_DescriptorCopy_v1)(uint64_t api_device, WWMI_DescriptorSpans
     WWMI_DescriptorNative_v1 native, void *native_context);
 typedef void (*WWMI_DescriptorWriteFn_v1)(uint64_t api_device, const WWMI_DescriptorWrite_v1 *write,
     WWMI_DescriptorNative_v1 native, void *native_context);
+typedef void (*WWMI_DescriptorCopyBatch_v1)(uint64_t api_device, const WWMI_DescriptorSpan_v1 *spans,
+    uint32_t span_count, uint32_t total_slots, WWMI_DescriptorNative_v1 native, void *native_context);
 typedef struct WWMI_DescriptorPublisher_v1 {
     uint32_t size, version;
     uint64_t owner;
     WWMI_DescriptorCopy_v1 copy;
     WWMI_DescriptorWriteFn_v1 write;
 } WWMI_DescriptorPublisher_v1;
+typedef struct WWMI_DescriptorPublisher_v3 {
+    WWMI_DescriptorPublisher_v1 base;
+    WWMI_DescriptorCopyBatch_v1 copy_batch;
+} WWMI_DescriptorPublisher_v3;
 // Register with callbacks != nullptr. Unregister by owner outside loader lock
 // with callbacks == nullptr; the call drains any entered native continuations.
 // Main's own native stamps are outside the device proxy. Report their exact
@@ -63,4 +70,5 @@ typedef int32_t (*WWMI_DescriptorPublish_ControlFn_v1)(uint64_t owner, const WWM
 }
 static_assert(sizeof(WWMI_DescriptorRange_v1)==40 && sizeof(WWMI_DescriptorSpan_v1)==88);
 static_assert(sizeof(WWMI_DescriptorWrite_v1)==72 && sizeof(WWMI_DescriptorPublisher_v1)==32);
+static_assert(sizeof(WWMI_DescriptorPublisher_v3)==40);
 #endif

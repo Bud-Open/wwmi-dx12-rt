@@ -121,8 +121,47 @@ public:
 };
 struct alignas(64) PreviousPage {
     FastPageMutex mutex;
+    // Writer-only page spinlock (NEVER touched by lock-free WithPublishedSlot
+    // readers). Serializes all writers targeting the same 32-slot page with a
+    // single LOCK BTS on acquire and a plain MOV 0 release store on unlock,
+    // allowing slot loops inside the page to publish with zero LOCK instructions.
+    // Global lock order: page.mutex (sorted by generation, page) -> vis_write_lock
+    // (sorted by generation, page). Never hold vis_write_lock across allocations
+    // or ContentId destruction/reclamation.
+    std::atomic<uint32_t> vis_write_lock{0};
     std::atomic<uint64_t> seq{0}; // bumped BEFORE writer unlocks; seqlock checks !has_active_writer() + seq
     std::atomic<bool> may_stamp{false};
+
+    __forceinline void lock_vis_write() noexcept {
+#if defined(_MSC_VER) && defined(_M_X64)
+        static_assert(sizeof(std::atomic<uint32_t>)==sizeof(long)&&alignof(std::atomic<uint32_t>)==alignof(long));
+        if(!_interlockedbittestandset(reinterpret_cast<volatile long*>(&vis_write_lock),0))return;
+#else
+        if(vis_write_lock.exchange(1u,std::memory_order_acquire)==0u)return;
+#endif
+        lock_vis_write_slow();
+    }
+    __declspec(noinline) void lock_vis_write_slow() noexcept {
+        for(unsigned spin=0;;++spin){
+            if(vis_write_lock.load(std::memory_order_relaxed)==0u){
+#if defined(_MSC_VER) && defined(_M_X64)
+                if(!_interlockedbittestandset(reinterpret_cast<volatile long*>(&vis_write_lock),0))return;
+#else
+                if(vis_write_lock.exchange(1u,std::memory_order_acquire)==0u)return;
+#endif
+            }
+            if(spin<64)_mm_pause();else std::this_thread::yield();
+        }
+    }
+    __forceinline void unlock_vis_write() noexcept {
+        vis_write_lock.store(0u,std::memory_order_release);
+    }
+};
+struct VisWriteGuard {
+    PreviousPage& page;
+    explicit VisWriteGuard(PreviousPage& p) noexcept : page(p) {page.lock_vis_write();}
+    ~VisWriteGuard() noexcept {page.unlock_vis_write();}
+    VisWriteGuard(const VisWriteGuard&)=delete;
 };
 uint32_t PreviousPageIndex(uint32_t slot) noexcept {return slot/previous_page_slots;}
 uint32_t PreviousPageEnd(uint32_t slot,uint32_t end) noexcept {
@@ -398,6 +437,7 @@ void DrainPreviousHeap(const PreviousHeap& h) {
     // past PreviousCurrent keeps its page set until its whole span finishes.
     for(uint32_t i=0,n=PreviousPageIndex(h.flat.size-1)+1;i<n;++i){
         std::unique_lock drained(h.pages[i].mutex);
+        VisWriteGuard vis_drained(h.pages[i]);
     }
 }
 void DrainDeferredRetiredHeaps() noexcept {
@@ -425,8 +465,21 @@ void PreviousHeapRetired(uint64_t heap) {
             dir.revision.fetch_add(1,std::memory_order_release);
         }
     }
+    if(CurrentCopyLane().copy_depth!=0){
+        if(h){
+            previous_retire_generation.fetch_add(1,std::memory_order_seq_cst);
+            // Wait for any already-admitted page-locked raw edit (Stamp/Unstamp)
+            // before returning to the native heap death watch, while deferring
+            // CopyLane drain of shadow storage until our own copy lane exits.
+            DrainPreviousHeap(*h);
+            std::lock_guard dl(deferred_retired_heaps_mutex);
+            deferred_retired_heaps.push_back(std::move(h));
+            deferred_retired_heap_count.fetch_add(1,std::memory_order_release);
+        }
+        return;
+    }
     std::vector<PreviousHeapPtr> deferred;
-    if(CurrentCopyLane().copy_depth==0&&deferred_retired_heap_count.load(std::memory_order_acquire)!=0){
+    if(deferred_retired_heap_count.load(std::memory_order_acquire)!=0){
         std::lock_guard dl(deferred_retired_heaps_mutex);
         deferred.swap(deferred_retired_heaps);
         deferred_retired_heap_count.store(0,std::memory_order_release);
@@ -463,6 +516,7 @@ void PreviousReset() {
     DrainCopyLanes(kCopyDepthMask);
     for(auto& heap:retired)DrainPreviousHeap(*heap);
     retired.clear();
+    FlushAllLaneRefCaches();
     ReclaimRetiredContentsBlocking();
     previous_epoch.store(++previous_epoch_serial,std::memory_order_release);
 }
@@ -471,15 +525,28 @@ PreviousResource PreviousFindResource(uint64_t resource) {
     const auto hash=PreviousHandleHash{}(resource);
     auto& shard=previous_resources[hash&(previous_resources.size()-1)];
     struct Memo {uint64_t resource=0,revision=0;PreviousResource value;};
-    static thread_local std::array<Memo,256> recent{};
-    auto& m=recent[hash&(recent.size()-1)];
+    struct MemoSet {Memo ways[2]{};uint8_t next_victim=0;};
+    static thread_local std::array<MemoSet,512> recent{};
+    auto& set=recent[hash&(recent.size()-1)];
     const auto revision=shard.revision.load(std::memory_order_acquire);
-    if(m.resource==resource&&m.revision==revision)return m.value;
+    if(set.ways[0].resource==resource&&set.ways[0].revision==revision){
+        set.next_victim=1;return set.ways[0].value;
+    }
+    if(set.ways[1].resource==resource&&set.ways[1].revision==revision){
+        set.next_victim=0;return set.ways[1].value;
+    }
     std::unique_lock lock(shard.mutex,std::defer_lock);PreviousLock(lock);
     const auto i=shard.resources.find(resource);
-    m={resource,shard.revision.load(std::memory_order_relaxed),
-        i==shard.resources.end()?PreviousResource{}:i->second};
-    return m.value;
+    const uint64_t locked_rev=shard.revision.load(std::memory_order_relaxed);
+    const PreviousResource val=i==shard.resources.end()?PreviousResource{}:i->second;
+    unsigned w=set.next_victim&1u;
+    if(set.ways[0].resource==resource)w=0;
+    else if(set.ways[1].resource==resource)w=1;
+    else if(set.ways[0].resource==0)w=0;
+    else if(set.ways[1].resource==0)w=1;
+    set.ways[w]={resource,locked_rev,val};
+    set.next_victim=uint8_t(w^1u);
+    return val;
 }
 void PreviousForgetResource(uint64_t res) {
     rt_cpu::Scope measured(rt_cpu::resource_life);
@@ -590,37 +657,143 @@ bool DefinitionLive(uint64_t native,const DescriptorDefinition& definition) {
     };
     return live(definition.info.res,definition.resource_generation)&&live(definition.counter,definition.counter_generation);
 }
-void StampDescriptorWrite(DescriptorSlot& target,uint64_t version,uint8_t kind) noexcept {
-    target.write=(version<<2)|kind;
-    target.frame=g_frame_id;
-    target.miss=0;
+// Writer-side slot publisher: caller MUST hold target's page vis_write_lock so
+// no concurrent writer touches this 32-slot page. Zero LOCK instructions on x64:
+// Boehm C++20 seqlock write protocol (updating bit -> release fence -> data ->
+// release store of unique monotonic new_w) pairs with WithPublishedSlot's
+// acquire loads + acquire fence. Never allocates or destroys ContentId.
+__forceinline void WriteSlotUnderPageLock(DescriptorSlot& target,const DescriptorContent* nv,
+    uint64_t version,uint8_t kind,bool& changed_out,const DescriptorContent*& cur_out) noexcept {
+    const uint64_t new_w=((version<<2)|kind)&~kSlotUpdatingBit;
+    target.write.store(new_w|kSlotUpdatingBit,std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    const auto* cur=target.content.load_relaxed();
+    if(cur!=nv){
+        target.content.store_relaxed(nv);
+        changed_out=true;
+        cur_out=cur;
+    }else{
+        changed_out=false;
+        cur_out=nullptr;
+    }
+    target.frame.store(g_frame_id,std::memory_order_relaxed);
+    target.miss.store(0,std::memory_order_relaxed);
+    target.write.store(new_w,std::memory_order_release);
 }
 void PublishContent(PreviousHeap& h,uint32_t slot,uint64_t version,ContentId content,uint8_t kind) noexcept {
     auto& page=h.page(slot);
     auto& target=h.slots[slot];
-    page.seq.fetch_add(1,std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
-    if(content&&content->definition.replacement)page.may_stamp.store(true,std::memory_order_release);
-    target.content.swap(content);
-    StampDescriptorWrite(target,version,kind);
-    page.seq.fetch_add(1,std::memory_order_release);
+    const uint64_t new_w=((version<<2)|kind)&~kSlotUpdatingBit;
+    {
+        VisWriteGuard vis_lock(page);
+        if(content&&content->definition.replacement)page.may_stamp.store(true,std::memory_order_release);
+        target.write.store(new_w|kSlotUpdatingBit,std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        target.content.swap(content);
+        target.frame.store(g_frame_id,std::memory_order_relaxed);
+        target.miss.store(0,std::memory_order_relaxed);
+        target.write.store(new_w,std::memory_order_release);
+        const uint64_t s=page.seq.load(std::memory_order_relaxed);
+        page.seq.store(s+1u,std::memory_order_release);
+    }
+    // ~ContentId() releases displaced content strictly AFTER vis_lock is released.
 }
 // Exclusive-lock-only publisher: caller holds std::unique_lock<FastPageMutex>
-// (kModeExcl), so no concurrent writer can modify page.seq. target.content.swap()
-// publishes with release and pairs with seqlock readers' acquire load_raw() and
-// subsequent acquire writer-state/seq validation; a single release store on seq
-// eliminates two LOCK INC bus locks per descriptor write.
+// (kModeExcl). VisWriteGuard still serializes against any lock-free vis copy
+// writer touching the same page, in global page.mutex -> vis_write_lock order.
 void PublishContentExclusive(PreviousHeap& h,uint32_t slot,uint64_t version,ContentId content,uint8_t kind) noexcept {
+    PublishContent(h,slot,version,std::move(content),kind);
+}
+// Per-page writer-only serialized publisher for shader-visible heaps
+// (is_vis == true): never touches page.mutex so lock-free WithPublishedSlot
+// readers never contend with writers.
+void PublishContentVisLockFree(PreviousHeap& h,uint32_t slot,uint64_t version,ContentId content,uint8_t kind) noexcept {
     auto& page=h.page(slot);
     auto& target=h.slots[slot];
-    if(content&&content->definition.replacement)page.may_stamp.store(true,std::memory_order_release);
-    target.content.swap(content);
-    StampDescriptorWrite(target,version,kind);
-    const uint64_t s=page.seq.load(std::memory_order_relaxed);
-    page.seq.store(s+1u,std::memory_order_release);
+    const uint64_t new_w=((version<<2)|kind)&~kSlotUpdatingBit;
+    {
+        VisWriteGuard vis_lock(page);
+        if(content&&content->definition.replacement)page.may_stamp.store(true,std::memory_order_release);
+        target.write.store(new_w|kSlotUpdatingBit,std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        target.content.swap(content);
+        target.frame.store(g_frame_id,std::memory_order_relaxed);
+        target.miss.store(0,std::memory_order_relaxed);
+        target.write.store(new_w,std::memory_order_release);
+    }
+    // ~ContentId() releases displaced content strictly AFTER vis_lock is released.
 }
 void PublishUnknownSlotExclusive(PreviousHeap& h,uint32_t slot,uint8_t kind) noexcept {
     PublishContentExclusive(h,slot,h.write_version(),{},kind);
+}
+
+struct SlotSnapshot {
+    ContentId content;
+    uint64_t write=0;
+    uint32_t frame=0,miss=0;
+    uint64_t version() const noexcept {return write>>2;}
+};
+template<class F>
+bool WithPublishedSlot(const PreviousHeap& h,PreviousPair pair,uint32_t slot,bool timed_wait,F&& fn) {
+    if(h.is_vis){
+        CopyLaneGuard guard;
+        if(guard.has_copy_depth()){
+            const auto& s=h.slots[slot];
+            for(unsigned spin=0;;++spin){
+                if(!PreviousCurrent(pair,h))return false;
+                const uint64_t w1=s.write.load(std::memory_order_acquire);
+                if(w1&kSlotUpdatingBit){
+                    if(spin<64)_mm_pause();else std::this_thread::yield();
+                    continue;
+                }
+                const auto* raw=s.content.load_relaxed();
+                const uint32_t f=s.frame.load(std::memory_order_relaxed);
+                const uint32_t m=s.miss.load(std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_acquire);
+                const uint64_t w2=s.write.load(std::memory_order_relaxed);
+                if(w1!=w2){
+                    if(spin<64)_mm_pause();else std::this_thread::yield();
+                    continue;
+                }
+                if(raw&&!TryRetainDescriptor(raw))continue;
+                SlotSnapshot snap{ContentId::adopt(raw),w1,f,m};
+                if(!PreviousCurrent(pair,h))return false;
+                // Keep CopyLaneGuard active across validation and projection so
+                // PreviousReset() cannot finish draining before this query ends.
+                const bool ok=fn(snap);
+                return ok&&PreviousCurrent(pair,h);
+            }
+        }
+        // Extreme fallback when all copy lanes are occupied: temporarily
+        // drain fast-lane writers so shared_lock sees a consistent slot.
+        raw_edits_pending.fetch_add(1,std::memory_order_seq_cst);
+        DrainCopyLanes(kRawFastMask);
+        struct ReleaseRaw { ~ReleaseRaw() noexcept { raw_edits_pending.fetch_sub(1,std::memory_order_release); } } rel_raw;
+        std::shared_lock lock(h.page(slot).mutex,std::defer_lock);
+        if(timed_wait)PreviousLock(lock);else lock.lock();
+        if(!PreviousCurrent(pair,h))return false;
+        const auto& s=h.slots[slot];
+        SlotSnapshot snap{s.content,s.write.load(std::memory_order_relaxed)&~kSlotUpdatingBit,
+            s.frame.load(std::memory_order_relaxed),s.miss.load(std::memory_order_relaxed)};
+        const bool ok=fn(snap);
+        return ok&&PreviousCurrent(pair,h);
+    }
+    std::shared_lock lock(h.page(slot).mutex,std::defer_lock);
+    if(timed_wait)PreviousLock(lock);else lock.lock();
+    if(!PreviousCurrent(pair,h))return false;
+    const auto& s=h.slots[slot];
+    SlotSnapshot snap{s.content,s.write.load(std::memory_order_relaxed)&~kSlotUpdatingBit,
+        s.frame.load(std::memory_order_relaxed),s.miss.load(std::memory_order_relaxed)};
+    const bool ok=fn(snap);
+    return ok&&PreviousCurrent(pair,h);
+}
+bool ReadPublishedSlot(const PreviousHeap& h,PreviousPair pair,uint32_t slot,SlotSnapshot& out,bool timed_wait=false) noexcept {
+    const bool ok=WithPublishedSlot(h,pair,slot,timed_wait,[&](SlotSnapshot& snap) noexcept {
+        out=std::move(snap);
+        return true;
+    });
+    if(!ok)out={};
+    return ok;
 }
 
 PreviousHeapPtr ReadHeap(uint64_t heap,PreviousPair pair) {
@@ -630,13 +803,22 @@ const DescriptorDefinition* OriginalDefinition(const DescriptorDefinition& conte
     if(!content.replacement_cpu)return &content;
     return content.original?&content.original->definition:nullptr;
 }
-bool ProjectDescriptorInfo(PreviousPair pair,const DescriptorSlot& slot,ResInfo& out) {
-    if(!slot.content)return false;
-    const auto& effective=slot.content->definition;
+bool ProjectDescriptorInfo(PreviousPair pair,const ContentId& content,uint64_t write,uint32_t frame,uint32_t miss,ResInfo& out) {
+    if(!content)return false;
+    const auto& effective=content->definition;
     const auto* original=OriginalDefinition(effective);
     if(!original||original->kind==WWMI_DESCRIPTOR_CBV||!original->info.res||!DefinitionLive(pair.device,*original))return false;
-    out=original->info;out.swapped=effective.replacement;out.wrote_frame=slot.frame;
-    out.wrote_src=uint8_t(slot.write&3u);out.miss_frame=slot.miss;return true;
+    out=original->info;out.swapped=effective.replacement;out.wrote_frame=frame;
+    out.wrote_src=uint8_t(write&3u);out.miss_frame=miss;return true;
+}
+bool ProjectDescriptorInfo(PreviousPair pair,const DescriptorSlot& slot,ResInfo& out) {
+    return ProjectDescriptorInfo(pair,slot.content,
+        slot.write.load(std::memory_order_relaxed)&~kSlotUpdatingBit,
+        slot.frame.load(std::memory_order_relaxed),
+        slot.miss.load(std::memory_order_relaxed),out);
+}
+bool ProjectDescriptorInfo(PreviousPair pair,const SlotSnapshot& snap,ResInfo& out) {
+    return ProjectDescriptorInfo(pair,snap.content,snap.write,snap.frame,snap.miss,out);
 }
 
 #include "descriptor_publish_copy.inc"
@@ -717,14 +899,18 @@ RtPreviousReadResult RtReadPreviousView(device* dev,uint64_t heap,uint32_t index
         if(!entry||!entry->vis.load(std::memory_order_relaxed))return RtPreviousReadResult::heap_unavailable;
         const auto h=PreviousGetHeap(PreviousToken(heap,entry),pair);
         if(!h||index>=h->flat.size)return RtPreviousReadResult::heap_unavailable;
-        auto& page=h->page(index);
-        std::shared_lock lock(page.mutex,std::defer_lock);PreviousLock(lock);
-        if(!PreviousCurrent(pair,*h))return RtPreviousReadResult::heap_unavailable;
-        if(!h->slots[index].version())return RtPreviousReadResult::uncovered;
-        const auto* v=std::get_if<RtPreviousView>(PublishedSlotType(*h,index));
-        if(!v||!PreviousViewLive(pair.device,*v))return RtPreviousReadResult::invalidated;
-        out=*v;out.heap_generation=h->generation;out.write_generation=h->slots[index].version();return RtPreviousReadResult::copied;
-    }catch(...){return RtPreviousReadResult::uncovered;}
+        RtPreviousReadResult res=RtPreviousReadResult::heap_unavailable;
+        const bool ok=WithPublishedSlot(*h,pair,index,true,[&](const SlotSnapshot& snap){
+            if(!snap.version()){res=RtPreviousReadResult::uncovered;return true;}
+            const auto* d=snap.content?&snap.content->definition:nullptr;
+            const auto* v=(d&&d->typed)?std::get_if<RtPreviousView>(&*d->typed):nullptr;
+            if(!v||!PreviousViewLive(pair.device,*v)){res=RtPreviousReadResult::invalidated;return true;}
+            out=*v;out.heap_generation=h->generation;out.write_generation=snap.version();
+            res=RtPreviousReadResult::copied;return true;
+        });
+        if(!ok){out={};return RtPreviousReadResult::heap_unavailable;}
+        return res;
+    }catch(...){out={};return RtPreviousReadResult::uncovered;}
 }
 bool RtReadCopiedPreviousView(device* dev,uint64_t heap,uint32_t index,RtPreviousView& out) noexcept {
     const auto result=RtReadPreviousView(dev,heap,index,out);
@@ -736,15 +922,17 @@ bool ReadPublishedHeapCbv(const HeapKey& key,HeapCbv& out) noexcept {
         PreviousPair pair;if(!PreviousDevice(g_reshade_device,pair,false))return false;
         const auto h=PreviousGetHeap(PreviousToken(key.heap,g_heap_to_res.entry_of(key.heap)),pair);
         if(!h||key.offset>=h->flat.size)return false;
-        auto& page=h->page(key.offset);
-        std::shared_lock lock(page.mutex,std::defer_lock);PreviousLock(lock);
-        if(!PreviousCurrent(pair,*h))return false;
-        const auto* cb=std::get_if<DescriptorCbv>(PublishedSlotType(*h,key.offset));
-        if(!cb)return false;
-        const auto life=PreviousFindResource(reinterpret_cast<uint64_t>(cb->value.res));
-        if(life.device!=pair.device||life.generation!=cb->resource_generation)return false;
-        out=cb->value;return true;
-    }catch(...){return false;}
+        const bool ok=WithPublishedSlot(*h,pair,key.offset,true,[&](const SlotSnapshot& snap){
+            const auto* d=snap.content?&snap.content->definition:nullptr;
+            const auto* cb=(d&&d->typed)?std::get_if<DescriptorCbv>(&*d->typed):nullptr;
+            if(!cb)return false;
+            const auto life=PreviousFindResource(reinterpret_cast<uint64_t>(cb->value.res));
+            if(life.device!=pair.device||life.generation!=cb->resource_generation)return false;
+            out=cb->value;return true;
+        });
+        if(!ok)out={};
+        return ok;
+    }catch(...){out={};return false;}
 }
 bool RtReadCopiedAuxView(device* dev,uint64_t heap,uint32_t index,RtAuxSource& out) noexcept {
     out={};try{
@@ -753,11 +941,13 @@ bool RtReadCopiedAuxView(device* dev,uint64_t heap,uint32_t index,RtAuxSource& o
         if(!entry||!entry->vis.load(std::memory_order_relaxed))return false;
         const auto h=PreviousGetHeap(PreviousToken(heap,entry),pair);
         if(!h||index>=h->flat.size)return false;
-        auto& page=h->page(index);
-        std::shared_lock lock(page.mutex,std::defer_lock);PreviousLock(lock);
-        if(!PreviousCurrent(pair,*h))return false;
-        const auto* v=std::get_if<RtAuxSource>(PublishedSlotType(*h,index));
-        if(!v||!AuxiliaryViewLive(pair.device,*v))return false;
-        out=*v;out.heap_generation=h->generation;out.write_generation=h->slots[index].version();return true;
-    }catch(...){return false;}
+        const bool ok=WithPublishedSlot(*h,pair,index,true,[&](const SlotSnapshot& snap){
+            const auto* d=snap.content?&snap.content->definition:nullptr;
+            const auto* v=(d&&d->typed)?std::get_if<RtAuxSource>(&*d->typed):nullptr;
+            if(!v||!AuxiliaryViewLive(pair.device,*v))return false;
+            out=*v;out.heap_generation=h->generation;out.write_generation=snap.version();return true;
+        });
+        if(!ok)out={};
+        return ok;
+    }catch(...){out={};return false;}
 }

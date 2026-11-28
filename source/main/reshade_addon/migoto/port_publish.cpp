@@ -100,6 +100,8 @@ thread_local unsigned t_call_number = 0;
 TextureDHashFn g_texture_dhash = nullptr;
 TextureDHashStateFn g_texture_dhash_state = nullptr;
 std::atomic<bool> g_filters_loaded{false};
+std::atomic<uint64_t> g_ps_tex_publish_hits{0};
+std::atomic<uint64_t> g_ps_tex_publish_rewrites{0};
 
 void TrackDHashMips(ResourceHandleInfo& info, ID3D12Resource* res, unsigned view_format)
 {
@@ -746,9 +748,13 @@ void SetPixelShaderTextures(uint64_t ini_hash, uint64_t lo, uint64_t hi, bool kn
                     }
                 }
             }
-            if (same) return;
+            if (same) {
+                g_ps_tex_publish_hits.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
         }
     }
+    g_ps_tex_publish_rewrites.fetch_add(1, std::memory_order_relaxed);
     bindings.resources.fill(ShaderResource{});
     bindings.resource_slots = ShaderSlotRange{};
     for (unsigned half = 0; half < 2; ++half) {
@@ -763,6 +769,16 @@ void SetPixelShaderTextures(uint64_t ini_hash, uint64_t lo, uint64_t hi, bool kn
         }
     }
     s_ps_masks[ini_hash] = {lo, hi};
+}
+
+void GetPixelShaderTextureStats(PixelShaderTextureStats* out)
+{
+    if (!out) return;
+    const uint64_t hits = g_ps_tex_publish_hits.load(std::memory_order_relaxed);
+    const uint64_t rewrites = g_ps_tex_publish_rewrites.load(std::memory_order_relaxed);
+    out->hits = hits;
+    out->rewrites = rewrites;
+    out->calls = hits + rewrites;
 }
 
 void NextDrawCall()

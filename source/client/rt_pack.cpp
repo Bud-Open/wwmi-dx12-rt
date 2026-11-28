@@ -175,17 +175,19 @@ PackCatalog PackSource::refresh(const PackCatalog &old) const {
     const auto mods=blob.array<WWMI_RtMod_v1>(h.mods_offset,h.mod_count);std::set<unsigned> ambiguous;
     for(const auto &m:mods)if((m.flags&WWMI_RT_MOD_ENABLED)&&!(m.flags&WWMI_RT_MOD_SKIP_ONLY))if(std::count_if(mods.begin(),mods.end(),[&](const auto &v){return (v.flags&WWMI_RT_MOD_ENABLED)&&!(v.flags&WWMI_RT_MOD_SKIP_ONLY)&&v.object_guid==m.object_guid;})>1)ambiguous.insert(m.object_guid);
     for(const auto &mod:mods){const auto name=blob.string(mod.namespace_offset,mod.namespace_bytes);std::string reason;
-        try{next.intents.push_back(read_intent(blob,h,mod));}catch(const std::exception &e){reason=e.what();}
         if(!(mod.flags&WWMI_RT_MOD_ENABLED))reason="Mod geometry disabled";
-        else if(mod.flags&WWMI_RT_MOD_SKIP_ONLY)reason="auxiliary skip-only mesh";
-        else if(ambiguous.contains(mod.object_guid))reason="native fallback: multiple enabled Mods claim this game object";
-        else if(reason.empty()){const auto native=NativeProfileRegistry::resolve(native_state,next.intents.back());
-            if(native.match==NativeProfileRegistry::Match::ambiguous)reason="native fallback: game-object native mesh signature ambiguous";
-            else if(!native.profile)reason=mod.shapekey_vertex_count?"native fallback: Mod needs final ShapeKey positions and game-object native vertex profile":"native fallback: game-object native vertex profile unavailable";
-            else{const auto retained=std::find_if(old.packs.begin(),old.packs.end(),[&](const auto &p){return p->load_generation==h.load_generation&&p->key==mod.key&&p->revision==mod.revision&&p->native==native.profile;});
-                if(retained!=old.packs.end())next.packs.push_back(*retained);
-                else try{next.packs.push_back(build_pack(blob,h,mod,native.profile,resource_));}catch(const std::exception &e){reason=e.what();}
-                if(reason.empty())reason=mod.shapekey_vertex_count?"loaded: final Mod ShapeKey position input required":(!next.packs.back()->rest_skinning_known?"loaded: final positions required for unresolved canonical bone mapping":"loaded: engine resources and evaluated draw selection");
+        else{
+            try{next.intents.push_back(read_intent(blob,h,mod));}catch(const std::exception &e){reason=e.what();}
+            if(mod.flags&WWMI_RT_MOD_SKIP_ONLY)reason="auxiliary skip-only mesh";
+            else if(ambiguous.contains(mod.object_guid))reason="native fallback: multiple enabled Mods claim this game object";
+            else if(reason.empty()){const auto native=NativeProfileRegistry::resolve(native_state,next.intents.back());
+                if(native.match==NativeProfileRegistry::Match::ambiguous)reason="native fallback: game-object native mesh signature ambiguous";
+                else if(!native.profile)reason=mod.shapekey_vertex_count?"native fallback: Mod needs final ShapeKey positions and game-object native vertex profile":"native fallback: game-object native vertex profile unavailable";
+                else{const auto retained=std::find_if(old.packs.begin(),old.packs.end(),[&](const auto &p){return p->load_generation==h.load_generation&&p->key==mod.key&&p->revision==mod.revision&&p->native==native.profile;});
+                    if(retained!=old.packs.end())next.packs.push_back(*retained);
+                    else try{next.packs.push_back(build_pack(blob,h,mod,native.profile,resource_));}catch(const std::exception &e){reason=e.what();}
+                    if(reason.empty())reason=mod.shapekey_vertex_count?"loaded: final Mod ShapeKey position input required":(!next.packs.back()->rest_skinning_known?"loaded: final positions required for unresolved canonical bone mapping":"loaded: engine resources and evaluated draw selection");
+                }
             }
         }
         next.status.push_back({mod.key,name,std::move(reason)});

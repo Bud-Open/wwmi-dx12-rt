@@ -1,15 +1,34 @@
 // The same exact native observation for every identified author draw, before the VM and geometry admission.
+extern std::atomic<uint64_t> g_layout_regmap_epoch;
 namespace {
 using RtFormatListApi=reshade::api::command_list;
 static unsigned RtReadNativePsFormats(RtFormatListApi* list,unsigned mask,std::array<RtNativeFormatView,16>& out){
     using namespace reshade::api;
-    std::array<RegBind,16> bindings{};
-    {
+    const uint64_t layh=CmdGfxLayout(list);
+    if(!layh)return 0;
+    struct CacheEntry {
+        uint64_t layout=0,epoch=0;
+        bool valid=false;
+        std::array<RegBind,16> t_ps{};
+    };
+    static thread_local std::array<CacheEntry,64> tls_cache{};
+    const uint64_t cur_epoch=g_layout_regmap_epoch.load(std::memory_order_acquire);
+    auto& slot=tls_cache[((layh>>4)^(layh>>12))&63u];
+    if(slot.layout!=layh||slot.epoch!=cur_epoch){
         std::lock_guard lock(g_layout_regmap_mtx);
-        const auto it=g_layout_regmap.find(CmdGfxLayout(list));
-        if(it==g_layout_regmap.end()||!it->second.built)return 0;
-        for(unsigned r=0;r<bindings.size();++r)if(mask&(1u<<r))bindings[r]=it->second.t_ps[r];
+        const uint64_t locked_epoch=g_layout_regmap_epoch.load(std::memory_order_relaxed);
+        const auto it=g_layout_regmap.find(layh);
+        slot.layout=layh;
+        slot.epoch=locked_epoch;
+        if(it!=g_layout_regmap.end()&&it->second.built){
+            slot.valid=true;
+            for(unsigned r=0;r<16;++r)slot.t_ps[r]=it->second.t_ps[r];
+        }else{
+            slot.valid=false;
+        }
     }
+    if(!slot.valid)return 0;
+    const auto& bindings=slot.t_ps;
     auto* dev=list->get_device();
     const auto& gfx=CmdGfx(list);
     unsigned found=0;

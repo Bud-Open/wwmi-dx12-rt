@@ -11,6 +11,8 @@
 
 std::unordered_map<uint64_t, int> g_layout_b4_root;
 std::atomic<uint64_t>             g_layout_regmap_epoch{ 1 };
+std::atomic<uint64_t>             g_layout_tables_epoch{ 1 };
+std::atomic<uint64_t>             g_layout_b2_epoch{ 1 };
 
 uint32_t LayoutParamRangeCount(const pipeline_layout_param& p)
 {
@@ -147,6 +149,7 @@ void                                     on_init_pipeline_layout(device*, uint32
         g_layout_b4_root[layout.handle] = b4;
         g_layout_b3_root[layout.handle] = b3;
         g_layout_b2_root[layout.handle] = b2;
+        g_layout_b2_epoch.fetch_add(1, std::memory_order_release);
     }
     int b0cs = FindCsCbvRoot(count, params, 0); // shapekey Loader/Multiplier read cb0 @ b0 (compute-visible)
     if (b0cs >= 0) {
@@ -232,6 +235,7 @@ void                                     on_init_pipeline_layout(device*, uint32
         if (!tbls.empty()) {
             std::lock_guard l(g_layout_tables_mtx);
             g_layout_tables[layout.handle] = std::move(tbls);
+            g_layout_tables_epoch.fetch_add(1, std::memory_order_release);
         }
     }
 
@@ -349,6 +353,7 @@ void                                     on_init_pipeline_layout(device*, uint32
                 else
                     g_layout_b3_root[layout.handle] = -1;
                 g_layout_b2_root[layout.handle] = (rb2.param != 0xFF && !rb2.is_table) ? (int)rb2.param : -1;
+                g_layout_b2_epoch.fetch_add(1, std::memory_order_release);
                 if (n < 12)
                     logger::write("B4MAP #%d layout=%llx FindVsCbvRoot=-1 but regmap b_gfx[4]=param %u "
                                   "(root descriptor) -- adopting it; b3=%d%s",
@@ -442,7 +447,8 @@ void on_destroy_pipeline_layout(device*, pipeline_layout layout)
         if (it != g_layout_b4_root.end()) g_layout_dead[layout.handle] = it->second;
         g_layout_b4_root.erase(layout.handle);
         g_layout_b3_root.erase(layout.handle);
-        g_layout_b2_root.erase(layout.handle);
+        if (g_layout_b2_root.erase(layout.handle) > 0)
+            g_layout_b2_epoch.fetch_add(1, std::memory_order_release);
         g_layout_b0cs_root.erase(layout.handle);
         g_layout_cs_cbv_roots.erase(layout.handle);
         g_layout_u0cs_root.erase(layout.handle);
@@ -450,7 +456,8 @@ void on_destroy_pipeline_layout(device*, pipeline_layout layout)
     }
     {
         std::lock_guard l(g_layout_tables_mtx);
-        g_layout_tables.erase(layout.handle);
+        if (g_layout_tables.erase(layout.handle) > 0)
+            g_layout_tables_epoch.fetch_add(1, std::memory_order_release);
     }
     {
         std::lock_guard l(g_layout_regmap_mtx);

@@ -10,7 +10,9 @@
 #include "rt_native_dispatch_receipt.h"
 #include "rt_skin_input_state.hpp"
 #include "rt_descriptor_source.h"
+#include <array>
 #include <mutex>
+#include <span>
 #include <unordered_map>
 #include <functional>
 #include <vector>
@@ -63,7 +65,17 @@ class InputCollector {
         if(discovery_.has_unforwarded_upload_copy()||std::any_of(content_.begin(),content_.end(),[](const Content &c){return !c.forwarded;}))mask|=kCopyRecActive;
         native_copy_mask_.store(mask,std::memory_order_release);
     }
-    std::shared_ptr<const std::vector<NativeMeshIntent>> discovery_interests_=std::make_shared<const std::vector<NativeMeshIntent>>();
+    struct DiscoveryInterestsSnapshot {
+        std::uint64_t generation=0;
+        std::vector<NativeMeshIntent> intents;
+    };
+    std::shared_ptr<const DiscoveryInterestsSnapshot> discovery_interests_=std::make_shared<const DiscoveryInterestsSnapshot>();
+    std::uint64_t discovery_interests_serial_=0; // protected by mutex_
+    const std::uint64_t collector_id_=next_collector_id();
+    static std::uint64_t next_collector_id()noexcept{
+        static std::atomic<std::uint64_t> seq{1};
+        return seq.fetch_add(1,std::memory_order_relaxed);
+    }
     std::vector<std::shared_ptr<const ModPack>> packs_;
     std::mutex mutex_;
     NativeShapeEvidence shape_evidence_;
@@ -73,6 +85,27 @@ class InputCollector {
 
     std::uint64_t serial_=0,order_=0;
     skin::State bindings_;
+    std::atomic<std::size_t> active_binding_lists_{0};
+    void sync_active_binding_lists_locked() noexcept {
+        active_binding_lists_.store(bindings_.lists.size(),std::memory_order_release);
+    }
+    static constexpr std::size_t kFastShaderCap=16;
+    std::atomic<std::uint64_t> shaders_seq_{0};
+    std::atomic<std::uint32_t> fast_shader_count_{0};
+    std::array<std::atomic<std::uint64_t>,kFastShaderCap> fast_shader_handles_{};
+    void sync_fast_shaders_locked() noexcept {
+        const std::uint64_t s=shaders_seq_.load(std::memory_order_relaxed);
+        shaders_seq_.store(s+1u,std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        if(shaders_.size()<=kFastShaderCap){
+            std::uint32_t n=0;
+            for(const auto &[handle,_]:shaders_)fast_shader_handles_[n++].store(handle,std::memory_order_relaxed);
+            fast_shader_count_.store(n,std::memory_order_relaxed);
+        }else{
+            fast_shader_count_.store(UINT32_MAX,std::memory_order_relaxed);
+        }
+        shaders_seq_.store(s+2u,std::memory_order_release);
+    }
     std::unordered_map<std::uint64_t,Resource> resources_;
     // One entry per applied nonzero VA. Map nodes remain stable until erase.
     // Sort by (base, object); the prefix maximum makes older covering
@@ -250,7 +283,11 @@ public:
         has_skip_intents_=std::any_of(enabled_intents.begin(),enabled_intents.end(),[](const NativeMeshIntent &i){return i.skip_only;});
         if(!has_skip_intents_){aux_skin_writers_.clear();aux_probe_targets_.clear();aux_rest_hashes_.clear();}
         arm_native_copy_mask(kCopyBeforeActive|kCopyRecActive);
-        discovery_.set_intents(enabled_intents);std::atomic_store(&discovery_interests_,std::make_shared<const std::vector<NativeMeshIntent>>(std::move(enabled_intents)));
+        discovery_.set_intents(enabled_intents);
+        auto next_interests=std::make_shared<DiscoveryInterestsSnapshot>();
+        next_interests->generation=++discovery_interests_serial_;
+        next_interests->intents=std::move(enabled_intents);
+        std::atomic_store(&discovery_interests_,std::shared_ptr<const DiscoveryInterestsSnapshot>(std::move(next_interests)));
         refresh_discovery_interest_locked();
         refresh_native_copy_mask_locked();
     }
@@ -313,6 +350,27 @@ public:
     struct PositionReceipt {Recording producer;std::uint64_t order=0;unsigned submissions=0;std::uint64_t native_queue=0;};
     PositionReceipt position_receipt(ResourceKey,std::uint64_t offset,std::uint64_t bytes);
     unsigned position_submission_count(const SkinSample &); // exact native write; UINT32_MAX = no receipt
+    struct HybridPoseCheck {
+        ResourceKey primitive{};
+        bool linked_known=false;
+        const NativeBlasIdentity *identity=nullptr;
+        bool alive=false;
+    };
+    struct HybridPreflight {
+        Recording consumer{};
+        ResourceKey primitive{};
+    };
+    // Early preflight under 1 mutex_ lock (recording + primitive_key).
+    HybridPreflight query_hybrid_preflight(api::command_list *list,std::uint64_t primitive_res,std::uint64_t primitive_origin);
+    // Post-asset/proof liveness & pose-pruning batch under 1 mutex_ lock.
+    bool query_hybrid_liveness(std::span<HybridPoseCheck> pose_checks,const NativeBlasIdentity &current_id,
+        unsigned expected_submissions,bool check_current);
+    // Batches position_receipt + position_live checks under a single mutex_
+    // acquisition for hybrid_previous_pose().
+    PositionReceipt query_hybrid_previous(
+        ResourceKey read_resource,std::uint64_t read_offset,std::uint64_t read_bytes,
+        std::span<const SkinSample *const> candidates,
+        std::span<std::uint8_t> live_out);
     const char *native_position_srv_error(std::uint64_t resource,std::uint64_t offset,std::uint64_t bytes,unsigned format,unsigned stride,ResourceKey &);
     bool previous_cb_keys(std::uint64_t view,std::uint64_t view_origin,std::uint64_t primitive,std::uint64_t primitive_origin,
         ResourceKey &view_key,ResourceKey &primitive_key);

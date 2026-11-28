@@ -13,6 +13,7 @@
 #include "dx12_context.h"
 #include "../../src/log.h"
 
+#include <array>
 #include <mutex>
 #include <atomic>
 #include <unordered_map>
@@ -157,14 +158,55 @@ std::unordered_map<const void*, Entry>& Map()
     return *m;
 }
 
+std::atomic<uint64_t> g_wrap_gen{ 1 };
+
+inline size_t WrapHash(const void* p) noexcept
+{
+    const uintptr_t v = reinterpret_cast<uintptr_t>(p);
+    return size_t(((v >> 4) ^ (v >> 12) ^ (v >> 20)) & 255u);
+}
+
 template <class T>
 T* Lookup(void* p, T* Entry::* field)
 {
     if (!p) return nullptr;
-    std::lock_guard<std::mutex> l(Mtx());
-    auto&                       m = Map();
-    auto                        it = m.find(p);
-    return (it == m.end()) ? nullptr : it->second.*field;
+    struct CacheWay {
+        const void* ptr = nullptr;
+        uint64_t    gen = 0;
+        Entry       entry{};
+    };
+    struct CacheSet {
+        CacheWay ways[2]{};
+        uint8_t  next_victim = 0;
+    };
+    static thread_local std::array<CacheSet, 256> tls_cache{};
+    const uint64_t gen = g_wrap_gen.load(std::memory_order_acquire);
+    auto&          set = tls_cache[WrapHash(p)];
+    if (set.ways[0].ptr == p && set.ways[0].gen == gen) {
+        set.next_victim = 1;
+        return set.ways[0].entry.*field;
+    }
+    if (set.ways[1].ptr == p && set.ways[1].gen == gen) {
+        set.next_victim = 0;
+        return set.ways[1].entry.*field;
+    }
+    Entry found{};
+    uint64_t locked_gen = 0;
+    {
+        std::lock_guard<std::mutex> l(Mtx());
+        locked_gen = g_wrap_gen.load(std::memory_order_relaxed);
+        auto& m = Map();
+        auto  it = m.find(p);
+        if (it != m.end()) found = it->second;
+    }
+    unsigned w = set.next_victim & 1u;
+    if (set.ways[0].ptr == p || set.ways[0].gen != locked_gen)
+        w = 0;
+    else if (set.ways[1].ptr == p || set.ways[1].gen != locked_gen)
+        w = 1;
+    set.ways[w] = { p, locked_gen, found };
+    set.next_victim = uint8_t(w ^ 1u);
+    return found.*field;
 }
 
 } // namespace
@@ -173,36 +215,42 @@ void RegisterWrap(void* iface, WrapResource* r)
 {
     std::lock_guard<std::mutex> l(Mtx());
     Map()[iface].res = r;
+    g_wrap_gen.fetch_add(1, std::memory_order_release);
 }
 
 void RegisterWrapView(void* iface, WrapView* v)
 {
     std::lock_guard<std::mutex> l(Mtx());
     Map()[iface].view = v;
+    g_wrap_gen.fetch_add(1, std::memory_order_release);
 }
 
 void RegisterShader(void* iface, ShaderCode* s)
 {
     std::lock_guard<std::mutex> l(Mtx());
     Map()[iface].shader = s;
+    g_wrap_gen.fetch_add(1, std::memory_order_release);
 }
 
 void RegisterState(void* iface, StateDesc* s)
 {
     std::lock_guard<std::mutex> l(Mtx());
     Map()[iface].state = s;
+    g_wrap_gen.fetch_add(1, std::memory_order_release);
 }
 
 void RegisterInputLayout(void* iface, InputLayoutDesc* l)
 {
     std::lock_guard<std::mutex> l2(Mtx());
     Map()[iface].layout = l;
+    g_wrap_gen.fetch_add(1, std::memory_order_release);
 }
 
 void UnregisterWrap(void* iface)
 {
     std::lock_guard<std::mutex> l(Mtx());
     Map().erase(iface);
+    g_wrap_gen.fetch_add(1, std::memory_order_release);
 }
 
 WrapResource* AsWrapResource(void* p)

@@ -139,13 +139,30 @@ template<class F> void ForEachPublishedStamp(F&& visit) {
             std::array<std::pair<uint32_t,ID3D12Resource*>,previous_page_slots> found;
             unsigned count=0;
             auto& page=h->page(first);
-            {
+            if(h->is_vis){
+                if(!PreviousCurrent(pair,*h))break;
+                if(page.may_stamp.load(std::memory_order_acquire)){
+                    bool heap_stale=false;
+                    for(uint32_t slot=first;slot<end;++slot){
+                        ID3D12Resource* repl=nullptr;
+                        const bool ok=WithPublishedSlot(*h,pair,slot,false,[&](const SlotSnapshot& snap){
+                            if(snap.content&&snap.content->definition.replacement)
+                                repl=snap.content->definition.replacement;
+                            return true;
+                        });
+                        if(!ok){heap_stale=true;break;}
+                        if(repl)found[count++]={slot,repl};
+                    }
+                    if(heap_stale||!PreviousCurrent(pair,*h))break;
+                }
+            }else{
                 std::shared_lock lock(page.mutex);
                 if(!PreviousCurrent(pair,*h))break;
-                if(page.may_stamp)for(uint32_t slot=first;slot<end;++slot)
+                if(page.may_stamp.load(std::memory_order_relaxed))for(uint32_t slot=first;slot<end;++slot)
                     if(const auto* d=PublishedDefinition(*h,slot);d&&d->replacement)found[count++]={slot,d->replacement};
             }
-            for(unsigned i=0;i<count;++i)visit(h->flat.handle,visible,found[i].first,found[i].second);
+            if(count&&!PreviousCurrent(pair,*h))break;
+            for(unsigned i=0;i<count;++i)visit(h->flat.handle,visible,found[i].first,found[i].second,pair.epoch);
             first=end;
         }
     }

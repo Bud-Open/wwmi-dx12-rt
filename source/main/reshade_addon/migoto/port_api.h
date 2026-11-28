@@ -133,6 +133,12 @@ void SetTextureDHash(TextureDHashFn fn, TextureDHashStateFn state);
 bool TextureDHashesWanted();
 bool HasLoadedFilters();
 void SetPixelShaderTextures(uint64_t ini_hash, uint64_t lo, uint64_t hi, bool known, const uint8_t* kinds = nullptr);
+struct PixelShaderTextureStats {
+    uint64_t calls = 0;
+    uint64_t rewrites = 0;
+    uint64_t hits = 0;
+};
+void GetPixelShaderTextureStats(PixelShaderTextureStats* out);
 void NextDrawCall();
 
 int PushGameTexture(char stage, unsigned slot, ID3D12Resource* res, unsigned content_hash, unsigned view_format = 0);

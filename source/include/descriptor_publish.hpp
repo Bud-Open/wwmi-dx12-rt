@@ -9,6 +9,7 @@
 namespace wwmi::descriptor_publish {
 bool enabled() noexcept;
 void observe_copy(uint64_t device,WWMI_DescriptorSpans_v1,void*,WWMI_DescriptorNative_v1,void*) noexcept;
+void observe_copy_batch(uint64_t device,const WWMI_DescriptorSpan_v1* spans,uint32_t span_count,uint32_t total_slots,WWMI_DescriptorNative_v1,void*) noexcept;
 void observe_write(uint64_t device,const WWMI_DescriptorWrite_v1&,WWMI_DescriptorNative_v1,void*) noexcept;
 void raw_after(uint64_t device,uint64_t heap,uint64_t creation,uint32_t index,uint32_t slot);
 
@@ -76,6 +77,14 @@ void copy(reshade::api::device* api,Enumerate&& spans,Forward&& forward) {
         +[](void* context,WWMI_DescriptorVisitSpan_v1 visit,void* user){
             (*static_cast<std::remove_reference_t<Enumerate>*>(context))(visit,user);
         },&spans,decltype(call)::invoke,context);
+    if(!call.called)decltype(call)::invoke(context);
+}
+
+template<class Forward>
+void copy_batch(reshade::api::device* api,const WWMI_DescriptorSpan_v1* spans,uint32_t span_count,uint32_t total_slots,Forward&& forward) {
+    CopyOnce<std::remove_reference_t<Forward>> call{forward};
+    auto* context=static_cast<CopyTimingContext*>(&call);
+    if(enabled())observe_copy_batch(reinterpret_cast<uint64_t>(api),spans,span_count,total_slots,decltype(call)::invoke,context);
     if(!call.called)decltype(call)::invoke(context);
 }
 

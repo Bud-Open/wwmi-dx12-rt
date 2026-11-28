@@ -566,8 +566,10 @@ struct Runtime {
     void refresh(){auto next=source.refresh(catalog);if(next.load_generation==catalog.load_generation&&next.revision==catalog.revision&&next.native_revision==catalog.native_revision)return;
         // A load-generation change ends the old pack lifetime. Selection
         // revisions and character switches must not discard reusable capacity.
-        if(next.load_generation!=catalog.load_generation&&!author_stream_pool.empty())
-            author_pool_release_due=true;
+        if(next.load_generation!=catalog.load_generation){
+            if(!author_stream_pool.empty())author_pool_release_due=true;
+            advance_hybrid_load(next.load_generation);
+        }
         inputs.set_catalog(next);
         auto retained=[&](const std::shared_ptr<const ModPack> &pack){return std::find(next.packs.begin(),next.packs.end(),pack)!=next.packs.end();};
         const auto before=targets.size();std::erase_if(targets,[&](const auto &v){return !retained(v.second->geometry->assets->pack);});

@@ -126,6 +126,13 @@ namespace reshade::d3d12
 		}
 
 #if RESHADE_ADDON >= 2
+		static constexpr size_t kHeapIndexStart = sizeof(SIZE_T) == 8 ? 28 : 24;
+		static constexpr SIZE_T kHeapOffsetMask = ((SIZE_T(1) << kHeapIndexStart) - 1) ^ SIZE_T(0x7);
+
+		PFORCEINLINE wwmi::rt_as::Heap *fast_descriptor_heap_at(size_t index) const noexcept
+		{
+			return index < kFastDescriptorHeapCount ? _fast_descriptor_heaps[index].load(std::memory_order_acquire) : nullptr;
+		}
 		D3D12_CPU_DESCRIPTOR_HANDLE convert_to_original_cpu_descriptor_handle(D3D12_CPU_DESCRIPTOR_HANDLE handle, wwmi::rt_as::Range *as = nullptr) const;
 		uint64_t wwmi_heap_generation(D3D12_CPU_DESCRIPTOR_HANDLE tagged) const;
 		bool wwmi_resolve_restore_heaps(const uint64_t (&tags)[2], const uint64_t (&generations)[2], uint64_t (&native)[2], wwmi::rt_as::HeapBounds *bounds = nullptr) const;

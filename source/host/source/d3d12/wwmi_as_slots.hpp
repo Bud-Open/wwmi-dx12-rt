@@ -95,6 +95,11 @@ namespace wwmi::rt_as
 				((occupied[slot >> 6].load(std::memory_order_acquire) & (uint64_t(1) << (slot & 63u))) != 0);
 		}
 
+		bool has_slot_unchecked(uint32_t slot) const noexcept
+		{
+			return (occupied[slot >> 6].load(std::memory_order_acquire) & (uint64_t(1) << (slot & 63u))) != 0;
+		}
+
 		bool has_any_in_range(uint32_t start, uint32_t count) const noexcept
 		{
 			if (!count || start >= num_descriptors)
@@ -122,6 +127,16 @@ namespace wwmi::rt_as
 		const Shard &shard_for_word(uint32_t word) const noexcept { return shards[word & kShardMask]; }
 	};
 
+	inline uint8_t compute_increment_shift(UINT inc) noexcept
+	{
+		if (inc == 0 || (inc & (inc - 1u)) != 0)
+			return 0xFFu;
+		uint8_t shift = 0;
+		while ((inc >> shift) > 1u)
+			++shift;
+		return shift;
+	}
+
 	// Owned by the existing native heap registration, not the proxy's allocation.
 	struct Heap
 	{
@@ -133,6 +148,7 @@ namespace wwmi::rt_as
 		SIZE_T cpu_start;
 		uint64_t gpu_start;
 		UINT increment;
+		uint8_t increment_shift = 0xFFu;
 		std::atomic<Slots *> sparse { nullptr };
 
 		~Heap() { delete sparse.load(std::memory_order_relaxed); }
@@ -180,6 +196,36 @@ namespace wwmi::rt_as
 			return contains(1) && heap->index >= 2;
 		}
 	};
+
+	inline D3D12_CPU_DESCRIPTOR_HANDLE decode_cpu_handle(Heap *heap, SIZE_T tagged_ptr, SIZE_T offset_mask, Range *as) noexcept
+	{
+		const SIZE_T offset = tagged_ptr & offset_mask;
+		if (as != nullptr)
+		{
+			*as = {};
+			if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && (tagged_ptr & 0x3u) == 0u)
+			{
+				const uint8_t shift = heap->increment_shift;
+				if (shift != 0xFFu)
+				{
+					const UINT inc = heap->increment;
+					if ((offset & (static_cast<SIZE_T>(inc) - 1u)) == 0u)
+					{
+						const uint64_t slot = static_cast<uint64_t>(offset) >> shift;
+						if (slot < heap->desc.NumDescriptors)
+							*as = { heap, static_cast<uint32_t>(slot) };
+					}
+				}
+				else if (heap->increment != 0 && (offset % heap->increment) == 0)
+				{
+					const uint64_t slot = static_cast<uint64_t>(offset) / heap->increment;
+					if (slot < heap->desc.NumDescriptors)
+						*as = { heap, static_cast<uint32_t>(slot) };
+				}
+			}
+		}
+		return { heap->cpu_start + offset };
+	}
 
 	inline void clear(Range dest, uint32_t count = 1)
 	{

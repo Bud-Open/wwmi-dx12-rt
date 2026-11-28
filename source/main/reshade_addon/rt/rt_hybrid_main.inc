@@ -473,10 +473,13 @@ static bool RtFinishHybridSection(StreamContext& ctx,bool complete,InjectFrame& 
     }
     if(!ctx.hybrid_asset)return reject("asset-missing");
     if(!RtHybridStreamsStillInitial(*ctx.hybrid_asset))return reject("asset-changed");
+    if(ctx.requested.size()>4096)return reject("acquire", &ctx.requested.front());
     const auto &world=ctx.surface();
-    std::vector<hybrid::Part> recipe;recipe.reserve(ctx.requested.size());
-    for(const auto& p:ctx.requested)recipe.push_back(p.hybrid);
-    hybrid::Request req{ctx.query,ctx.author.draw_ticket,ctx.hybrid_instance,&ctx.hybrid_asset->abi,recipe.data(),unsigned(recipe.size()),
+    static thread_local std::vector<hybrid::Part> s_recipe;
+    s_recipe.clear();
+    s_recipe.reserve(ctx.requested.size());
+    for(const auto& p:ctx.requested)s_recipe.push_back(p.hybrid);
+    hybrid::Request req{ctx.query,ctx.author.draw_ticket,ctx.hybrid_instance,&ctx.hybrid_asset->abi,s_recipe.data(),unsigned(s_recipe.size()),
         RtHybridBaseAllowed(),ctx.program!=nullptr,ctx.program&&ctx.program->aux>=0&&!world.aux_constant,
         ctx.program&&world.reads_previous};
     hybrid::Frame frame;
@@ -491,8 +494,16 @@ static bool RtFinishHybridSection(StreamContext& ctx,bool complete,InjectFrame& 
             return reject("previous-fallback-refused", &ctx.requested.front());
     }
     struct Material {RtMaterialTables tables;uint64_t local_cb=0;std::array<uint64_t,WWMI_RT_NH_CB_COUNT> history{};};
-    std::vector<Material> unique_materials;
-    std::vector<unsigned> part_mat_index(ctx.requested.size(),0u);
+    static thread_local std::vector<Material> s_unique_materials;
+    static thread_local std::vector<unsigned> s_part_mat_index;
+    static thread_local std::vector<unsigned> s_unique_rep;
+    struct ScratchGuard {
+        ~ScratchGuard() noexcept { s_unique_materials.clear(); }
+    } scratch_guard;
+    s_unique_materials.clear();
+    s_part_mat_index.assign(ctx.requested.size(),0u);
+    auto& unique_materials=s_unique_materials;
+    auto& part_mat_index=s_part_mat_index;
     if(ctx.program){
         RtWorldMaterialInputs shared_inputs;
         RtMaterialTables init_tables{};
@@ -508,7 +519,8 @@ static bool RtFinishHybridSection(StreamContext& ctx,bool complete,InjectFrame& 
                 if(a[k].param!=b[k].param||a[k].offset!=b[k].offset||a[k].src.ptr!=b[k].src.ptr)return false;
             return true;
         };
-        std::vector<unsigned> unique_rep;
+        s_unique_rep.clear();
+        auto& unique_rep=s_unique_rep;
         unique_materials.reserve(ctx.requested.size());
         unique_rep.reserve(ctx.requested.size());
         for(unsigned i=0;i<ctx.requested.size();++i){

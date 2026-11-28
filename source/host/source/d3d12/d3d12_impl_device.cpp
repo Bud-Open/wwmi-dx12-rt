@@ -32,14 +32,89 @@ struct GpuAddrCacheEntry {
 	D3D12_GPU_VIRTUAL_ADDRESS start = 0;
 	UINT64 width = 0;
 	ID3D12Resource *resource = nullptr;
+	uint64_t gen = 0;
 	bool is_as = false;
 };
 
 struct ThreadGpuAddrCache {
+	static constexpr size_t kPageSets = 128;
+	static constexpr size_t kMruSize = 4;
+	struct PageSet {
+		GpuAddrCacheEntry ways[2] {};
+		uint8_t next_victim = 0;
+	};
 	const reshade::d3d12::device_impl *dev = nullptr;
-	uint64_t gen = 0;
-	uint32_t next_evict = 1;
-	std::array<GpuAddrCacheEntry, 64> entries {};
+	std::array<GpuAddrCacheEntry, kMruSize> mru {};
+	std::array<PageSet, kPageSets> sets {};
+
+	static size_t page_set_index(D3D12_GPU_VIRTUAL_ADDRESS addr) noexcept
+	{
+		const uint64_t p = addr >> 16;
+		return static_cast<size_t>((p ^ (p >> 7) ^ (p >> 14)) & (kPageSets - 1));
+	}
+
+	void reset_for_device(const reshade::d3d12::device_impl *new_dev) noexcept
+	{
+		dev = new_dev;
+		for (auto &e : mru)
+			e.gen = 0;
+		for (auto &s : sets)
+		{
+			s.ways[0].gen = 0;
+			s.ways[1].gen = 0;
+			s.next_victim = 0;
+		}
+	}
+
+	void insert_page(D3D12_GPU_VIRTUAL_ADDRESS addr, const GpuAddrCacheEntry &e, uint64_t cur_gen) noexcept
+	{
+		auto &set = sets[page_set_index(addr)];
+		if (set.ways[0].gen == cur_gen && set.ways[0].start == e.start)
+		{
+			set.ways[0] = e;
+			set.next_victim = 1;
+		}
+		else if (set.ways[1].gen == cur_gen && set.ways[1].start == e.start)
+		{
+			set.ways[1] = e;
+			set.next_victim = 0;
+		}
+		else if (set.ways[0].gen != cur_gen)
+		{
+			set.ways[0] = e;
+			set.next_victim = 1;
+		}
+		else if (set.ways[1].gen != cur_gen)
+		{
+			set.ways[1] = e;
+			set.next_victim = 0;
+		}
+		else
+		{
+			const uint8_t v = set.next_victim & 1u;
+			set.ways[v] = e;
+			set.next_victim = v ^ 1u;
+		}
+	}
+
+	void insert(D3D12_GPU_VIRTUAL_ADDRESS addr, D3D12_GPU_VIRTUAL_ADDRESS start, UINT64 width,
+		ID3D12Resource *res, bool is_as, uint64_t cur_gen) noexcept
+	{
+		const GpuAddrCacheEntry e { start, width, res, cur_gen, is_as };
+		insert_page(addr, e, cur_gen);
+		size_t pos = kMruSize - 1;
+		for (size_t i = 0; i < kMruSize; ++i)
+		{
+			if ((mru[i].gen == cur_gen && mru[i].start == start) || mru[i].gen != cur_gen)
+			{
+				pos = i;
+				break;
+			}
+		}
+		for (size_t i = pos; i > 0; --i)
+			mru[i] = mru[i - 1];
+		mru[0] = e;
+	}
 };
 
 inline bool fast_slot_from_offset(uint64_t bytes, uint32_t inc, uint64_t &out_slot) noexcept
@@ -2323,13 +2398,13 @@ void reshade::d3d12::device_impl::register_resource(ID3D12Resource *resource, [[
 		if (!overlaps && it != _buffer_gpu_addresses.begin())
 		{
 			const auto prev = std::prev(it);
-			if (prev->first + std::get<UINT64>(prev->second) > start_address)
+			if (std::get<UINT64>(prev->second) > start_address - prev->first)
 				overlaps = true;
 		}
 		if (!overlaps)
 		{
 			const auto next = std::next(it);
-			if (next != _buffer_gpu_addresses.end() && start_address + desc.Width > next->first)
+			if (next != _buffer_gpu_addresses.end() && desc.Width > next->first - start_address)
 				overlaps = true;
 		}
 		if (overlaps)
@@ -2454,42 +2529,64 @@ bool reshade::d3d12::device_impl::resolve_gpu_address(D3D12_GPU_VIRTUAL_ADDRESS 
 
 	static thread_local ThreadGpuAddrCache tls_cache;
 	const uint64_t cur_gen = g_wwmi_gpu_addr_gen.load(std::memory_order_acquire);
-	if (tls_cache.dev == this && tls_cache.gen == cur_gen)
+	if (tls_cache.dev == this)
 	{
-		for (size_t i = 0; i < tls_cache.entries.size(); ++i)
+		auto &set = tls_cache.sets[ThreadGpuAddrCache::page_set_index(address)];
+		for (unsigned w = 0; w < 2; ++w)
 		{
-			const auto &e = tls_cache.entries[i];
-			const UINT64 off = address - e.start;
-			if (e.width != 0 && address >= e.start && off < e.width)
+			const auto &e = set.ways[w];
+			if (e.gen == cur_gen && e.width != 0 && address >= e.start)
 			{
-				*out_offset = off;
-				*out_resource = to_handle(e.resource);
-				if (out_acceleration_structure != nullptr)
-					*out_acceleration_structure = e.is_as;
-				if (i > 0)
-					std::swap(tls_cache.entries[i >> 1], tls_cache.entries[i]);
-				return true;
+				const UINT64 off = address - e.start;
+				if (off < e.width)
+				{
+					set.next_victim = static_cast<uint8_t>(w ^ 1u);
+					*out_offset = off;
+					*out_resource = to_handle(e.resource);
+					if (out_acceleration_structure != nullptr)
+						*out_acceleration_structure = e.is_as;
+					return true;
+				}
+			}
+		}
+		for (size_t i = 0; i < ThreadGpuAddrCache::kMruSize; ++i)
+		{
+			const auto &e = tls_cache.mru[i];
+			if (e.gen == cur_gen && e.width != 0 && address >= e.start)
+			{
+				const UINT64 off = address - e.start;
+				if (off < e.width)
+				{
+					const GpuAddrCacheEntry hit = e;
+					if (i > 0)
+					{
+						for (size_t j = i; j > 0; --j)
+							tls_cache.mru[j] = tls_cache.mru[j - 1];
+						tls_cache.mru[0] = hit;
+					}
+					tls_cache.insert_page(address, hit, cur_gen);
+					*out_offset = off;
+					*out_resource = to_handle(hit.resource);
+					if (out_acceleration_structure != nullptr)
+						*out_acceleration_structure = hit.is_as;
+					return true;
+				}
 			}
 		}
 	}
 
 	const std::shared_lock<std::shared_mutex> lock(g_wwmi_gpu_addr_mutex);
 	const uint64_t locked_gen = g_wwmi_gpu_addr_gen.load(std::memory_order_relaxed);
-	if (tls_cache.dev != this || tls_cache.gen != locked_gen)
-	{
-		tls_cache.dev = this;
-		tls_cache.gen = locked_gen;
-		tls_cache.next_evict = 1;
-		tls_cache.entries = {};
-	}
+	if (tls_cache.dev != this)
+		tls_cache.reset_for_device(this);
 
 	// Find next resource placed above this address
-	auto it = _buffer_gpu_addresses.upper_bound(address);
-	if (_buffer_gpu_addresses.empty() || it == _buffer_gpu_addresses.begin()) // There is no entry, or all entries are greater than the address
+	const auto next_it = _buffer_gpu_addresses.upper_bound(address);
+	if (_buffer_gpu_addresses.empty() || next_it == _buffer_gpu_addresses.begin()) // There is no entry, or all entries are greater than the address
 		return false;
 
 	// Go down to the resource before, which would be the one containing the address
-	--it;
+	const auto it = std::prev(next_it);
 
 	const D3D12_GPU_VIRTUAL_ADDRESS start_address = it->first;
 	const std::tuple<UINT64, ID3D12Resource *, bool> &buffer_info = it->second;
@@ -2502,13 +2599,17 @@ bool reshade::d3d12::device_impl::resolve_gpu_address(D3D12_GPU_VIRTUAL_ADDRESS 
 
 	ID3D12Resource *const res = std::get<ID3D12Resource *>(buffer_info);
 	const bool is_as = std::get<bool>(buffer_info);
-	if (width != 0)
+	// Cap the cached interval at the next registered start address so overlapping
+	// placed buffers remain strictly disjoint in the TLS cache and match upper_bound().
+	UINT64 cached_width = width;
+	if (next_it != _buffer_gpu_addresses.end())
 	{
-		const size_t slot = (tls_cache.entries[0].width == 0) ? 0 : (1 + (tls_cache.next_evict++ % (tls_cache.entries.size() - 1)));
-		tls_cache.entries[slot] = { start_address, width, res, is_as };
-		if (slot > 0)
-			std::swap(tls_cache.entries[0], tls_cache.entries[slot]);
+		const UINT64 gap = next_it->first - start_address;
+		if (gap < cached_width)
+			cached_width = gap;
 	}
+	if (cached_width != 0)
+		tls_cache.insert(address, start_address, cached_width, res, is_as, locked_gen);
 
 	*out_offset = address_offset;
 	*out_resource = to_handle(res);
@@ -2525,9 +2626,11 @@ wwmi::rt_as::Heap *reshade::d3d12::device_impl::register_descriptor_heap(D3D12De
 	const std::unique_lock<std::shared_mutex> lock(_heap_gpu_ranges_mutex);
 	const size_t index = _descriptor_heap_count.load(std::memory_order_relaxed);
 	heap->initialize_descriptor_base_handle(index);
+	const UINT inc = _descriptor_handle_size[desc.Type];
 	const auto registration = new wwmi::rt_as::Heap {
 		heap, heap->_orig, index, creation.fetch_add(1, std::memory_order_relaxed) + 1, desc,
-		heap->_orig_base_cpu_handle.ptr, heap->_orig_base_gpu_handle.ptr, _descriptor_handle_size[desc.Type]
+		heap->_orig_base_cpu_handle.ptr, heap->_orig_base_gpu_handle.ptr, inc,
+		wwmi::rt_as::compute_increment_shift(inc)
 	};
 	if (index < kFastDescriptorHeapCount)
 		_fast_descriptor_heaps[index].store(registration, std::memory_order_release);
@@ -2754,18 +2857,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE reshade::d3d12::device_impl::convert_to_original_cpu
 	const size_t heap_index = (handle.ptr >> heap_index_start) & 0xFFFFFFF;
 	const auto heap = descriptor_heap_at(heap_index);
 	assert(heap != nullptr);
-	const SIZE_T offset = handle.ptr & (((1ull << heap_index_start) - 1) ^ 0x7);
-	if (as != nullptr)
-	{
-		*as = {};
-		if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && (handle.ptr & 0x3) == heap->desc.Type)
-		{
-			uint64_t slot = 0;
-			if (fast_slot_from_offset(offset, heap->increment, slot) && slot < heap->desc.NumDescriptors)
-				*as = { heap, static_cast<uint32_t>(slot) };
-		}
-	}
-	return { heap->cpu_start + offset };
+	return wwmi::rt_as::decode_cpu_handle(heap, handle.ptr, (((1ull << heap_index_start) - 1) ^ 0x7), as);
 }
 #endif
 

@@ -126,15 +126,27 @@ void OnNativeDescriptorWrite(uint64_t api,const WWMI_DescriptorWrite_v1* packet,
                                     content=CaptureNativeView(dev,*packet,pair);
                                     if(content)written=content->definition.info;
                                 }
-                                std::unique_lock lock(cached->page(r.slot).mutex,std::defer_lock);
-                                PreviousLock(lock);
-                                if(PreviousCurrent(pair,*cached)){
-                                    rt_cpu::Scope apply(rt_cpu::previous_aux);
-                                    PublishContentExclusive(*cached,r.slot,cached->write_version(),std::move(content),3);
+                                if(cached->is_vis){
+                                    if(PreviousCurrent(pair,*cached)){
+                                        rt_cpu::Scope apply(rt_cpu::previous_aux);
+                                        PublishContentVisLockFree(*cached,r.slot,cached->write_version(),std::move(content),3);
+                                    }
+                                }else{
+                                    std::unique_lock lock(cached->page(r.slot).mutex,std::defer_lock);
+                                    PreviousLock(lock);
+                                    if(PreviousCurrent(pair,*cached)){
+                                        rt_cpu::Scope apply(rt_cpu::previous_aux);
+                                        PublishContentExclusive(*cached,r.slot,cached->write_version(),std::move(content),3);
+                                    }
                                 }
                             }catch(...){
-                                std::unique_lock lock(cached->page(r.slot).mutex);
-                                if(PreviousCurrent(pair,*cached))PublishUnknownSlotExclusive(*cached,r.slot,3);
+                                if(cached->is_vis){
+                                    if(PreviousCurrent(pair,*cached))
+                                        PublishContentVisLockFree(*cached,r.slot,cached->write_version(),{},3);
+                                }else{
+                                    std::unique_lock lock(cached->page(r.slot).mutex);
+                                    if(PreviousCurrent(pair,*cached))PublishUnknownSlotExclusive(*cached,r.slot,3);
+                                }
                                 fast_ok=false;
                             }
                         }
@@ -234,9 +246,15 @@ bool InstallDescriptorPublisher(HMODULE host) {
         GetProcAddress(host,"WWMI_DescriptorPublish_Control_v1")):nullptr;
     if(!control)return false;
     const auto owner=reinterpret_cast<uint64_t>(&descriptor_owner);
-    const WWMI_DescriptorPublisher_v1 sink{sizeof(sink),WWMI_DESCRIPTOR_CONTENT_VERSION,owner,OnNativeDescriptorCopy,OnNativeDescriptorWrite};
+    const WWMI_DescriptorPublisher_v3 sink_v3{
+        {sizeof(sink_v3),WWMI_DESCRIPTOR_BATCH_VERSION,owner,OnNativeDescriptorCopy,OnNativeDescriptorWrite},
+        OnNativeDescriptorCopyBatch
+    };
     WWMI_DescriptorRawAfter_v1 after=nullptr;
-    if(control(owner,&sink,&after)!=0)return false;
+    if(control(owner,&sink_v3.base,&after)!=0){
+        const WWMI_DescriptorPublisher_v1 sink_v2{sizeof(sink_v2),WWMI_DESCRIPTOR_CONTENT_VERSION,owner,OnNativeDescriptorCopy,OnNativeDescriptorWrite};
+        if(control(owner,&sink_v2,&after)!=0)return false;
+    }
     descriptor_raw_after.store(after,std::memory_order_release);
     descriptor_control=control;
     g_heap_to_res.retire_hook.store(PreviousHeapRetired,std::memory_order_release);
@@ -248,5 +266,6 @@ void StopDescriptorPublisher() {
         descriptor_control(reinterpret_cast<uint64_t>(&descriptor_owner),nullptr,nullptr);
         descriptor_control=nullptr;
     }
+    FlushAllLaneRefCaches();
     ReclaimRetiredContentsBlocking();
 }

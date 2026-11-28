@@ -8,6 +8,7 @@
 #include "tex_dhash.h"
 #include "tex_dhash_table.h"
 #include "wwmi_upload_footprint.h"
+#include "tex_upload_layout.hpp"
 #include "wwmi_post_execute.h"
 #include "tex_readback_policy.hpp"
 #include "tex_live_sig_retention.hpp"
@@ -137,8 +138,8 @@ public:
     bool Schedule(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
         ID3D12Resource* dst, const D3D12_RESOURCE_DESC& sd);
     bool ScheduleUpload(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
-        uint64_t src_off, uint64_t bytes, ID3D12Resource* dst, const D3D12_RESOURCE_DESC& dd, uint32_t sub,
-        const uint32_t* cpu_crc);
+        uint64_t src_off, uint64_t bytes, size_t row_pitch, ID3D12Resource* dst, const D3D12_RESOURCE_DESC& dd,
+        uint32_t sub, const uint32_t* cpu_crc);
     void OnExecute(command_queue* queue, command_list* list);
     void OnPostExecute(ID3D12CommandQueue* native_queue, const uint64_t* api_lists, uint32_t list_count);
     void Drain();
@@ -176,7 +177,7 @@ private:
         bool                   once = false;      // one-shot texture-to-texture readback (tracked in tried_)
         bool                   submitted = false; // confirmed returned from _orig->ExecuteCommandLists
         uint32_t               off = 0;
-        uint32_t               rowPitch = 0;
+        size_t                 rowPitch = 0;
         uint32_t               sub = 0;         // an upload's mip
         bool                   compare = false; // D16: cpu_crc is the processor's read of the same upload
         uint32_t               cpu_crc = 0;
@@ -1247,29 +1248,15 @@ void TexMipIdentityForget(uint64_t res)
     }
     g_tex_readback.Forget(reinterpret_cast<ID3D12Resource*>(res));
 }
-struct TexAssetLayout {
-    uint32_t w = 0;
-    uint32_t h = 0;
-    uint32_t rows = 0;
-    uint32_t tight_row = 0;
-    uint32_t pitch = 0;
-    bool     floor = false;
-};
+using TexAssetLayout = wwmi_tex_upload::UploadMipLayout;
 static bool TexAssetLayoutOf(const D3D12_RESOURCE_DESC& d, uint32_t mip, TexAssetLayout& o)
 {
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || mip >= d.MipLevels) return false;
     if (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return false;
-    const uint32_t fmt = (uint32_t)d.Format;
-    const uint32_t bb = DxgiBcBlockBytes(fmt);
-    const uint32_t bpp = bb ? 0 : DxgiPlainBytesPerPixel(fmt);
-    if (!bb && !bpp) return false;
-    o.w = std::max<uint32_t>(1u, (uint32_t)d.Width >> mip);
-    o.h = std::max<uint32_t>(1u, d.Height >> mip);
-    o.rows = bb ? (o.h + 3) / 4 : o.h;
-    o.tight_row = bb ? ((o.w + 3) / 4) * bb : o.w * bpp;
-    o.pitch = (o.tight_row + 255u) & ~255u;
-    o.floor = (uint64_t)o.w * o.h >= kTexHashFloorPx;
-    return true;
+    if (d.Width > UINT32_MAX) return false;
+    return wwmi_tex_upload::ComputeMipLayout(
+        static_cast<uint32_t>(d.Width), d.Height, d.MipLevels, mip, static_cast<uint32_t>(d.Format),
+        kTexHashFloorPx, o);
 }
 // Streaming resident mip-tail cutout mask candidate (e.g. 64x64 m7 or 128x128 m8 BC1/BC3/BC7).
 // Excludes single-mip UI icons/LUTs via MipLevels >= 7; only hashed/stored if CheckCutoutMask confirms it.
@@ -1379,7 +1366,7 @@ static void DumpIfDegenerate(uint32_t hash, const std::vector<uint8_t>& tight, c
 }
 
 static void TexMipIdentityFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOURCE_DESC& d, uint64_t expected_gen,
-    uint32_t sub, const uint8_t* src)
+    uint32_t sub, const uint8_t* src, size_t src_row_pitch = 0)
 {
     if (!dest || !src || sub == 0 || !g_texovr_ready || !g_texlod_cache) return;
     const uint64_t destKey = reinterpret_cast<uint64_t>(dest);
@@ -1389,7 +1376,9 @@ static void TexMipIdentityFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOU
     const uint32_t             fmt = (uint32_t)d.Format;
     const uint32_t             w = L.w;
     const uint32_t             h = L.h;
-    const std::vector<uint8_t> tight = TightFromUpload(src, L.pitch, L);
+    src_row_pitch = wwmi_tex_upload::ResolveEffectiveRowPitch(src_row_pitch, L);
+    if (!src_row_pitch) return;
+    const std::vector<uint8_t> tight = TightFromUpload(src, src_row_pitch, L);
     uint32_t                   data_hash;
     {
         PROF(PROF_CB_Crc);
@@ -1443,10 +1432,10 @@ static void TexMipIdentityFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOU
     DumpIfDegenerate(id, tight, L, fmt, sub, rule ? rule : h0);
 }
 
-void TexMipIdentityFromUpload(ID3D12Resource* dest, uint32_t sub, const uint8_t* src)
+void TexMipIdentityFromUpload(ID3D12Resource* dest, uint32_t sub, const uint8_t* src, size_t src_row_pitch)
 {
     if (!dest || !src || sub == 0 || !g_texovr_ready || !g_texlod_cache) return;
-    TexMipIdentityFromUploadDesc(dest, dest->GetDesc(), 0, sub, src);
+    TexMipIdentityFromUploadDesc(dest, dest->GetDesc(), 0, sub, src, src_row_pitch);
 }
 
 TexLodWorker g_tex_lod_worker;
@@ -1557,8 +1546,8 @@ static void TexHashFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOURCE_DES
     const uint32_t w = L.w;
     const uint32_t h = L.h;
     const uint32_t fmt = (uint32_t)d.Format;
-    if (src_row_pitch == 0) src_row_pitch = L.pitch; // DX12 copy: 256-aligned rows
-    if (src_row_pitch < L.tight_row) src_row_pitch = L.tight_row;
+    src_row_pitch = wwmi_tex_upload::ResolveEffectiveRowPitch(src_row_pitch, L); // DX12 copy: 256-aligned rows
+    if (!src_row_pitch) return;
     std::vector<uint8_t> tight = TightFromUpload(src, src_row_pitch, L);
     uint32_t             data_hash;
     {
@@ -2135,6 +2124,7 @@ void TexReadbackUnregisterPostExecute()
 
 bool TexReadback::Reserve(ID3D12Device* dev, uint64_t total, bool once, Pending& p, ComPtr<ID3D12Resource>& buf)
 {
+    if (!total || total > (1ull << 34)) return false;
     const auto      t_wait = std::chrono::steady_clock::now();
     std::lock_guard l(mtx_);
     {
@@ -2231,13 +2221,14 @@ bool TexReadback::Schedule(ID3D12Device* dev, command_list* list, ID3D12Graphics
 }
 
 bool TexReadback::ScheduleUpload(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
-    uint64_t src_off, uint64_t bytes, ID3D12Resource* dst, const D3D12_RESOURCE_DESC& dd, uint32_t sub,
-    const uint32_t* cpu_crc)
+    uint64_t src_off, uint64_t bytes, size_t row_pitch, ID3D12Resource* dst, const D3D12_RESOURCE_DESC& dd,
+    uint32_t sub, const uint32_t* cpu_crc)
 {
     Pending p;
     p.dst = dst;
     p.dst_desc = dd;
     p.dst_gen = TexResGenAcquire(reinterpret_cast<uint64_t>(dst));
+    p.rowPitch = row_pitch;
     p.sub = sub;
     p.list = list;
     p.gen = CmdGen(list);
@@ -2257,17 +2248,20 @@ void TexReadback::Arrived(const Pending& p, const uint8_t* data)
     if (p.compare) {
         TexAssetLayout L;
         if (TexAssetLayoutOf(p.dst_desc, p.sub, L)) {
-            const std::vector<uint8_t> tight = TightFromUpload(data, L.pitch, L);
-            const uint32_t             gpu_crc = PortApi::Crc32c(0, tight.data(), tight.size());
-            (gpu_crc == p.cpu_crc ? g_ts_up_same : g_ts_up_diff).fetch_add(1, std::memory_order_relaxed);
-            static std::atomic<int> n{ 0 };
-            if (gpu_crc != p.cpu_crc && n.fetch_add(1) < 20)
-                logger::write("TEXUP-DIFF res=%p mip %u %ux%u: the GPU copy hashes %08x, the processor's read %08x",
-                    (void*)p.dst, p.sub, L.w, L.h, gpu_crc, p.cpu_crc);
+            const size_t pitch = wwmi_tex_upload::ResolveEffectiveRowPitch(p.rowPitch, L);
+            if (pitch) {
+                const std::vector<uint8_t> tight = TightFromUpload(data, pitch, L);
+                const uint32_t             gpu_crc = PortApi::Crc32c(0, tight.data(), tight.size());
+                (gpu_crc == p.cpu_crc ? g_ts_up_same : g_ts_up_diff).fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<int> n{ 0 };
+                if (gpu_crc != p.cpu_crc && n.fetch_add(1) < 20)
+                    logger::write("TEXUP-DIFF res=%p mip %u %ux%u: the GPU copy hashes %08x, the processor's read %08x",
+                        (void*)p.dst, p.sub, L.w, L.h, gpu_crc, p.cpu_crc);
+            }
         }
     }
     if (p.sub)
-        TexMipIdentityFromUploadDesc(p.dst, p.dst_desc, p.dst_gen, p.sub, data);
+        TexMipIdentityFromUploadDesc(p.dst, p.dst_desc, p.dst_gen, p.sub, data, p.rowPitch);
     else
         TexHashFromUploadDesc(p.dst, p.dst_desc, p.dst_gen, data, p.rowPitch);
 }
@@ -2561,8 +2555,9 @@ static bool UploadReadSlow(const uint8_t* p, uint64_t span)
     return true;
 }
 
-static bool HashUploadOnGpu(command_list* cl, ID3D12Resource* src, uint64_t off, uint64_t span, ID3D12Resource* dst,
-    const D3D12_RESOURCE_DESC& dd, uint32_t sub, const uint8_t* compare_from, const TexAssetLayout& L)
+static bool HashUploadOnGpu(command_list* cl, ID3D12Resource* src, uint64_t off, uint64_t span, uint64_t row_pitch,
+    ID3D12Resource* dst, const D3D12_RESOURCE_DESC& dd, uint32_t sub, const uint8_t* compare_from,
+    const TexAssetLayout& L)
 {
     if (sub && (!g_texovr_ready || !g_texlod_cache)) return true;
     auto* dev = reinterpret_cast<ID3D12Device*>(cl->get_device()->get_native());
@@ -2570,10 +2565,12 @@ static bool HashUploadOnGpu(command_list* cl, ID3D12Resource* src, uint64_t off,
     if (!dev || !d3dcl) return false;
     uint32_t cpu_crc = 0;
     if (compare_from) {
-        const std::vector<uint8_t> tight = TightFromUpload(compare_from, L.pitch, L);
+        const std::vector<uint8_t> tight = TightFromUpload(compare_from, static_cast<size_t>(row_pitch), L);
         cpu_crc = PortApi::Crc32c(0, tight.data(), tight.size());
     }
-    if (!g_tex_readback.ScheduleUpload(dev, cl, d3dcl, src, off, span, dst, dd, sub, compare_from ? &cpu_crc : nullptr)) return false;
+    if (!g_tex_readback.ScheduleUpload(dev, cl, d3dcl, src, off, span, static_cast<size_t>(row_pitch), dst, dd, sub,
+            compare_from ? &cpu_crc : nullptr))
+        return false;
     RemovalPin::Ours(d3dcl, "tex-upload-readback");
     g_ts_up_gpu.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -2588,39 +2585,79 @@ bool on_copy_buffer_to_texture(command_list* cl, resource source, uint64_t sourc
     auto*               dst = reinterpret_cast<ID3D12Resource*>(dest.handle);
     auto*               srcRes = reinterpret_cast<ID3D12Resource*>(source.handle);
     D3D12_RESOURCE_DESC dd = dst->GetDesc();
-    if (FullDHashMip(dd, dest_subresource, dst_box)) {
-        TexDHashTable::UploadFootprint fp{};
-        const TexDHashTable::UploadFootprint* fp_ptr = nullptr;
-        if (auto fn = ResolveUploadFootprintFn()) {
-            WWMI_D3D12UploadFootprint_v1 raw{};
-            if (fn(reinterpret_cast<uint64_t>(cl), source.handle, dest.handle, dest_subresource, &raw, sizeof(raw))) {
-                fp.row_pitch = raw.row_pitch;
-                fp.footprint_height = raw.footprint_height;
-                fp.src_left = raw.src_left;
-                fp.src_top = raw.src_top;
-                fp.src_front = raw.src_front;
-                fp.has_src_box = raw.has_src_box != 0;
-                fp_ptr = &fp;
-            }
-        }
-        g_tex_dhash.FromUpload(srcRes, source_offset, dst, dest_subresource, fp_ptr);
-    } else
-        g_tex_dhash.Unknown(dest.handle, dest_subresource);
-    TexAssetLayout      L;
-    if (!TexAssetLayoutOf(dd, dest_subresource, L) || (!L.floor && !IsCutoutResidentTailMip(dd, L, dest_subresource))) return false;
-    // a partial upload (an atlas region) is not the texture, and its source holds only the region
-    if (dst_box && (dst_box->left || dst_box->top || dst_box->right != L.w || dst_box->bottom != L.h)) return false;
 
-    if (dest_subresource != 0 && !g_mip_exact) return false;
+    const bool     full_dhash_mip = FullDHashMip(dd, dest_subresource, dst_box);
+    TexAssetLayout L;
+    uint32_t       legacy_copy_w = 0;
+    uint32_t       legacy_copy_h = 0;
+    wwmi_tex_upload::DstCopyBox legacy_box{};
+    const wwmi_tex_upload::DstCopyBox* legacy_box_ptr = nullptr;
+    if (dst_box) {
+        legacy_box.left = dst_box->left;
+        legacy_box.top = dst_box->top;
+        legacy_box.front = dst_box->front;
+        legacy_box.right = dst_box->right;
+        legacy_box.bottom = dst_box->bottom;
+        legacy_box.back = dst_box->back;
+        legacy_box_ptr = &legacy_box;
+    }
+    // a partial upload (an atlas region) is not the texture, and its source holds only the region
+    const bool     legacy_eligible =
+        TexAssetLayoutOf(dd, dest_subresource, L) &&
+        (L.floor || IsCutoutResidentTailMip(dd, L, dest_subresource)) &&
+        wwmi_tex_upload::LegacyDstBoxCoversFullMip(L, legacy_box_ptr, legacy_copy_w, legacy_copy_h) &&
+        (dest_subresource == 0 || g_mip_exact);
+
+    WWMI_D3D12UploadFootprint_v1 host_fp_raw{};
+    bool                         has_host_fp = false;
+    if (full_dhash_mip || legacy_eligible) {
+        if (auto fn = ResolveUploadFootprintFn()) {
+            has_host_fp = fn(reinterpret_cast<uint64_t>(cl), source.handle, dest.handle, dest_subresource,
+                &host_fp_raw, sizeof(host_fp_raw)) != 0;
+        }
+    }
+
+    if (full_dhash_mip) {
+        if (has_host_fp) {
+            if (host_fp_raw.struct_size == sizeof(host_fp_raw) && host_fp_raw.abi_version == 1u &&
+                host_fp_raw.row_pitch != 0u) {
+                TexDHashTable::UploadFootprint fp{};
+                fp.row_pitch = host_fp_raw.row_pitch;
+                fp.footprint_height = host_fp_raw.footprint_height;
+                fp.src_left = host_fp_raw.src_left;
+                fp.src_top = host_fp_raw.src_top;
+                fp.src_front = host_fp_raw.src_front;
+                fp.has_src_box = host_fp_raw.has_src_box != 0;
+                g_tex_dhash.FromUpload(srcRes, source_offset, dst, dest_subresource, &fp);
+            } else {
+                g_tex_dhash.Unknown(dest.handle, dest_subresource);
+            }
+        } else {
+            g_tex_dhash.FromUpload(srcRes, source_offset, dst, dest_subresource, nullptr);
+        }
+    } else {
+        g_tex_dhash.Unknown(dest.handle, dest_subresource);
+    }
+
+    if (!legacy_eligible) return false;
+
     D3D12_HEAP_PROPERTIES hp = {};
     D3D12_HEAP_FLAGS      hf = {};
-    srcRes->GetHeapProperties(&hp, &hf);
-    if (hp.Type != D3D12_HEAP_TYPE_UPLOAD) {
+    if (FAILED(srcRes->GetHeapProperties(&hp, &hf)) || hp.Type != D3D12_HEAP_TYPE_UPLOAD) {
         DiagTexPath("buf2tex(non-upload)", dst, srcRes, dest_subresource);
         return false;
     }
-    // every row the hasher reads must lie inside the upload buffer (the placed footprint's pitch is assumed)
-    if (source_offset + (uint64_t)L.pitch * (L.rows - 1) + L.tight_row > srcRes->GetDesc().Width) return false;
+    const D3D12_RESOURCE_DESC src_desc = srcRes->GetDesc();
+    if (src_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return false;
+
+    // Validate host footprint when present (never falling back on invalid metadata);
+    // infer canonical 256-aligned pitch only when host metadata is absent.
+    wwmi_tex_upload::ResolvedUploadLayout resolved{};
+    if (!wwmi_tex_upload::ResolveUploadLayout(
+            L, source_offset, src_desc.Width, has_host_fp ? &host_fp_raw : nullptr, resolved,
+            legacy_copy_w, legacy_copy_h))
+        return false;
+
     if (dest_subresource != 0) {
         // Only a target's mips are worth a map: a known mip0 that is no rule hash and no alias is nothing.
         // Exception: on UHD (-krqlv=uhd), a character texture's mip0 can be 1-2 mips larger than the
@@ -2632,10 +2669,12 @@ bool on_copy_buffer_to_texture(command_list* cl, resource source, uint64_t sourc
             (dest_subresource == 1 || (dest_subresource == 2 && dd.Width >= 2048 && dd.Height >= 2048));
         if (h0 && !TexRuleHashFor(h0) && !TexCrawlOn() && !maybe_uhd_sub) return false;
     }
-    const uint64_t         span = (uint64_t)L.pitch * (L.rows - 1) + L.tight_row;
+    const uint64_t         base_off = resolved.base_offset;
+    const uint64_t         pitch = resolved.row_pitch;
+    const uint64_t         span = resolved.span_bytes;
     std::atomic<uint32_t>& arrivals = dest_subresource == 0 ? g_ts_buf_mip0 : g_ts_buf_mipk;
     if (!g_tex_upload_gpu && g_up_gpu.load(std::memory_order_relaxed) &&
-        HashUploadOnGpu(cl, srcRes, source_offset, span, dst, dd, dest_subresource, nullptr, L)) {
+        HashUploadOnGpu(cl, srcRes, base_off, span, pitch, dst, dd, dest_subresource, nullptr, L)) {
         arrivals.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -2647,16 +2686,17 @@ bool on_copy_buffer_to_texture(command_list* cl, resource source, uint64_t sourc
     }
     if (SUCCEEDED(map_hr) && ptr) {
         arrivals.fetch_add(1, std::memory_order_relaxed);
-        const uint8_t* up = (const uint8_t*)ptr + source_offset;
+        const uint8_t* up = (const uint8_t*)ptr + base_off;
         const bool     gpu = g_tex_upload_gpu || UploadReadSlow(up, span);
-        if (!gpu || !HashUploadOnGpu(cl, srcRes, source_offset, span, dst, dd, dest_subresource, g_tex_upload_gpu ? up : nullptr, L)) {
+        if (!gpu || !HashUploadOnGpu(cl, srcRes, base_off, span, pitch, dst, dd, dest_subresource, g_tex_upload_gpu ? up : nullptr, L)) {
             if (dest_subresource == 0)
-                TexHashFromUpload(dst, up, 0 /*256-aligned*/);
+                TexHashFromUpload(dst, up, static_cast<size_t>(pitch));
             else
-                TexMipIdentityFromUpload(dst, dest_subresource, up);
+                TexMipIdentityFromUpload(dst, dest_subresource, up, static_cast<size_t>(pitch));
         }
         PROF(PROF_CB_Map);
-        srcRes->Unmap(0, nullptr);
+        const D3D12_RANGE no_writes{ 0, 0 };
+        srcRes->Unmap(0, &no_writes);
     }
     return false;
 }

@@ -20,6 +20,7 @@
 #include <memory_resource>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <type_traits>
 #include <variant>
 #include <utility>
@@ -346,7 +347,7 @@ bool UnstampResource(uint64_t resH, bool log)
 std::vector<std::pair<HeapKey, uint64_t>> StampedCpuOnlySlots()
 {
     std::vector<std::pair<HeapKey, uint64_t>> out;
-    ForEachPublishedStamp([&](uint64_t h,bool vis,uint32_t o,ID3D12Resource*) {
+    ForEachPublishedStamp([&](uint64_t h,bool vis,uint32_t o,ID3D12Resource*,uint64_t) {
         ResInfo ri;
         if (!vis && ReadPublishedDescriptor({ h, o }, ri)) out.push_back({ HeapKey{ h, o }, reinterpret_cast<uint64_t>(ri.res) });
     });
@@ -420,13 +421,13 @@ StampTally MoveStamps(const std::unordered_map<ID3D12Resource*, StampMove>& move
     StampTally t;
     if (!g_d3d12_device || moves.empty()) return t;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    ForEachPublishedStamp([&](uint64_t heap,bool vis,uint32_t slot,ID3D12Resource* was) {
+    ForEachPublishedStamp([&](uint64_t heap,bool vis,uint32_t slot,ID3D12Resource* was,uint64_t expected_epoch) {
         const auto it=moves.find(was);
         if(it==moves.end())return;
         try{
             PreviousPair pair;
             auto h=RawDestination({heap,slot},pair);
-            if(!h){++t.raced;return;}
+            if(!h||pair.epoch!=expected_epoch){++t.raced;return;}
             RawDescriptorAdmission admission(HeapCpu(*h,slot).ptr,it->second.to_srv.ptr);
             if(!admission){++t.raced;return;}
             std::unique_lock lock(h->page(slot).mutex);
@@ -541,7 +542,7 @@ StampTally UnstampDying(const std::unordered_set<ID3D12Resource*>& dying)
     if(!g_d3d12_device||dying.empty())return t;
     std::vector<std::pair<HeapKey,ID3D12Resource*>> found;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    ForEachPublishedStamp([&](uint64_t heap,bool,uint32_t slot,ID3D12Resource* was) {
+    ForEachPublishedStamp([&](uint64_t heap,bool,uint32_t slot,ID3D12Resource* was,uint64_t) {
         if(was&&dying.count(was))found.push_back({{heap,slot},was});
     });
     for(const auto& [key,was]:found)GiveBack(key,was,t);

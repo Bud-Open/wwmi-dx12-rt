@@ -12,42 +12,141 @@ std::atomic<WWMI_DescriptorRawAfter_v1> descriptor_raw_after{nullptr};
 
 // Per-thread private reader lanes for asymmetric fast admission and
 // epoch-safe raw-heap / seqlock descriptor reads during OnNativeDescriptorCopy.
-// Low 32 bits: copy_depth (protects TLS PreviousHeap* & seqlock DescriptorContent*).
-// High 32 bits: raw_fast (fast-path exclusion against RawDescriptorAdmission).
-constexpr unsigned copy_lane_count=128;
+// Bits 0..31:  copy_depth (protects TLS PreviousHeap*, seqlock DescriptorContent*,
+//              and lock-free shader-visible slot reads/writes).
+// Bits 32..62: raw_fast (fast-path exclusion against RawDescriptorAdmission).
+// Bit 63:      cache_drain (exclusive drain lock for per-lane refcount credit cache).
+constexpr unsigned copy_lane_count=256;
 constexpr uint64_t kCopyDepthInc=1ull;
 constexpr uint64_t kRawFastInc=1ull<<32;
 constexpr uint64_t kCopyDepthMask=0xFFFFFFFFull;
-constexpr uint64_t kRawFastMask=0xFFFFFFFF00000000ull;
+constexpr uint64_t kRawFastMask=0x7FFFFFFF00000000ull;
+constexpr uint64_t kCacheDrainBit=uint64_t{1}<<63;
+constexpr uint8_t kLaneFree=0;
+constexpr uint8_t kLaneActive=1;
+constexpr uint8_t kLaneAbandoned=2;
+
+struct LaneRefCache;
+void FlushLaneRefCache(LaneRefCache* cache) noexcept;
 
 struct alignas(64) CopyLane {
     std::atomic<uint64_t> state{0};
-    std::atomic<bool> claimed{false};
+    std::atomic<uint8_t> owner_state{kLaneFree};
+    std::atomic<LaneRefCache*> ref_cache{nullptr};
 };
 std::array<CopyLane,copy_lane_count> copy_lanes;
+std::atomic<uint32_t> active_lane_count{0};
+std::atomic<uint32_t> abandoned_lane_count{0};
 std::atomic<uint32_t> raw_edits_pending{0};
 std::atomic<uint32_t> copy_lane_waiters{0};
 std::atomic<uint64_t> previous_retire_generation{1};
 std::atomic<uint64_t> content_grace_epoch{1};
 
+void AcquireLaneCacheDrain(CopyLane& lane) noexcept {
+    copy_lane_waiters.fetch_add(1,std::memory_order_seq_cst);
+    uint64_t s=lane.state.load(std::memory_order_relaxed);
+    for(;;){
+        if(s&kCacheDrainBit){
+            lane.state.wait(s,std::memory_order_acquire);
+            s=lane.state.load(std::memory_order_relaxed);
+            continue;
+        }
+        if(lane.state.compare_exchange_weak(s,s|kCacheDrainBit,
+            std::memory_order_seq_cst,std::memory_order_relaxed))
+            break;
+    }
+    auto v=lane.state.load(std::memory_order_seq_cst);
+    while(v&kCopyDepthMask){
+        lane.state.wait(v,std::memory_order_acquire);
+        v=lane.state.load(std::memory_order_seq_cst);
+    }
+}
+void ReleaseLaneCacheDrain(CopyLane& lane) noexcept {
+    lane.state.fetch_and(~kCacheDrainBit,std::memory_order_release);
+    lane.state.notify_all();
+    copy_lane_waiters.fetch_sub(1,std::memory_order_release);
+}
+void FlushAbandonedLaneRefCaches() noexcept {
+    if(abandoned_lane_count.load(std::memory_order_acquire)==0)return;
+    for(auto& lane:copy_lanes){
+        if(lane.owner_state.load(std::memory_order_acquire)!=kLaneAbandoned)continue;
+        uint8_t expected=kLaneAbandoned;
+        if(!lane.owner_state.compare_exchange_strong(expected,kLaneActive,std::memory_order_acq_rel))continue;
+        abandoned_lane_count.fetch_sub(1,std::memory_order_release);
+        AcquireLaneCacheDrain(lane);
+        if(auto* cache=lane.ref_cache.load(std::memory_order_acquire))
+            FlushLaneRefCache(cache);
+        ReleaseLaneCacheDrain(lane);
+        lane.owner_state.store(kLaneFree,std::memory_order_release);
+    }
+}
+void FlushAllLaneRefCaches() noexcept {
+    FlushAbandonedLaneRefCaches();
+    for(auto& lane:copy_lanes){
+        if(!lane.ref_cache.load(std::memory_order_acquire))continue;
+        AcquireLaneCacheDrain(lane);
+        if(auto* cache=lane.ref_cache.load(std::memory_order_acquire))
+            FlushLaneRefCache(cache);
+        ReleaseLaneCacheDrain(lane);
+    }
+}
+
 struct ThreadCopyLane {
     CopyLane* lane=nullptr;
     uint32_t copy_depth=0;
     uint32_t fast_raw_depth=0;
-    ThreadCopyLane() noexcept {
+    uint32_t callback_depth=0;
+    bool ref_cache_allowed=false;
+
+    bool try_claim() noexcept {
+        if(lane)return true;
+        if(active_lane_count.load(std::memory_order_acquire)>=copy_lane_count&&
+           abandoned_lane_count.load(std::memory_order_acquire)==0)
+            return false;
         const uintptr_t seed=reinterpret_cast<uintptr_t>(this);
         const unsigned start=unsigned((seed>>6)^(seed>>13))&(copy_lane_count-1);
         for(unsigned i=0;i<copy_lane_count;++i){
             auto& cand=copy_lanes[(start+i)&(copy_lane_count-1)];
-            bool expected=false;
-            if(cand.claimed.compare_exchange_strong(expected,true,std::memory_order_acq_rel)){
+            uint8_t expected=kLaneFree;
+            if(cand.owner_state.compare_exchange_strong(expected,kLaneActive,std::memory_order_acq_rel)){
+                active_lane_count.fetch_add(1,std::memory_order_release);
                 lane=&cand;
-                break;
+                return true;
             }
         }
+        if(abandoned_lane_count.load(std::memory_order_acquire)==0)return false;
+        for(unsigned i=0;i<copy_lane_count;++i){
+            auto& cand=copy_lanes[(start+i)&(copy_lane_count-1)];
+            uint8_t expected=kLaneAbandoned;
+            if(cand.owner_state.compare_exchange_strong(expected,kLaneActive,std::memory_order_acq_rel)){
+                abandoned_lane_count.fetch_sub(1,std::memory_order_release);
+                active_lane_count.fetch_add(1,std::memory_order_release);
+                AcquireLaneCacheDrain(cand);
+                if(auto* cache=cand.ref_cache.load(std::memory_order_acquire))
+                    FlushLaneRefCache(cache);
+                ReleaseLaneCacheDrain(cand);
+                lane=&cand;
+                return true;
+            }
+        }
+        return false;
     }
+
+    ThreadCopyLane() noexcept { try_claim(); }
+    // Wait-free TLS teardown: never acquires locks or flushes into
+    // retired_content_mutex during ExitProcess / DLL_PROCESS_DETACH.
+    // Abandoned lanes with a ref_cache are drained by active runtime threads
+    // (FlushAbandonedLaneRefCaches / try_claim / FlushAllLaneRefCaches).
     ~ThreadCopyLane() {
-        if(lane)lane->claimed.store(false,std::memory_order_release);
+        if(lane){
+            if(lane->ref_cache.load(std::memory_order_acquire)!=nullptr){
+                abandoned_lane_count.fetch_add(1,std::memory_order_release);
+                lane->owner_state.store(kLaneAbandoned,std::memory_order_release);
+            }else{
+                lane->owner_state.store(kLaneFree,std::memory_order_release);
+            }
+            active_lane_count.fetch_sub(1,std::memory_order_release);
+        }
     }
 };
 inline ThreadCopyLane& CurrentCopyLane() noexcept {
@@ -69,29 +168,33 @@ struct CopyLaneGuard {
     ThreadCopyLane* tls=nullptr;
     bool held_copy=false;
     bool held_fast_raw=false;
+    bool held_ref_cache=false;
     bool outermost=false;
     uint64_t retire_gen=0;
 
     CopyLaneGuard() noexcept {
         auto& t=CurrentCopyLane();
-        if(!t.lane)return;
+        if(!t.lane&&!t.try_claim())return;
         tls=&t;
         if(t.copy_depth==0){
             outermost=true;
-            t.lane->state.fetch_add(kCopyDepthInc|kRawFastInc,std::memory_order_seq_cst);
+            const uint64_t prev=t.lane->state.fetch_add(kCopyDepthInc|kRawFastInc,std::memory_order_seq_cst);
             t.copy_depth=1;
             held_copy=true;
+            t.ref_cache_allowed=((prev&kCacheDrainBit)==0);
+            held_ref_cache=t.ref_cache_allowed;
             if(raw_edits_pending.load(std::memory_order_seq_cst)==0){
                 t.fast_raw_depth=1;
                 held_fast_raw=true;
             }else{
-                t.lane->state.fetch_sub(kRawFastInc,std::memory_order_seq_cst);
-                if(copy_lane_waiters.load(std::memory_order_seq_cst)!=0)
+                const uint64_t p2=t.lane->state.fetch_sub(kRawFastInc,std::memory_order_seq_cst);
+                if((p2&kCacheDrainBit)||copy_lane_waiters.load(std::memory_order_seq_cst)!=0)
                     t.lane->state.notify_all();
             }
         }else{
             ++t.copy_depth;
             held_copy=true;
+            held_ref_cache=t.ref_cache_allowed;
             if(t.fast_raw_depth>0){
                 ++t.fast_raw_depth;
                 held_fast_raw=true;
@@ -106,15 +209,20 @@ struct CopyLaneGuard {
     CopyLaneGuard(const CopyLaneGuard&)=delete;
     bool has_copy_depth() const noexcept {return held_copy;}
     bool has_fast_raw() const noexcept {return held_fast_raw;}
+    bool has_ref_cache() const noexcept {return held_ref_cache;}
     bool is_outermost() const noexcept {return outermost;}
+    CopyLane* lane_ptr() const noexcept {return tls?tls->lane:nullptr;}
     ~CopyLaneGuard() {
         if(!held_copy)return;
         uint64_t sub=0;
         if(held_fast_raw&&--tls->fast_raw_depth==0)sub|=kRawFastInc;
-        if(--tls->copy_depth==0)sub|=kCopyDepthInc;
+        if(--tls->copy_depth==0){
+            tls->ref_cache_allowed=false;
+            sub|=kCopyDepthInc;
+        }
         if(sub){
-            tls->lane->state.fetch_sub(sub,std::memory_order_seq_cst);
-            if(copy_lane_waiters.load(std::memory_order_seq_cst)!=0)
+            const uint64_t prev=tls->lane->state.fetch_sub(sub,std::memory_order_seq_cst);
+            if((prev&kCacheDrainBit)||copy_lane_waiters.load(std::memory_order_seq_cst)!=0)
                 tls->lane->state.notify_all();
         }
     }

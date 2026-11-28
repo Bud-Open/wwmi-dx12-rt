@@ -6,14 +6,13 @@ ContentId PublishedContentLease(const HeapKey& key,PreviousPair& pair,ResInfo* i
     if(!PreviousDevice(g_reshade_device,pair,false))return {};
     const auto h=ReadHeap(key.heap,pair);
     if(!h||key.offset>=h->flat.size)return {};
-    std::shared_lock lock(h->page(key.offset).mutex);
-    if(!PreviousCurrent(pair,*h))return {};
-    const auto& s=h->slots[key.offset];
-    if(info)ProjectDescriptorInfo(pair,s,*info);
-    if(write)*write=s.version();
-    if(frame)*frame=s.frame;
-    if(kind)*kind=uint32_t(s.write&3);
-    return s.content;
+    SlotSnapshot snap;
+    if(!ReadPublishedSlot(*h,pair,key.offset,snap))return {};
+    if(info)ProjectDescriptorInfo(pair,snap,*info);
+    if(write)*write=snap.version();
+    if(frame)*frame=snap.frame;
+    if(kind)*kind=uint32_t(snap.write&3u);
+    return std::move(snap.content);
 }
 bool LivePhysicalOrigin(PreviousPair pair,const ContentId& content) {
     if(!content)return false;
@@ -25,8 +24,8 @@ bool LivePhysicalOrigin(PreviousPair pair,const ContentId& content) {
     if(!TrackedSlotOfCpu(cpu,&origin))return false;
     const auto h=ReadHeap(origin.heap,pair);
     if(!h||origin.offset>=h->flat.size)return false;
-    std::shared_lock lock(h->page(origin.offset).mutex);
-    return PreviousCurrent(pair,*h)&&h->slots[origin.offset].content==content;
+    SlotSnapshot snap;
+    return ReadPublishedSlot(*h,pair,origin.offset,snap)&&snap.content==content;
 }
 }
 bool ReadPublishedDescriptor(const FlatHeapMap::Entry* entry,uint32_t index,ResInfo& out) noexcept {
@@ -37,9 +36,12 @@ bool ReadPublishedDescriptor(const FlatHeapMap::Entry* entry,uint32_t index,ResI
         if(heap<=FlatHeapMap::kDead)return false;
         const auto h=PreviousGetHeap(PreviousToken(heap,const_cast<FlatHeapMap::Entry*>(entry)),pair);
         if(!h||index>=h->flat.size)return false;
-        std::shared_lock lock(h->page(index).mutex);
-        return PreviousCurrent(pair,*h)&&ProjectDescriptorInfo(pair,h->slots[index],out);
-    }catch(...){return false;}
+        const bool ok=WithPublishedSlot(*h,pair,index,false,[&](const SlotSnapshot& snap){
+            return ProjectDescriptorInfo(pair,snap,out);
+        });
+        if(!ok)out={};
+        return ok;
+    }catch(...){out={};return false;}
 }
 bool ReadPublishedDescriptor(const HeapKey& key,ResInfo& out) noexcept {
     return ReadPublishedDescriptor(g_heap_to_res.entry_of(key.heap),key.offset,out);
@@ -53,22 +55,32 @@ bool ReadPublishedDescriptorAndFormat(const HeapKey& key,ResInfo& out,DXGI_FORMA
         if(!PreviousDevice(g_reshade_device,pair,false))return false;
         const auto h=ReadHeap(key.heap,pair);
         if(!h||key.offset>=h->flat.size)return false;
-        std::shared_lock lock(h->page(key.offset).mutex);
-        if(!PreviousCurrent(pair,*h))return false;
-        const auto& s=h->slots[key.offset];
-        if(!ProjectDescriptorInfo(pair,s,out))return false;
-        const auto* d=OriginalDefinition(s.content->definition);
-        if(d){
-            if(out_res_gen)*out_res_gen=d->resource_generation;
-            if(const auto* v=std::get_if<D3D12_SHADER_RESOURCE_VIEW_DESC>(&d->description))
-                out_fmt=v->Format;
-            else if(const auto* v=std::get_if<D3D12_UNORDERED_ACCESS_VIEW_DESC>(&d->description))
-                out_fmt=v->Format;
-            else
-                out_fmt=d->default_format;
+        const bool ok=WithPublishedSlot(*h,pair,key.offset,false,[&](const SlotSnapshot& snap){
+            if(!ProjectDescriptorInfo(pair,snap,out))return false;
+            const auto* d=OriginalDefinition(snap.content->definition);
+            if(d){
+                if(out_res_gen)*out_res_gen=d->resource_generation;
+                if(const auto* v=std::get_if<D3D12_SHADER_RESOURCE_VIEW_DESC>(&d->description))
+                    out_fmt=v->Format;
+                else if(const auto* v=std::get_if<D3D12_UNORDERED_ACCESS_VIEW_DESC>(&d->description))
+                    out_fmt=v->Format;
+                else
+                    out_fmt=d->default_format;
+            }
+            return true;
+        });
+        if(!ok){
+            out={};
+            out_fmt=DXGI_FORMAT_UNKNOWN;
+            if(out_res_gen)*out_res_gen=0;
         }
-        return true;
-    }catch(...){return false;}
+        return ok;
+    }catch(...){
+        out={};
+        out_fmt=DXGI_FORMAT_UNKNOWN;
+        if(out_res_gen)*out_res_gen=0;
+        return false;
+    }
 }
 
 RtPublishedTexture ReadPublishedTextureShape(const HeapKey& key,RtPublishedTextureShape& out) noexcept {
@@ -100,8 +112,31 @@ void NotePublishedDescriptorMiss(const HeapKey& key,uint32_t frame) noexcept {
         PreviousPair pair;if(!PreviousDevice(g_reshade_device,pair,false))return;
         const auto h=ReadHeap(key.heap,pair);
         if(!h||key.offset>=h->flat.size)return;
-        std::unique_lock lock(h->page(key.offset).mutex);
-        if(PreviousCurrent(pair,*h))h->slots[key.offset].miss=frame;
+        auto& page=h->page(key.offset);
+        auto& slot=h->slots[key.offset];
+        if(h->is_vis){
+            CopyLaneGuard guard;
+            if(guard.has_copy_depth()&&guard.has_fast_raw()){
+                VisWriteGuard vis_lock(page);
+                if(PreviousCurrent(pair,*h)){
+                    const uint64_t prev_w=slot.write.load(std::memory_order_relaxed)&~kSlotUpdatingBit;
+                    slot.write.store(prev_w|kSlotUpdatingBit,std::memory_order_relaxed);
+                    std::atomic_thread_fence(std::memory_order_release);
+                    slot.miss.store(frame,std::memory_order_relaxed);
+                    slot.write.store(prev_w,std::memory_order_release);
+                }
+                return;
+            }
+        }
+        std::unique_lock lock(page.mutex);
+        VisWriteGuard vis_lock(page);
+        if(PreviousCurrent(pair,*h)){
+            const uint64_t prev_w=slot.write.load(std::memory_order_relaxed)&~kSlotUpdatingBit;
+            slot.write.store(prev_w|kSlotUpdatingBit,std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_release);
+            slot.miss.store(frame,std::memory_order_relaxed);
+            slot.write.store(prev_w,std::memory_order_release);
+        }
     }catch(...){}
 }
 bool ReadPublishedBuffer(const HeapKey& key,WWMI_RtDescriptorBuffer_v2& out) noexcept {

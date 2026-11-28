@@ -396,6 +396,7 @@ static bool Promotable(const WrapResource* r, D3D12_RESOURCE_STATES to)
 using ListBufStates = std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>>;
 std::mutex                                                    g_list_buf_mtx;
 std::unordered_set<ID3D12Resource*>                           g_owned_bufs;
+std::atomic<uint64_t>                                         g_owned_bufs_gen{ 1 };
 std::unordered_map<ID3D12GraphicsCommandList*, ListBufStates> g_list_buf;
 std::unordered_map<ID3D12Resource*, uint64_t>                 g_owned_writes;
 std::unordered_map<ID3D12GraphicsCommandList*, uint64_t>      g_list_recording;
@@ -860,22 +861,58 @@ void OwnBuffer(ID3D12Resource* res)
 {
     if (!res) return;
     std::lock_guard<std::mutex> l(g_list_buf_mtx);
-    g_owned_bufs.insert(res);
+    if (g_owned_bufs.insert(res).second)
+        g_owned_bufs_gen.fetch_add(1, std::memory_order_release);
 }
 
 void DisownBuffer(ID3D12Resource* res)
 {
     if (!res) return;
     std::lock_guard<std::mutex> l(g_list_buf_mtx);
-    g_owned_bufs.erase(res);
+    if (g_owned_bufs.erase(res) > 0)
+        g_owned_bufs_gen.fetch_add(1, std::memory_order_release);
     g_owned_writes.erase(res);
 }
 
 bool OwnedBuffer(ID3D12Resource* res)
 {
     if (!res) return false;
-    std::lock_guard<std::mutex> l(g_list_buf_mtx);
-    return g_owned_bufs.count(res) != 0;
+    struct CacheWay {
+        ID3D12Resource* res = nullptr;
+        uint64_t        gen = 0;
+        bool            owned = false;
+    };
+    struct CacheSet {
+        CacheWay ways[2]{};
+        uint8_t  next_victim = 0;
+    };
+    static thread_local std::array<CacheSet, 128> tls_cache{};
+    const uint64_t  gen = g_owned_bufs_gen.load(std::memory_order_acquire);
+    const uintptr_t v = reinterpret_cast<uintptr_t>(res);
+    auto&           set = tls_cache[((v >> 4) ^ (v >> 12) ^ (v >> 20)) & 127u];
+    if (set.ways[0].res == res && set.ways[0].gen == gen) {
+        set.next_victim = 1;
+        return set.ways[0].owned;
+    }
+    if (set.ways[1].res == res && set.ways[1].gen == gen) {
+        set.next_victim = 0;
+        return set.ways[1].owned;
+    }
+    bool     owned = false;
+    uint64_t locked_gen = 0;
+    {
+        std::lock_guard<std::mutex> l(g_list_buf_mtx);
+        locked_gen = g_owned_bufs_gen.load(std::memory_order_relaxed);
+        owned = g_owned_bufs.count(res) != 0;
+    }
+    unsigned w = set.next_victim & 1u;
+    if (set.ways[0].res == res || set.ways[0].gen != locked_gen)
+        w = 0;
+    else if (set.ways[1].res == res || set.ways[1].gen != locked_gen)
+        w = 1;
+    set.ways[w] = { res, locked_gen, owned };
+    set.next_victim = uint8_t(w ^ 1u);
+    return owned;
 }
 
 D3D12_RESOURCE_STATES OwnedTransition(ID3D12GraphicsCommandList* cl, ID3D12Resource* res, D3D12_RESOURCE_STATES to)
@@ -1618,81 +1655,121 @@ bool BindDescriptors(ID3D12GraphicsCommandList* cl, const RootSigEntry& rse, boo
     if(!RtSetDrawHeaps(cl,H().ring.heap,H().samp_ring.heap))return false;
     t_heaps_changed = true;
 
-    for (const RootBind& b : rse.binds) {
-        const int                         si = StageIndex(b.stage);
-        Heap&                             ring = (b.kind == 's') ? H().samp_ring : H().ring;
-        const UINT                        slot = ring.next++; // reserved above: in range and out of flight
-        const D3D12_CPU_DESCRIPTOR_HANDLE dst = ring.Cpu(slot);
-        if (g_bd_trace)
-            logger::write("BINDDESC   bind param=%u %c%c%u slot=%u/%u heap=%p cpu=%zx",
-                b.param, b.stage, b.kind, b.reg, slot, ring.size,
-                (void*)ring.heap, (size_t)dst.ptr);
-        // Record compute UAV registers as they are bound, for the capture to report per pass.
-        if (compute && b.kind == 'u' && b.reg < 32)
-            g_cs_uav_bound_mask.fetch_or(1u << b.reg, std::memory_order_relaxed);
+    static constexpr UINT kCopyBatchCap = 64;
+    static constexpr UINT kOnes[kCopyBatchCap] = {
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1
+    };
+    const size_t total_binds = rse.binds.size();
+    for (size_t chunk = 0; chunk < total_binds; chunk += kCopyBatchCap) {
+        const size_t                chunk_end = (std::min)(total_binds, chunk + kCopyBatchCap);
+        UINT                        chunk_slots[kCopyBatchCap];
+        D3D12_CPU_DESCRIPTOR_HANDLE chunk_dsts[kCopyBatchCap];
+        D3D12_CPU_DESCRIPTOR_HANDLE copy_dsts[kCopyBatchCap];
+        D3D12_CPU_DESCRIPTOR_HANDLE copy_srcs[kCopyBatchCap];
+        UINT                        copy_n = 0;
 
-        if (b.kind == 'b') {
-            ID3D11Buffer* cb = (si >= 0 && b.reg < kMaxCB) ? st.cb[si][b.reg] : nullptr;
-            if (cb) {
-                WrapResource* wr = AsWrapResource(cb);
-                Transition(cl, wr, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-                WriteCbvDescriptor(cb, dst);
-            } else {
-                WriteNullDescriptor('b', dst, b.sit, b.dim);
+        for (size_t idx = chunk; idx < chunk_end; ++idx) {
+            const RootBind&                   b = rse.binds[idx];
+            const int                         si = StageIndex(b.stage);
+            Heap&                             ring = (b.kind == 's') ? H().samp_ring : H().ring;
+            const UINT                        slot = ring.next++; // reserved above: in range and out of flight
+            const D3D12_CPU_DESCRIPTOR_HANDLE dst = ring.Cpu(slot);
+            chunk_slots[idx - chunk] = slot;
+            chunk_dsts[idx - chunk] = dst;
+            if (g_bd_trace)
+                logger::write("BINDDESC   bind param=%u %c%c%u slot=%u/%u heap=%p cpu=%zx",
+                    b.param, b.stage, b.kind, b.reg, slot, ring.size,
+                    (void*)ring.heap, (size_t)dst.ptr);
+            // Record compute UAV registers as they are bound, for the capture to report per pass.
+            if (compute && b.kind == 'u' && b.reg < 32) {
+                const uint32_t bit = 1u << b.reg;
+                if ((g_cs_uav_bound_mask.load(std::memory_order_relaxed) & bit) == 0u)
+                    g_cs_uav_bound_mask.fetch_or(bit, std::memory_order_relaxed);
             }
-        } else if (b.kind == 'u') {
-            ID3D11UnorderedAccessView* v = (b.reg < kMaxUAV) ? st.uav[b.reg] : nullptr;
-            WrapView*                  wv = AsWrapView(v);
-            if (wv && wv->wres && HasDescriptor(wv, 'u', b.reg)) {
-                Transition(cl, wv->wres, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                H().dev->CopyDescriptorsSimple(1, dst, wv->cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            } else {
-                WriteNullDescriptor('u', dst, b.sit, b.dim);
-            }
-        } else if (b.kind == 's') {
-            ID3D11SamplerState* ss = (si >= 0 && b.reg < kMaxSamp) ? st.samp[si][b.reg] : nullptr;
-            StateDesc*          sd = AsStateDesc(ss);
-            D3D12_SAMPLER_DESC  d{};
-            if (sd) {
-                d.Filter = (D3D12_FILTER)sd->sampler.Filter;
-                d.AddressU = (D3D12_TEXTURE_ADDRESS_MODE)sd->sampler.AddressU;
-                d.AddressV = (D3D12_TEXTURE_ADDRESS_MODE)sd->sampler.AddressV;
-                d.AddressW = (D3D12_TEXTURE_ADDRESS_MODE)sd->sampler.AddressW;
-                d.MipLODBias = sd->sampler.MipLODBias;
-                d.MaxAnisotropy = sd->sampler.MaxAnisotropy;
-                d.ComparisonFunc = (D3D12_COMPARISON_FUNC)sd->sampler.ComparisonFunc;
-                for (int i = 0; i < 4; ++i) d.BorderColor[i] = sd->sampler.BorderColor[i];
-                d.MinLOD = sd->sampler.MinLOD;
-                d.MaxLOD = sd->sampler.MaxLOD;
-            } else {
-                // The DX11 default sampler, which is what an unbound slot reads as.
-                d.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-                d.AddressU = d.AddressV = d.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-                d.MaxLOD = D3D12_FLOAT32_MAX;
-                d.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-            }
-            H().dev->CreateSampler(&d, dst);
-        } else { // 't'
-            ID3D11ShaderResourceView* v = (si >= 0 && b.reg < kMaxSRV) ? st.srv[si][b.reg] : nullptr;
-            WrapView*                 wv = AsWrapView(v);
-            if (wv && wv->wres && HasDescriptor(wv, 't', b.reg)) {
-                Transition(cl, wv->wres, compute ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                if (wv->wres->dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-                    if (auto fn = g_texture_use_observer.load(std::memory_order_relaxed)) fn(wv->wres->dx12);
-                H().dev->CopyDescriptorsSimple(1, dst, wv->cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            } else {
-                WriteNullDescriptor('t', dst, b.sit, b.dim);
+
+            if (b.kind == 'b') {
+                ID3D11Buffer* cb = (si >= 0 && b.reg < kMaxCB) ? st.cb[si][b.reg] : nullptr;
+                if (cb) {
+                    WrapResource* wr = AsWrapResource(cb);
+                    Transition(cl, wr, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+                    WriteCbvDescriptor(cb, dst);
+                } else {
+                    WriteNullDescriptor('b', dst, b.sit, b.dim);
+                }
+            } else if (b.kind == 'u') {
+                ID3D11UnorderedAccessView* v = (b.reg < kMaxUAV) ? st.uav[b.reg] : nullptr;
+                WrapView*                  wv = AsWrapView(v);
+                if (wv && wv->wres && HasDescriptor(wv, 'u', b.reg)) {
+                    Transition(cl, wv->wres, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    copy_dsts[copy_n] = dst;
+                    copy_srcs[copy_n] = wv->cpu;
+                    ++copy_n;
+                } else {
+                    WriteNullDescriptor('u', dst, b.sit, b.dim);
+                }
+            } else if (b.kind == 's') {
+                ID3D11SamplerState* ss = (si >= 0 && b.reg < kMaxSamp) ? st.samp[si][b.reg] : nullptr;
+                StateDesc*          sd = AsStateDesc(ss);
+                D3D12_SAMPLER_DESC  d{};
+                if (sd) {
+                    d.Filter = (D3D12_FILTER)sd->sampler.Filter;
+                    d.AddressU = (D3D12_TEXTURE_ADDRESS_MODE)sd->sampler.AddressU;
+                    d.AddressV = (D3D12_TEXTURE_ADDRESS_MODE)sd->sampler.AddressV;
+                    d.AddressW = (D3D12_TEXTURE_ADDRESS_MODE)sd->sampler.AddressW;
+                    d.MipLODBias = sd->sampler.MipLODBias;
+                    d.MaxAnisotropy = sd->sampler.MaxAnisotropy;
+                    d.ComparisonFunc = (D3D12_COMPARISON_FUNC)sd->sampler.ComparisonFunc;
+                    for (int i = 0; i < 4; ++i) d.BorderColor[i] = sd->sampler.BorderColor[i];
+                    d.MinLOD = sd->sampler.MinLOD;
+                    d.MaxLOD = sd->sampler.MaxLOD;
+                } else {
+                    // The DX11 default sampler, which is what an unbound slot reads as.
+                    d.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+                    d.AddressU = d.AddressV = d.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                    d.MaxLOD = D3D12_FLOAT32_MAX;
+                    d.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+                }
+                H().dev->CreateSampler(&d, dst);
+            } else { // 't'
+                ID3D11ShaderResourceView* v = (si >= 0 && b.reg < kMaxSRV) ? st.srv[si][b.reg] : nullptr;
+                WrapView*                 wv = AsWrapView(v);
+                if (wv && wv->wres && HasDescriptor(wv, 't', b.reg)) {
+                    Transition(cl, wv->wres, compute ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    if (wv->wres->dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+                        if (auto fn = g_texture_use_observer.load(std::memory_order_relaxed)) fn(wv->wres->dx12);
+                    copy_dsts[copy_n] = dst;
+                    copy_srcs[copy_n] = wv->cpu;
+                    ++copy_n;
+                } else {
+                    WriteNullDescriptor('t', dst, b.sit, b.dim);
+                }
             }
         }
 
-        const D3D12_GPU_DESCRIPTOR_HANDLE gpu = ring.Gpu(slot);
-        if (compute)
-            cl->SetComputeRootDescriptorTable(b.param, gpu);
-        else
-            cl->SetGraphicsRootDescriptorTable(b.param, gpu);
-        wwmi::semantic::DescriptorBound(wwmi::semantic::Number(cl), wwmi::semantic::Number(rse.rs),
-            static_cast<uint32_t>(b.stage), static_cast<uint32_t>(b.kind), b.param, b.space, b.reg, slot,
-            static_cast<uint64_t>(dst.ptr), gpu.ptr);
+        if (copy_n == 1u) {
+            H().dev->CopyDescriptorsSimple(1, copy_dsts[0], copy_srcs[0], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        } else if (copy_n > 1u) {
+            H().dev->CopyDescriptors(copy_n, copy_dsts, kOnes, copy_n, copy_srcs, kOnes,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+
+        for (size_t idx = chunk; idx < chunk_end; ++idx) {
+            const RootBind&                   b = rse.binds[idx];
+            const Heap&                       ring = (b.kind == 's') ? H().samp_ring : H().ring;
+            const UINT                        slot = chunk_slots[idx - chunk];
+            const D3D12_CPU_DESCRIPTOR_HANDLE dst = chunk_dsts[idx - chunk];
+            const D3D12_GPU_DESCRIPTOR_HANDLE gpu = ring.Gpu(slot);
+            if (compute)
+                cl->SetComputeRootDescriptorTable(b.param, gpu);
+            else
+                cl->SetGraphicsRootDescriptorTable(b.param, gpu);
+            wwmi::semantic::DescriptorBound(wwmi::semantic::Number(cl), wwmi::semantic::Number(rse.rs),
+                static_cast<uint32_t>(b.stage), static_cast<uint32_t>(b.kind), b.param, b.space, b.reg, slot,
+                static_cast<uint64_t>(dst.ptr), gpu.ptr);
+        }
     }
     if (g_bd_trace) logger::write("BINDDESC done -- all descriptors written, returning to IssueDispatch");
     return true;
@@ -2151,7 +2228,8 @@ bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
         return IssueBail(true, "no-topology", vs_dbg, count, start, instances);
     }
 
-    std::vector<RootBind> want;
+    static thread_local std::vector<RootBind> want;
+    want.clear();
     UINT                  n_res = 0;
     UINT                  n_samp = 0;
     if (!CollectBinds(false, want, n_res, n_samp)) return IssueBail(true, "CollectBinds", vs_dbg, count, start, instances);
@@ -2248,7 +2326,7 @@ bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
     g_gpu_timer.End(b.cl, gt);
     if (b.own_list) {
         g_own_list_draws.fetch_add(1, std::memory_order_relaxed);
-        const bool vs_iniparams = std::any_of(want.begin(), want.end(),
+        const bool vs_iniparams = std::any_of(rse->binds.begin(), rse->binds.end(),
             [](const RootBind& rb) { return rb.stage == 'v' && rb.kind == 't' && rb.reg == 120; });
         if (!indexed && b.back_buffer && probe_rt0 == b.back_buffer && probe_vp_mode == 1 && vs_iniparams &&
             ((st.topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && count == 4) ||
@@ -2347,7 +2425,8 @@ bool IssueDispatch(UINT x, UINT y, UINT z)
         return DispatchBail("no-cs-bound", cs_dbg, x, y, z);
     }
 
-    std::vector<RootBind> want;
+    static thread_local std::vector<RootBind> want;
+    want.clear();
     UINT                  n_res = 0;
     UINT                  n_samp = 0;
     if (!CollectBinds(true, want, n_res, n_samp)) return DispatchBail("CollectBinds", cs_dbg, x, y, z);
@@ -2365,15 +2444,31 @@ bool IssueDispatch(UINT x, UINT y, UINT z)
     ID3D12PipelineState* pso = GetComputePso(rse->rs);
     if (!pso) return DispatchBail("GetComputePso", cs_dbg, x, y, z);
 
+    // Avoid locking a global mutex + unordered_map on every dispatch once this
+    // compute shader has passed its initial diagnostic trace runs. Keep pre-bind
+    // (<=2) and post-bind successful dispatch (<=3) counters independent so
+    // refused attempts never consume the successful DISPATCH-PRE/POST budget.
     {
-        static std::mutex                           m;
-        static std::unordered_map<const void*, int> seen;
-        int                                         n;
-        {
-            std::lock_guard<std::mutex> l(m);
-            n = ++seen[cs_dbg];
+        static thread_local std::array<const void*, 32> tls_bd_done{};
+        static thread_local uint32_t                    tls_bd_done_n = 0;
+        bool                                            already_done = false;
+        for (uint32_t i = 0; i < tls_bd_done_n; ++i) {
+            if (tls_bd_done[i] == cs_dbg) { already_done = true; break; }
         }
-        g_bd_trace = (n <= 2);
+        if (already_done) {
+            g_bd_trace = false;
+        } else {
+            static std::mutex                           m;
+            static std::unordered_map<const void*, int> seen;
+            int                                         n;
+            {
+                std::lock_guard<std::mutex> l(m);
+                n = ++seen[cs_dbg];
+            }
+            if (n > 2 && tls_bd_done_n < tls_bd_done.size())
+                tls_bd_done[tls_bd_done_n++] = cs_dbg;
+            g_bd_trace = (n <= 2);
+        }
     }
     if(!RtBeforePortComputeRoots(b.cl,rse->rs)){
         g_bd_trace=false;
@@ -2395,13 +2490,25 @@ bool IssueDispatch(UINT x, UINT y, UINT z)
     if (ObserverActive()) TraceDispatch(*rse, x, y, z);
 
     {
-        static std::mutex                           m;
-        static std::unordered_map<const void*, int> seen;
-        const void*                                 key = (const void*)State().shader[5];
-        int                                         n;
+        const void* key = (const void*)State().shader[5];
+        int         n = 4;
         {
-            std::lock_guard<std::mutex> l(m);
-            n = ++seen[key];
+            static thread_local std::array<const void*, 32> tls_run_done{};
+            static thread_local uint32_t                    tls_run_done_n = 0;
+            bool                                            already_done = false;
+            for (uint32_t i = 0; i < tls_run_done_n; ++i) {
+                if (tls_run_done[i] == key) { already_done = true; break; }
+            }
+            if (!already_done) {
+                static std::mutex                           m;
+                static std::unordered_map<const void*, int> seen;
+                {
+                    std::lock_guard<std::mutex> l(m);
+                    n = ++seen[key];
+                }
+                if (n > 3 && tls_run_done_n < tls_run_done.size())
+                    tls_run_done[tls_run_done_n++] = key;
+            }
         }
         SkCapBeforeDispatch(b.device, b.cl, x, y, z);
         const int   gt = g_gpu_timer.Begin(b.cl, b.own_list ? GT_PresentDispatch : GT_IssueDispatch);
@@ -2448,7 +2555,7 @@ bool IssueDispatch(UINT x, UINT y, UINT z)
 
     if (g_uav_barrier) {
         PipeState& pst = State();
-        for (const RootBind& rb : want) {
+        for (const RootBind& rb : rse->binds) {
             if (rb.kind != 'u' || rb.reg >= kMaxUAV) continue;
             WrapView* wv = AsWrapView(pst.uav[rb.reg]);
             if (wv && wv->wres && wv->wres->dx12) g_owed_uav.Note(b.cl, wv->wres->dx12);

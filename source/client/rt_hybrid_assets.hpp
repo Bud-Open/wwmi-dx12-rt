@@ -1,9 +1,9 @@
 #pragma once
 #include <algorithm>
 #include <cstring>
-#include <map>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 #include "rt_hybrid_raster.hpp"
 
@@ -25,9 +25,24 @@ struct AssetProof {
     std::vector<unsigned char> normalized,source_indices;
     std::vector<std::uint16_t> full,original,forwards,reverses;
     std::vector<bool> shaped;
-    using Key=std::tuple<unsigned,unsigned,int,Blend,unsigned,unsigned>;
+    struct Key {
+        unsigned count=0,first=0;
+        int base=0;
+        Blend blend=raw;
+        unsigned remap_row=0,remap_count=0;
+        bool operator==(const Key&)const=default;
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& k)const noexcept{
+            std::uint64_t h=std::uint64_t(k.count)*0x9e3779b97f4a7c15ull;
+            h^=std::uint64_t(k.first)+0x9e3779b97f4a7c15ull+(h<<6)+(h>>2);
+            h^=std::uint64_t(std::uint32_t(k.base))+0x9e3779b97f4a7c15ull+(h<<6)+(h>>2);
+            h^=(std::uint64_t(k.blend)<<32|std::uint64_t(k.remap_row)<<16|std::uint64_t(k.remap_count))+0x9e3779b97f4a7c15ull+(h<<6)+(h>>2);
+            return static_cast<std::size_t>(h);
+        }
+    };
     struct Window {bool valid=false,shape=false,remap_mismatch=false; unsigned max_bone=0;};
-    std::map<Key,Window> windows;
+    std::unordered_map<Key,Window,KeyHash> windows;
     bool load(const Asset& a){
         const auto as=std::span(a.streams);
         const bool shape_stream_ok=a.shapes

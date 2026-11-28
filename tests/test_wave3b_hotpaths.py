@@ -53,7 +53,8 @@ class Wave3BHotpathTests(unittest.TestCase):
         self.assertIn("if(s.is_vis||!PreviousCurrent(pair,s))return false;", copy_inc)
         self.assertIn("if(!h||h->is_vis||!PreviousCurrent(pair,*h))return false;", copy_inc)
         self.assertIn("if(!h||h->is_vis||!count||first>=h->flat.size||count>h->flat.size-first)return false;", copy_inc)
-        self.assertIn("if(!dh->is_vis)pg.seq.fetch_add(1,std::memory_order_release);", copy_inc)
+        self.assertIn("if(!dh->is_vis){", copy_inc)
+        self.assertIn("pg.seq.store(sq+1u,std::memory_order_release);", copy_inc)
 
         # 3. Client uses PrimaryRuntimeTable + off-lock DXR build + deferred mod_stamp
         runtime_cpp = (REPO_ROOT / "source/client/hsin_runtime.cpp").read_text()

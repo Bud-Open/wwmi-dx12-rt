@@ -101,14 +101,31 @@ MaterialReceipt RtTakeMaterialNote(unsigned load,int mod,const MaterialNoteKey& 
         unsigned load=0;int mod=-1;MaterialNoteKey key{};MaterialNoteKind kind{};
         MaterialWinners bindings{};uint64_t epoch=0;bool capped=false;
     };
-    thread_local std::array<Recent,64> recent{};
-    const auto index=(std::get<0>(key)+std::get<1>(key)*7u+std::get<2>(key)*13u+unsigned(mod)*23u+
-        unsigned(kind)*5u+std::get<7>(key)*11u+(std::get<10>(key)>>4)+std::get<11>(key)*17u)%recent.size();
-    auto& slot=recent[index];
+    struct RecentSet {
+        Recent ways[2]{};
+        uint8_t next_victim=0;
+    };
+    // 256 sets x 2 ways (512 entries) prevents direct-mapped thrashing on
+    // high-subdraw toggle mods (e.g. 60+ subdraws across multiple passes).
+    thread_local std::array<RecentSet,256> recent{};
+    uint64_t h=std::get<0>(key)*0x9e3779b97f4a7c15ull;
+    h^=std::get<1>(key)+0x9e3779b97f4a7c15ull+(h<<6)+(h>>2);
+    h^=(uint64_t(std::get<2>(key))<<32|uint64_t(std::get<7>(key))*1315423911ull)^uint64_t(std::get<8>(key))*2654435761ull;
+    h^=uint64_t(uint32_t(std::get<9>(key)))*0x9e3779b9ull^uint64_t(unsigned(mod)*23u+unsigned(kind)*5u);
+    h^=(std::get<10>(key)>>4)^(std::get<11>(key)*17u);
+    auto& set=recent[size_t((h^(h>>16)^(h>>32))&255u)];
     auto& notes=RtMaterialNotes();
-    if(slot.load==load&&slot.mod==mod&&slot.key==key&&slot.kind==kind&&
-       (!track||slot.capped||(slot.bindings==bindings&&slot.epoch==notes.change_epoch.load(std::memory_order_acquire))))
-        return MaterialReceipt::drop;
+    const auto matches_way=[&](const Recent& w) noexcept {
+        return w.load==load&&w.mod==mod&&w.key==key&&w.kind==kind&&
+            (!track||w.capped||(w.bindings==bindings&&w.epoch==notes.change_epoch.load(std::memory_order_acquire)));
+    };
+    if(matches_way(set.ways[0])){set.next_victim=1;return MaterialReceipt::drop;}
+    if(matches_way(set.ways[1])){set.next_victim=0;return MaterialReceipt::drop;}
+    unsigned victim=set.next_victim&1u;
+    if(set.ways[0].load!=load)victim=0;
+    else if(set.ways[1].load!=load)victim=1;
+    auto& slot=set.ways[victim];
+    set.next_victim=uint8_t(victim^1u);
     std::lock_guard lock(notes.lock);
     if(load<notes.generation)return MaterialReceipt::drop;
     if(load!=notes.generation){RtMaterialFlushLocked(notes);notes.generation=load;}
@@ -153,8 +170,8 @@ MaterialReadPlan RtMaterialReadPlan(reshade::api::command_list* list,uint64_t ps
         uint64_t recording=0,pso=0,layout=0;
         MaterialReadPlan plan{};
     };
-    thread_local std::array<Memo,16> memo{};
-    auto& slot=memo[((pso>>4)^layout)%memo.size()];
+    thread_local std::array<Memo,64> memo{};
+    auto& slot=memo[(((pso>>4)^(pso>>12))^((layout>>4)^(layout>>12)))&63u];
     if(recording&&slot.list==list&&slot.recording==recording&&slot.pso==pso&&slot.layout==layout)
         return slot.plan;
     MaterialReadPlan plan{};

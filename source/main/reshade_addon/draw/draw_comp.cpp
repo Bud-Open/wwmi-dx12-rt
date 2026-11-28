@@ -93,12 +93,23 @@ static double SkBonesRms(const SkBones& a, const SkBones& b)
 
 static RootCbvBind ObjectCbOf(reshade::api::command_list* cl)
 {
-    int root = -1;
-    {
+    extern std::atomic<uint64_t> g_layout_b2_epoch;
+    const uint64_t               layh = CmdGfxLayout(cl);
+    if (!layh) return RootCbvBind{};
+    struct B2Cache {
+        uint64_t layout = 0, epoch = 0;
+        int      root = -1;
+    };
+    static thread_local std::array<B2Cache, 64> tls_b2{};
+    const uint64_t cur_epoch = g_layout_b2_epoch.load(std::memory_order_acquire);
+    auto&          slot = tls_b2[((layh >> 4) ^ (layh >> 12)) & 63u];
+    if (slot.layout != layh || slot.epoch != cur_epoch) {
         std::lock_guard l(g_layout_mutex);
-        auto            it = g_layout_b2_root.find(CmdGfxLayout(cl));
-        if (it != g_layout_b2_root.end()) root = it->second;
+        const uint64_t  locked_epoch = g_layout_b2_epoch.load(std::memory_order_relaxed);
+        auto            it = g_layout_b2_root.find(layh);
+        slot = { layh, locked_epoch, (it != g_layout_b2_root.end()) ? it->second : -1 };
     }
+    const int root = slot.root;
     return (root >= 0 && root < 64) ? CmdCbv(cl).binds[root] : RootCbvBind{};
 }
 
@@ -322,14 +333,32 @@ template <typename Want, typename Fn>
 static bool ForEachPsTexture(reshade::api::command_list* cmd_list, bool unread, const DxilSrvRegs& ps_regs, Want&& want,
     Fn&& fn, bool format_only_unread = false)
 {
+    extern std::atomic<uint64_t> g_layout_regmap_epoch;
     const uint64_t layh = CmdGfxLayout(cmd_list);
-    RegBind        t_ps[kSectionTexRegs];
-    {
+    if (!layh) return false;
+    struct RegCache {
+        uint64_t layout = 0, epoch = 0;
+        bool     valid = false;
+        RegBind  t_ps[kSectionTexRegs]{};
+    };
+    static thread_local std::array<RegCache, 64> tls_reg{};
+    const uint64_t cur_epoch = g_layout_regmap_epoch.load(std::memory_order_acquire);
+    auto&          slot = tls_reg[((layh >> 4) ^ (layh >> 12)) & 63u];
+    if (slot.layout != layh || slot.epoch != cur_epoch) {
         std::lock_guard l(g_layout_regmap_mtx);
+        const uint64_t  locked_epoch = g_layout_regmap_epoch.load(std::memory_order_relaxed);
         auto            it = g_layout_regmap.find(layh);
-        if (it == g_layout_regmap.end() || !it->second.built) return false;
-        memcpy(t_ps, it->second.t_ps, sizeof t_ps);
+        slot.layout = layh;
+        slot.epoch = locked_epoch;
+        if (it != g_layout_regmap.end() && it->second.built) {
+            slot.valid = true;
+            memcpy(slot.t_ps, it->second.t_ps, sizeof slot.t_ps);
+        } else {
+            slot.valid = false;
+        }
     }
+    if (!slot.valid) return false;
+    const RegBind* t_ps = slot.t_ps;
     device*     dev = cmd_list->get_device();
     const auto& root = CmdGfx(cmd_list).root;
     for (unsigned r = 0; r < kSectionTexRegs; ++r) {
@@ -767,33 +796,59 @@ static bool DrawComponentImpl(InjectFrame& fr, int dm, const WwmiMod::Component*
             }
             ProfScope _cs_restore(PROF_CS_Restore);
             struct PortRestore {
-                ID3D12GraphicsCommandList*             cl = nullptr;
-                ID3D12DescriptorHeap*                  srv = nullptr;
-                ID3D12DescriptorHeap*                  smp = nullptr;
-                std::vector<std::pair<UINT, uint64_t>> tables;
-                void*                                  inner_user = nullptr;
-                bool*                                  mid = nullptr; // X32: raised around the inner call so restore_state knows it is mid-section
-                ID3D12PipelineState*                   pso = nullptr;
+                ID3D12GraphicsCommandList*       cl = nullptr;
+                ID3D12DescriptorHeap*            srv = nullptr;
+                ID3D12DescriptorHeap*            smp = nullptr;
+                std::pair<UINT, uint64_t>        tables[64]{};
+                uint32_t                         table_count = 0;
+                void*                            inner_user = nullptr;
+                bool*                            mid = nullptr; // X32: raised around the inner call so restore_state knows it is mid-section
+                ID3D12PipelineState*             pso = nullptr;
             } port_restore;
             {
+                extern std::atomic<uint64_t> g_layout_tables_epoch;
                 const bool paired_restore=RtHasNativeBindingScope(d3d12_cl);
                 const auto *native_heaps=RtOriginalDrawHeaps(d3d12_cl);
                 const auto&                   root = CmdGfx(cmd_list).root;
                 const uint64_t                layh = CmdGfxLayout(cmd_list);
-                std::vector<LayoutTableParam> ltabs;
+                struct LayoutTablesCache {
+                    uint64_t         layout = 0, epoch = 0;
+                    uint32_t         count = 0;
+                    LayoutTableParam items[64]{};
+                };
+                static thread_local std::array<LayoutTablesCache, 64> tls_ltabs{};
+                const LayoutTableParam* ltab_ptr = nullptr;
+                uint32_t                ltab_n = 0;
                 if (layh) {
-                    std::lock_guard l(g_layout_tables_mtx);
-                    auto            it = g_layout_tables.find(layh);
-                    if (it != g_layout_tables.end()) ltabs = it->second;
+                    const uint64_t cur_epoch = g_layout_tables_epoch.load(std::memory_order_acquire);
+                    auto&          slot = tls_ltabs[((layh >> 4) ^ (layh >> 12)) & 63u];
+                    if (slot.layout != layh || slot.epoch != cur_epoch) {
+                        std::lock_guard l(g_layout_tables_mtx);
+                        const uint64_t  locked_epoch = g_layout_tables_epoch.load(std::memory_order_relaxed);
+                        auto            it = g_layout_tables.find(layh);
+                        slot.layout = layh;
+                        slot.epoch = locked_epoch;
+                        if (it != g_layout_tables.end()) {
+                            const uint32_t n = (uint32_t)(std::min<size_t>)(it->second.size(), 64u);
+                            for (uint32_t i = 0; i < n; ++i) slot.items[i] = it->second[i];
+                            slot.count = n;
+                        } else {
+                            slot.count = 0;
+                        }
+                    }
+                    ltab_ptr = slot.items;
+                    ltab_n = slot.count;
                 }
-                for (const auto& t : ltabs) {
+                for (uint32_t i = 0; i < ltab_n; ++i) {
+                    const auto&      t = ltab_ptr[i];
                     const TableStart ts = TableStartOf(cmd_list->get_device(), root[t.param].table);
                     if (!ts) continue;
                     auto* hp = ts.Heap();
                     if(paired_restore&&(!native_heaps||hp!=(t.kind==0?native_heaps->samplers:native_heaps->resources)))continue;
                     if (t.kind == 1 && !port_restore.srv) port_restore.srv = hp;
                     if (t.kind == 0 && !port_restore.smp) port_restore.smp = hp;
-                    port_restore.tables.emplace_back((UINT)t.param, (uint64_t)root[t.param].table.handle);
+                    if (port_restore.table_count < 64u)
+                        port_restore.tables[port_restore.table_count++] = { (UINT)t.param, (uint64_t)root[t.param].table.handle };
                 }
                 if(native_heaps){
                     port_restore.srv=native_heaps->resources;port_restore.smp=native_heaps->samplers;
@@ -825,9 +880,9 @@ static bool DrawComponentImpl(InjectFrame& fr, int dm, const WwmiMod::Component*
                                 logger::write("HEAPRESTORE: our heaps were set on this list and the game's CBV_SRV_UAV heap is unknown -- ours stay set");
                             }
                         }
-                        for (const auto& t : r->tables)
-                            r->cl->SetGraphicsRootDescriptorTable(t.first,
-                                D3D12_GPU_DESCRIPTOR_HANDLE{ t.second });
+                        for (uint32_t ti = 0; ti < r->table_count; ++ti)
+                            r->cl->SetGraphicsRootDescriptorTable(r->tables[ti].first,
+                                D3D12_GPU_DESCRIPTOR_HANDLE{ r->tables[ti].second });
                         if (r->mid) *r->mid = true;
                         (*static_cast<decltype(restore_state)*>(r->inner_user))();
                         if (r->mid) *r->mid = false; }, &port_restore, [](void*, unsigned slot) -> int { return slot == 4 ? t_cb4_root : slot == 3 ? t_cb3_root

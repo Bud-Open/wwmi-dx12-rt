@@ -158,15 +158,15 @@ bool InputCollector::may_select_blas(const D3D12_BUILD_RAYTRACING_ACCELERATION_S
         const auto native_profiles=registry_->snapshot();
         for(const auto &profile:native_profiles->profiles)if(native_layout_candidate(*profile,desc))return true;
         const auto interests=std::atomic_load(&discovery_interests_);
-        if(native_receipts_&&desc.Inputs.Type==D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL&&desc.Inputs.NumDescs){
+        if(native_receipts_&&interests&&!interests->intents.empty()&&desc.Inputs.Type==D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL&&desc.Inputs.NumDescs){
             ValidBlasGeoms valid;
             const bool layout=collect_valid_blas_geoms(desc,valid);
             if(layout){
-                for(const auto &i:*interests)if(NativeProfileRegistry::resolve(native_profiles,i).match==NativeProfileRegistry::Match::missing&&
+                for(const auto &i:interests->intents)if(NativeProfileRegistry::resolve(native_profiles,i).match==NativeProfileRegistry::Match::missing&&
                     native_geometry_window_map_subset(i.components.size(),[&](auto c){return i.components[c];},valid.count,
                         [&](auto vi){const auto &g=blas_geom_desc(desc,valid.idx[unsigned(vi)])->Triangles;return std::pair{g.IndexBuffer,g.IndexCount};},nullptr,valid.idx_stride))return true;
             }
-            for(const auto &i:*interests){
+            for(const auto &i:interests->intents){
                 if(NativeProfileRegistry::resolve(native_profiles,i).match!=NativeProfileRegistry::Match::missing)continue;
                 unsigned shared_big=0,first_ic=0;
                 for(unsigned g=0;g<desc.Inputs.NumDescs;++g){
@@ -327,7 +327,7 @@ Recording InputCollector::reset_list_deferred_stamp(api::command_list *c){
     if(list.has_skin_sample||list.skin_submit_started||list.pose_owner!=no_pose_owner)retain_submitted_poses(list);
     ++list.epoch.generation;
     list.poses.reset(list.epoch);
-    if(!bindings_.lists.empty())bindings_.reset(id(c));
+    if(!bindings_.lists.empty()){bindings_.reset(id(c));sync_active_binding_lists_locked();}
     if(copy_state_changed)refresh_native_copy_mask_locked();
     return list.epoch;
     // This is a client observed-reset epoch. The actual native scope rejects a
@@ -341,7 +341,7 @@ void InputCollector::destroy_list_deferred_stamp(api::command_list *c){
     (void)reset_list_deferred_stamp(c);
     std::lock_guard lock(mutex_);
     lists_.erase(id(c));
-    if(!bindings_.lists.empty())bindings_.reset(id(c));
+    if(!bindings_.lists.empty()){bindings_.reset(id(c));sync_active_binding_lists_locked();}
 }
 void InputCollector::destroy_list(api::command_list *c){
     destroy_list_deferred_stamp(c);
@@ -378,6 +378,7 @@ void InputCollector::init_layout(api::pipeline_layout layout,unsigned count,cons
 void InputCollector::destroy_layout(api::pipeline_layout layout){
     std::lock_guard lock(mutex_);evidence_layouts_.erase(layout.handle);bindings_.layouts.erase(layout.handle);
     std::erase_if(bindings_.lists,[&](const auto &v){return v.second.layout==layout.handle;});
+    sync_active_binding_lists_locked();
 }
 skin::Kind InputCollector::classify_compute_shader(const void *code,std::size_t bytes){
     return classify_skin_shader(code,bytes);
@@ -385,8 +386,10 @@ skin::Kind InputCollector::classify_compute_shader(const void *code,std::size_t 
 void InputCollector::init_pipeline_classified(api::pipeline p,api::pipeline_layout layout,skin::Kind kind,bool compute,const void *capture_code,std::size_t capture_bytes){
     std::lock_guard lock(mutex_);
     if(!evidence_shaders_.empty())evidence_shaders_.erase(p.handle);
-    if(!shaders_.empty())shaders_.erase(p.handle);
-    if(kind!=skin::Kind::none)shaders_[p.handle]={layout.handle,++serial_,kind};
+    bool shaders_changed=false;
+    if(!shaders_.empty())shaders_changed=shaders_.erase(p.handle)!=0;
+    if(kind!=skin::Kind::none){shaders_[p.handle]={layout.handle,++serial_,kind};shaders_changed=true;}
+    if(shaders_changed)sync_fast_shaders_locked();
     if(shape_evidence_enabled_&&compute){const auto l=evidence_layouts_.find(layout.handle);
         evidence_shaders_[p.handle]=shape_evidence_.shader(p.handle,shape_evidence_.next_creation(),l==evidence_layouts_.end()?nullptr:l->second,capture_code,capture_bytes);
     }
@@ -398,16 +401,36 @@ void InputCollector::init_pipeline(api::pipeline p,api::pipeline_layout layout,u
     init_pipeline_classified(p,layout,kind,compute,capture_code,capture_bytes);
 }
 void InputCollector::destroy_pipeline(api::pipeline p){
-    std::lock_guard lock(mutex_);evidence_shaders_.erase(p.handle);shaders_.erase(p.handle);
+    std::lock_guard lock(mutex_);evidence_shaders_.erase(p.handle);
+    if(shaders_.erase(p.handle)!=0)sync_fast_shaders_locked();
     std::erase_if(bindings_.lists,[&](const auto &v){return v.second.pipeline==p.handle;});
+    sync_active_binding_lists_locked();
 }
 bool InputCollector::tracks_pipeline_bind(api::command_list *c,api::pipeline p){
+    // Lock-free fast path when no command list holds an active skinning bind:
+    // bindings_.lists cannot contain id(c) because bind_pipeline on this same
+    // thread would have already published active_binding_lists_ >= 1.
+    if(active_binding_lists_.load(std::memory_order_acquire)==0){
+        const std::uint64_t s1=shaders_seq_.load(std::memory_order_acquire);
+        if((s1&1u)==0u){
+            const std::uint32_t n=fast_shader_count_.load(std::memory_order_relaxed);
+            if(n<=kFastShaderCap){
+                bool found=false;
+                for(std::uint32_t i=0;i<n;++i){
+                    if(fast_shader_handles_[i].load(std::memory_order_relaxed)==p.handle){found=true;break;}
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if(shaders_seq_.load(std::memory_order_relaxed)==s1)return found;
+            }
+        }
+    }
     std::lock_guard lock(mutex_);
     // A new known shader starts root evidence; an unrelated shader can
     // still erase evidence from a prior skin bind on this list.
     return shaders_.contains(p.handle)||bindings_.lists.contains(id(c));
 }
 bool InputCollector::tracks_table_bind(api::command_list *c,api::pipeline_layout layout,unsigned first,unsigned count){
+    if(active_binding_lists_.load(std::memory_order_acquire)==0)return false;
     std::lock_guard lock(mutex_);
     const auto b=bindings_.lists.find(id(c));
     if(b==bindings_.lists.end()||b->second.layout!=layout.handle)return false;
@@ -415,6 +438,7 @@ bool InputCollector::tracks_table_bind(api::command_list *c,api::pipeline_layout
     return includes(b->second.ports.srv)||includes(b->second.ports.uav);
 }
 bool InputCollector::tracks_cb_bind(api::command_list *c,api::pipeline_layout layout,unsigned param){
+    if(active_binding_lists_.load(std::memory_order_acquire)==0)return false;
     std::lock_guard lock(mutex_);
     const auto b=bindings_.lists.find(id(c));
     return b!=bindings_.lists.end()&&b->second.layout==layout.handle&&
@@ -423,8 +447,9 @@ bool InputCollector::tracks_cb_bind(api::command_list *c,api::pipeline_layout la
 void InputCollector::bind_pipeline(api::command_list *c,api::pipeline_stage stages,api::pipeline p){
     if(!(static_cast<unsigned>(stages)&static_cast<unsigned>(api::pipeline_stage::compute_shader|api::pipeline_stage::ray_tracing_shader)))return;
     std::lock_guard lock(mutex_);auto s=shaders_.find(p.handle);
-    if(s==shaders_.end()){bindings_.reset(id(c));return;}
+    if(s==shaders_.end()){bindings_.reset(id(c));sync_active_binding_lists_locked();return;}
     bindings_.bind(id(c),p.handle,s->second.generation,s->second.layout,s->second.kind);
+    sync_active_binding_lists_locked();
 }
 void InputCollector::bind_tables(api::command_list *c,api::shader_stage stages,api::pipeline_layout layout,unsigned first,unsigned count,const api::descriptor_table *tables){
     if(!(static_cast<unsigned>(stages)&static_cast<unsigned>(api::shader_stage::all_compute)))return;
@@ -622,6 +647,7 @@ bool InputCollector::view(std::uint64_t table,unsigned binding,View &out){
     out={entry->second,device_->get_resource_view_desc(api::resource_view{source.source_view})};return true;
 }
 bool InputCollector::has_skin_dispatch(api::command_list *c){
+    if(active_binding_lists_.load(std::memory_order_acquire)==0)return false;
     std::lock_guard lock(mutex_);const auto b=bindings_.lists.find(id(c));
     if(b==bindings_.lists.end()||!lists_.contains(id(c)))return false;
     const auto s=shaders_.find(b->second.pipeline);
@@ -800,6 +826,77 @@ InputCollector::PositionReceipt InputCollector::position_receipt(ResourceKey key
 unsigned InputCollector::position_submission_count(const SkinSample &s){
     const auto p=position_receipt(s.output,s.output_offset,s.output_bytes);
     return p.order==s.order&&p.producer==s.recording?p.submissions:UINT32_MAX;
+}
+InputCollector::HybridPreflight InputCollector::query_hybrid_preflight(
+    api::command_list *list,std::uint64_t primitive_res,std::uint64_t primitive_origin){
+    HybridPreflight out{};
+    std::lock_guard lock(mutex_);
+    if(const auto it=lists_.find(id(list));it!=lists_.end())out.consumer=it->second.epoch;
+    if(const auto r=resources_.find(primitive_res);
+       r!=resources_.end()&&r->second.heap==api::memory_heap::upload&&current(r->second)&&
+       r->second.base&&primitive_origin<=UINT64_MAX-r->second.base&&
+       (r->second.base+primitive_origin)%256==0&&
+       identity::fits(primitive_origin,720,r->second.bytes)&&
+       unique_current(r->second,r->second.base+primitive_origin,720)){
+        out.primitive=r->second.key;
+    }
+    return out;
+}
+bool InputCollector::query_hybrid_liveness(std::span<HybridPoseCheck> pose_checks,
+    const NativeBlasIdentity &current_id,unsigned expected_submissions,bool check_current){
+    std::lock_guard lock(mutex_);
+    const auto pos_live_locked=[&](const SkinSample &s)->bool{
+        const auto r=resources_.find(s.output.object),content=resources_.find(s.content.object);
+        if(r==resources_.end()||r->second.key!=s.output||!current(r->second)||
+           content==resources_.end()||content->second.key!=s.content||!current(content->second))return false;
+        const auto *p=find_position_stamp_locked(s.output,s.output_offset,s.output_bytes);
+        return p&&p->order==s.order;
+    };
+    for(auto &chk:pose_checks){
+        const bool owner_ok=(chk.primitive&&live_key(chk.primitive))||chk.linked_known;
+        if(!owner_ok||!chk.identity){chk.alive=false;continue;}
+        bool any_live=false;
+        for(const auto &c:chk.identity->components){
+            if(pos_live_locked(c.sample)){any_live=true;break;}
+        }
+        chk.alive=any_live;
+    }
+    if(!check_current)return false;
+    for(const auto &c:current_id.components){
+        const auto &s=c.sample;
+        if(s.recording!=current_id.recording)return false;
+        const auto r=resources_.find(s.output.object);
+        if(r==resources_.end()||r->second.key!=s.output||!current(r->second))return false;
+        const auto *p=find_position_stamp_locked(s.output,s.output_offset,s.output_bytes);
+        if(!p||p->order!=s.order||p->producer!=s.recording||p->submissions!=expected_submissions)
+            return false;
+    }
+    return true;
+}
+InputCollector::PositionReceipt InputCollector::query_hybrid_previous(
+    ResourceKey read_resource,std::uint64_t read_offset,std::uint64_t read_bytes,
+    std::span<const SkinSample *const> candidates,
+    std::span<std::uint8_t> live_out){
+    std::lock_guard lock(mutex_);
+    PositionReceipt receipt{};
+    if(const auto r=resources_.find(read_resource.object);
+       r!=resources_.end()&&r->second.key==read_resource&&current(r->second)){
+        if(const auto *p=find_position_stamp_locked(read_resource,read_offset,read_bytes))
+            receipt={p->producer,p->order,p->submissions,p->native_queue};
+    }
+    const std::size_t n=(std::min)(candidates.size(),live_out.size());
+    for(std::size_t i=0;i<n;++i){
+        const SkinSample *s=candidates[i];
+        if(!s){live_out[i]=0;continue;}
+        const auto r=resources_.find(s->output.object),content=resources_.find(s->content.object);
+        if(r==resources_.end()||r->second.key!=s->output||!current(r->second)||
+           content==resources_.end()||content->second.key!=s->content||!current(content->second)){
+            live_out[i]=0;continue;
+        }
+        const auto *p=find_position_stamp_locked(s->output,s->output_offset,s->output_bytes);
+        live_out[i]=(p&&p->order==s->order)?1u:0u;
+    }
+    return receipt;
 }
 const char *InputCollector::native_position_srv_error(std::uint64_t resource,std::uint64_t offset,std::uint64_t bytes,unsigned format,unsigned stride,ResourceKey &out){
     std::lock_guard lock(mutex_);
@@ -1422,8 +1519,26 @@ Assembly InputCollector::select(api::command_list *c,const D3D12_BUILD_RAYTRACIN
     return {PoseResult::missing_producer,{}};
 }
 bool InputCollector::discovery_interested()const noexcept{
-    if(!native_receipts_)return false;const auto state=registry_->snapshot();const auto interests=std::atomic_load(&discovery_interests_);
-    return std::any_of(interests->begin(),interests->end(),[&](const auto &i){return NativeProfileRegistry::resolve(state,i).match==NativeProfileRegistry::Match::missing;});
+    if(!native_receipts_)return false;
+    // Sample the append-only profile registry BEFORE the intent snapshot so a
+    // reader can never pair an older intent list with a newer registry publish.
+    const auto state=registry_->snapshot();
+    const auto interests=std::atomic_load(&discovery_interests_);
+    if(!interests||interests->intents.empty())return false;
+    const std::uint64_t snap_rev=state?state->revision:0ull;
+    const std::uint64_t int_gen=interests->generation;
+    struct Cache {
+        std::uint64_t id=0,snap_rev=0,int_gen=0;
+        bool val=false;
+    };
+    static thread_local Cache tls{};
+    if(tls.id==collector_id_&&tls.snap_rev==snap_rev&&tls.int_gen==int_gen)
+        return tls.val;
+    const bool val=std::any_of(interests->intents.begin(),interests->intents.end(),[&](const auto &i){
+        return NativeProfileRegistry::resolve(state,i).match==NativeProfileRegistry::Match::missing;
+    });
+    tls={collector_id_,snap_rev,int_gen,val};
+    return val;
 }
 void InputCollector::native_copy(api::command_list *c,api::resource source,std::uint64_t from,api::resource dest,std::uint64_t to,std::uint64_t bytes,bool recorded){
     std::lock_guard lock(mutex_);const auto d=resources_.find(dest.handle),s=resources_.find(source.handle);const auto list=lists_.find(id(c));

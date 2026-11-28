@@ -71,12 +71,16 @@
         f.offset=previous.offset+offset;f.bytes=s.output_bytes;f.view_offset=previous.offset;
         f.receipt=inputs.position_receipt(f.resource,f.offset,f.bytes);
     }
+    void advance_hybrid_load(std::uint64_t next_load){
+        if(next_load<=hybrid_load)return;
+        for(const auto &[_,old]:hybrid_assets)author_static_assets.erase(old->pack.get());
+        hybrid_assets.clear();hybrid_poses.clear();
+        hybrid_load=next_load;
+    }
     std::shared_ptr<HybridAsset> hybrid_asset(const wwmi::hybrid::Asset &a,const std::shared_ptr<const NativeProfile> &profile){
         namespace h=wwmi::hybrid;
-        if(hybrid_load!=a.load){
-            for(const auto &[_,old]:hybrid_assets)author_static_assets.erase(old->pack.get());
-            hybrid_assets.clear();hybrid_poses.clear();hybrid_load=a.load;
-        }
+        if(a.load<hybrid_load)return {};
+        advance_hybrid_load(a.load);
         const auto key=std::make_tuple(a.load,a.mod,a.version);
         if(auto it=hybrid_assets.find(key);it!=hybrid_assets.end())
             return it->second->pack->native==profile?it->second:nullptr;
@@ -128,25 +132,76 @@
         const std::shared_ptr<HybridAsset> &asset,const std::shared_ptr<const NativeBlasIdentity> &id,
         unsigned component,ResourceKey primitive,std::uint64_t origin){
         if(!read.resource||!read.receipt.order||read.receipt.submissions!=1||!read.receipt.native_queue)return nullptr;
-        const auto receipt=inputs.position_receipt(read.resource,read.offset,read.bytes);
-        if(receipt.producer!=read.receipt.producer||receipt.order!=read.receipt.order||
-           receipt.submissions!=1||receipt.native_queue!=read.receipt.native_queue)return nullptr;
         const auto &now=id->components[component];
-        const auto matches=[&](const auto &source){
-            if(!source||source==id||source->recording!=receipt.producer||
+        const auto field_matches=[&](const auto &source){
+            if(!source||source==id||source->recording!=read.receipt.producer||
                source->components.size()!=id->components.size())return false;
             const auto &old=source->components[component];
             const auto &s=old.sample;
-            return s.output==read.resource&&s.order==receipt.order&&s.recording==receipt.producer&&
+            return s.output==read.resource&&s.order==read.receipt.order&&s.recording==read.receipt.producer&&
                 s.profile==now.sample.profile&&s.component==now.sample.component&&
                 s.content==now.sample.content&&s.content_offset==now.sample.content_offset&&
                 old.indices==now.indices&&old.index_offset==now.index_offset&&old.index_count==now.index_count&&
                 old.vertices.vertex==read.resource&&old.vertices.offset==read.view_offset&&
-                s.output_offset==read.offset&&s.output_bytes==read.bytes&&inputs.position_live(s);
+                s.output_offset==read.offset&&s.output_bytes==read.bytes;
         };
         const auto proved=[&](NativeIdentityFence signal){
-            return signal.queue==receipt.native_queue&&writer_signal_known(signal,false);
+            return signal.queue==read.receipt.native_queue&&writer_signal_known(signal,false);
         };
+        // Pre-filter candidates without locking inputs.mutex_, then verify
+        // position_receipt + position_live for all matched candidates in 1 lock.
+        constexpr std::size_t kInlineCand=32;
+        std::array<const SkinSample *,kInlineCand> cand_buf{};
+        std::array<std::uint8_t,kInlineCand> live_buf{};
+        std::vector<const SkinSample *> cand_vec;
+        std::vector<std::uint8_t> live_vec;
+        std::array<std::size_t,kInlineCand> pose_idx_buf{};
+        std::vector<std::size_t> pose_idx_vec;
+        std::array<std::size_t,kInlineCand> hist_idx_buf{};
+        std::vector<std::size_t> hist_idx_vec;
+        std::size_t pose_cand_n=0,hist_cand_n=0;
+        const auto push_cand=[&](const SkinSample *s,std::size_t idx,bool is_pose){
+            const std::size_t total=pose_cand_n+hist_cand_n;
+            if(cand_vec.empty()&&total<kInlineCand){
+                cand_buf[total]=s;
+                if(is_pose)pose_idx_buf[pose_cand_n++]=idx;else hist_idx_buf[hist_cand_n++]=idx;
+            }else{
+                if(cand_vec.empty()){
+                    cand_vec.assign(cand_buf.begin(),cand_buf.begin()+total);
+                    pose_idx_vec.assign(pose_idx_buf.begin(),pose_idx_buf.begin()+pose_cand_n);
+                    hist_idx_vec.assign(hist_idx_buf.begin(),hist_idx_buf.begin()+hist_cand_n);
+                }
+                cand_vec.push_back(s);
+                if(is_pose){pose_idx_vec.push_back(idx);++pose_cand_n;}else{hist_idx_vec.push_back(idx);++hist_cand_n;}
+            }
+        };
+        for(std::size_t i=0;i<hybrid_poses.size();++i){
+            const auto &old=hybrid_poses[i];
+            if(old.asset!=asset||!field_matches(old.identity))continue;
+            const bool adopted=old.primitive==primitive&&old.origin==origin&&
+                old.adopted[component]!=wwmi::hybrid::unavailable;
+            if(!adopted&&!proved(old.linked_history))continue;
+            push_cand(&old.identity->components[component].sample,i,true);
+        }
+        for(std::size_t i=0;i<surface_history.size();++i){
+            const auto &old=surface_history[i];
+            if(old.pack||!proved(old.native_signal)||!field_matches(old.identity))continue;
+            push_cand(&old.identity->components[component].sample,i,false);
+        }
+        const std::size_t total_cands=pose_cand_n+hist_cand_n;
+        std::span<const SkinSample *const> cand_span;
+        std::span<std::uint8_t> live_span;
+        if(cand_vec.empty()){
+            cand_span={cand_buf.data(),total_cands};
+            live_span={live_buf.data(),total_cands};
+        }else{
+            live_vec.assign(total_cands,0);
+            cand_span={cand_vec.data(),total_cands};
+            live_span={live_vec.data(),total_cands};
+        }
+        const auto receipt=inputs.query_hybrid_previous(read.resource,read.offset,read.bytes,cand_span,live_span);
+        if(receipt.producer!=read.receipt.producer||receipt.order!=read.receipt.order||
+           receipt.submissions!=1||receipt.native_queue!=read.receipt.native_queue)return nullptr;
         // Cached and native-history entries are two ways to prove the
         // previous identity, not competing lookup routes. Repeated views of
         // the same identity are fine; a different linked cohort is not.
@@ -156,22 +211,20 @@
             exact=identity;return true;
         };
         HybridPose *found=nullptr;
-        for(auto &old:hybrid_poses){
-            if(old.asset!=asset||!matches(old.identity))continue;
+        for(std::size_t k=0;k<pose_cand_n;++k){
+            if(!live_span[k])continue;
+            const std::size_t idx=cand_vec.empty()?pose_idx_buf[k]:pose_idx_vec[k];
+            auto &old=hybrid_poses[idx];
             const bool adopted=old.primitive==primitive&&old.origin==origin&&
                 old.adopted[component]!=wwmi::hybrid::unavailable;
-            if(!adopted&&!proved(old.linked_history))continue;
             if(!consider(old.identity))return nullptr;
             if(!found||adopted)found=&old;
         }
-        // The VS's original typed SRV identifies a written position range.
-        // Its submitted, linked native snapshot proves all palette providers
-        // even if there was no previously adopted draw at this upload origin.
-        // The immutable author mesh uses those same local-space bone rows;
-        // the draw's original VS still supplies its own previous transform.
         NativeIdentityFence signal{};
-        for(const auto &old:surface_history){
-            if(old.pack||!proved(old.native_signal)||!matches(old.identity))continue;
+        for(std::size_t k=0;k<hist_cand_n;++k){
+            if(!live_span[pose_cand_n+k])continue;
+            const std::size_t idx=cand_vec.empty()?hist_idx_buf[k]:hist_idx_vec[k];
+            const auto &old=surface_history[idx];
             if(!consider(old.identity))return nullptr;
             signal=old.native_signal;
         }
@@ -195,11 +248,13 @@
         if(!cap||!hybrid_probe_captured(*cap,q.asset->load,q.asset->mod))return h::unavailable;
         const auto match=cap->match;
         const auto &id=match.identity;
+        if(match.component>=id->components.size())return h::unavailable;
         auto *list=reinterpret_cast<api::command_list *>(q.native.list);
-        const auto consumer=inputs.recording(list);
+        const auto preflight=inputs.query_hybrid_preflight(list,q.instance.resource,q.instance.byte_origin);
+        const auto consumer=preflight.consumer;
         auto binding=hold_draw_recording(consumer,list);
-        if(!binding||match.component>=id->components.size())return h::unavailable;
-        const auto primitive=inputs.primitive_key(q.instance.resource,q.instance.byte_origin);
+        if(!binding)return h::unavailable;
+        const auto primitive=preflight.primitive;
         if(!primitive)return h::unavailable;
         if(!q.count)return h::empty_selection;
         const auto &sample=id->components[match.component].sample;
@@ -221,23 +276,47 @@
         // components to share another component's material/shader pass.
         if((shape||remap_mismatch)&&!q.allow_base)return h::unavailable;
         const auto mode=(shape||remap_mismatch)?h::base_skin:h::exact;
-        std::erase_if(hybrid_poses,[&](const auto &p){
-            return ((!p.primitive||!inputs.resource_current(p.primitive))&&!writer_signal_known(p.linked_history,false))||
-                std::none_of(p.identity->components.begin(),p.identity->components.end(),[&](const auto &c){
-                    return inputs.position_live(c.sample);
-                });
-        });
-        // This precise native multi-component BLAS is already linked by 06.
-        // Do not merge disjoint VG windows from a second raw dispatch/ring.
+        // Build the pose-pruning snapshot and verify current position-output
+        // liveness strictly AFTER hybrid_asset() (which may clear hybrid_poses
+        // via advance_hybrid_load()) and asset->proof.prove(), using ONE
+        // batched inputs.mutex_ acquisition.
         NativeIdentityFence live_producer=match.producer;
         unsigned live_submissions=match.submissions;
-        const bool current_live=identities.live_state(id,live_submissions,live_producer)&&
+        const bool id_live_pre=
+            identities.live_state(id,live_submissions,live_producer)&&
             live_submissions<=1&&(match.submissions==0||live_submissions==1)&&
             std::all_of(id->components.begin(),id->components.end(),[&](const auto &c){
-                return c.sample.recording==id->recording&&identities.live(id,c.sample.component)&&
-                    inputs.position_submission_count(c.sample)==live_submissions;
+                return c.sample.recording==id->recording&&identities.live(id,c.sample.component);
             });
-        if(!current_live)return h::unavailable;
+        constexpr std::size_t kInlinePoses=32;
+        std::array<InputCollector::HybridPoseCheck,kInlinePoses> checks_buf{};
+        std::vector<InputCollector::HybridPoseCheck> checks_vec;
+        std::span<InputCollector::HybridPoseCheck> checks;
+        const std::size_t pose_n=hybrid_poses.size();
+        if(pose_n<=kInlinePoses){
+            checks={checks_buf.data(),pose_n};
+        }else{
+            checks_vec.resize(pose_n);
+            checks=checks_vec;
+        }
+        for(std::size_t i=0;i<pose_n;++i){
+            const auto &p=hybrid_poses[i];
+            checks[i]={p.primitive,writer_signal_known(p.linked_history,false),p.identity.get(),false};
+        }
+        const bool current_submissions_match=inputs.query_hybrid_liveness(checks,*id,live_submissions,id_live_pre);
+        if(pose_n){
+            std::size_t dst_i=0;
+            for(std::size_t i=0;i<pose_n;++i){
+                if(checks[i].alive){
+                    if(dst_i!=i)hybrid_poses[dst_i]=std::move(hybrid_poses[i]);
+                    ++dst_i;
+                }
+            }
+            hybrid_poses.resize(dst_i);
+        }
+        // This precise native multi-component BLAS is already linked by 06.
+        // Do not merge disjoint VG windows from a second raw dispatch/ring.
+        if(!id_live_pre||!current_submissions_match)return h::unavailable;
         cap->match.submissions=live_submissions;
         cap->match.producer=live_producer;
         auto same_scope=[&](const auto &p){return p.asset==asset&&p.primitive==primitive&&p.origin==q.instance.byte_origin;};

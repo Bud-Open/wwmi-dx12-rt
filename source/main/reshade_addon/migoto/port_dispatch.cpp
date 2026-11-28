@@ -20,6 +20,7 @@
 #include "prof_core.h" // PROF(PL_*): the engine-lock WAITs measured apart from the work, the lookups
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -673,15 +674,51 @@ namespace {
 thread_local void (*g_typed_cb)(const ObservedCommand&, void*) = nullptr;
 thread_local void* g_typed_cb_user = nullptr;
 
+struct NameCache {
+    struct Way {
+        const void*    ptr = nullptr;
+        const wchar_t* val = nullptr;
+        unsigned       gen = ~0u;
+    };
+    struct Set {
+        Way     ways[2]{};
+        uint8_t next_victim = 0;
+    };
+    std::array<Set, 256> sets{};
+
+    const wchar_t* lookup(std::unordered_map<const void*, std::wstring>& idx, const void* p, unsigned gen)
+    {
+        if (!p) return nullptr;
+        const uintptr_t v = reinterpret_cast<uintptr_t>(p);
+        auto&           s = sets[((v >> 4) ^ (v >> 12) ^ (v >> 20)) & 255u];
+        if (s.ways[0].ptr == p && s.ways[0].gen == gen) {
+            s.next_victim = 1;
+            return s.ways[0].val;
+        }
+        if (s.ways[1].ptr == p && s.ways[1].gen == gen) {
+            s.next_victim = 0;
+            return s.ways[1].val;
+        }
+        auto           it = idx.find(p);
+        const wchar_t* val = (it == idx.end() || it->second.empty()) ? nullptr : it->second.c_str();
+        unsigned       w = s.next_victim & 1u;
+        if (s.ways[0].ptr == p || s.ways[0].gen != gen)
+            w = 0;
+        else if (s.ways[1].ptr == p || s.ways[1].gen != gen)
+            w = 1;
+        s.ways[w] = { p, val, gen };
+        s.next_victim = uint8_t(w ^ 1u);
+        return val;
+    }
+};
+
 void TypedTrampoline(const MigotoPort::ObservedCmd& in, void*)
 {
     if (!g_typed_cb) return;
     PROF(PL_PS_Observe);
-    auto key_of = [](std::unordered_map<const void*, std::wstring>& idx, const void* p) -> const wchar_t* {
-        if (!p) return nullptr;
-        auto it = idx.find(p);
-        return (it == idx.end() || it->second.empty()) ? nullptr : it->second.c_str();
-    };
+    static thread_local NameCache s_explicit_cache;
+    static thread_local NameCache s_custom_cache;
+    const unsigned                gen = g_generation;
     ObservedCommand o;
     if (in.kind == MigotoPort::ObservedCmd::Kind::RunList)
         o.kind = ObservedCommand::Kind::RunList;
@@ -702,11 +739,11 @@ void TypedTrampoline(const MigotoPort::ObservedCmd& in, void*)
     o.dst_slot = in.dst_slot;
     o.post = in.post;
     if (o.kind == ObservedCommand::Kind::RunList) {
-        o.run_target = key_of(ExplicitNameIndex(), in.run_explicit);
+        o.run_target = s_explicit_cache.lookup(ExplicitNameIndex(), in.run_explicit, gen);
         if (!o.run_target && in.run_target && *in.run_target) o.run_target = in.run_target;
     } else {
-        if (o.dst_is_custom) o.dst_resource = key_of(CustomResourceNameIndex(), in.dst_custom);
-        if (o.dst_is_custom || o.dst_is_vb || o.dst_is_ib) o.src_resource = key_of(CustomResourceNameIndex(), in.src_custom);
+        if (o.dst_is_custom) o.dst_resource = s_custom_cache.lookup(CustomResourceNameIndex(), in.dst_custom, gen);
+        if (o.dst_is_custom || o.dst_is_vb || o.dst_is_ib) o.src_resource = s_custom_cache.lookup(CustomResourceNameIndex(), in.src_custom, gen);
         o.src_custom = in.src_custom;
     }
     g_typed_cb(o, g_typed_cb_user);

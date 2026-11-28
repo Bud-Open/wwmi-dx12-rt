@@ -174,6 +174,9 @@ private:
     std::shared_ptr<NativeProfileRegistry> registry_;
     std::vector<NativeMeshIntent> intents_;
     bool forced_=false;
+    mutable const void *cached_interest_snap_=nullptr;
+    mutable std::uint64_t cached_interest_rev_=0;
+    mutable bool cached_interest_val_=false;
     Counters counters_;
     bool pending(const NativeMeshIntent &i)const{return forced_||NativeProfileRegistry::resolve(registry_->snapshot(),i).match==NativeProfileRegistry::Match::missing;}
     std::uint64_t serial_=0,order_=0;
@@ -192,11 +195,19 @@ public:
     void note_skin(){++counters_.skin_seen;}
     void note_blas(){++counters_.blas_seen;}
     void note_failure(Failure f){if(f!=Failure::none){++counters_.rejected[unsigned(f)];counters_.last_failure=f;}}
-    void set_intents(const std::vector<NativeMeshIntent> &values){intents_=values;forced_=false;}
-    void force(){forced_=true;}
+    void set_intents(const std::vector<NativeMeshIntent> &values){intents_=values;forced_=false;cached_interest_snap_=nullptr;}
+    void force(){forced_=true;cached_interest_snap_=nullptr;}
     bool interested()const{
-        if(forced_)return !intents_.empty();const auto state=registry_->snapshot();
-        return std::any_of(intents_.begin(),intents_.end(),[&](const auto &i){return NativeProfileRegistry::resolve(state,i).match==NativeProfileRegistry::Match::missing;});
+        if(forced_)return !intents_.empty();
+        if(intents_.empty())return false;
+        const auto state=registry_->snapshot();
+        const auto rev=state?state->revision:0ull;
+        if(state.get()==cached_interest_snap_&&rev==cached_interest_rev_)return cached_interest_val_;
+        const bool res=std::any_of(intents_.begin(),intents_.end(),[&](const auto &i){return NativeProfileRegistry::resolve(state,i).match==NativeProfileRegistry::Match::missing;});
+        cached_interest_snap_=state.get();
+        cached_interest_rev_=rev;
+        cached_interest_val_=res;
+        return res;
     }
     bool written(NativeRange);
     void destroyed(ResourceKey);
@@ -644,7 +655,7 @@ inline std::vector<std::pair<std::shared_ptr<NativeDiscovery::Bytes>,std::shared
             if(native_mesh_content_hash(std::span<const unsigned char>(p->data->data(),std::size_t(n)))==native->content_hash)out.emplace_back(p,native);
         }
     }
-    if(!interested())for(auto &p:bytes_)if(p->point==ReadPoint::index_consumer||(p->point==ReadPoint::upload_copy&&p->bindings_revision==state->revision))p->retired=true;
+    if(!interested())for(auto &p:bytes_)if(p->point==ReadPoint::index_consumer||((p->point==ReadPoint::upload_copy||(!p->gpu&&p->point==ReadPoint::rest_consumer))&&p->bindings_revision==state->revision))p->retired=true;
     return out;
 }
 }

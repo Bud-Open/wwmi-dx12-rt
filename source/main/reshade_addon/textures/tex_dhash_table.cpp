@@ -1,6 +1,7 @@
 // CPU texture fingerprints for native [Filter] matching.
 #include "tex_dhash_table.h"
 #include "tex_dhash.h"
+#include "../instrumentation/profiler.h"
 #include "../migoto/port_api.h"
 #include <algorithm>
 #include <cstring>
@@ -85,6 +86,7 @@ bool HashUpload(ID3D12Resource* src, uint64_t offset, const DHashMipLayout& l,
     if (!l.Fits(pitch, limit - base_off))
         return false;
 
+    PROF(PROF_CB_DHash);
     std::vector<uint32_t> rows;
     texdhash::RowsRead(mip.w, mip.h, mip.fmt, [&](uint32_t r) { rows.push_back(r); });
     if (rows.empty() || rows.back() >= l.rows) return false;
