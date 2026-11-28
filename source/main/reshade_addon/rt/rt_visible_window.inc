@@ -22,12 +22,20 @@ constexpr unsigned kRtMaterialBinMs=rt_phase_cpu::bin_ms;
 std::array<RtMaterialMirrorBin,kRtDrawWindowMs/kRtMaterialBinMs> rt_material_mirror{};
 std::array<unsigned,rt_phase_cpu::bins> rt_phase_presents{};
 std::atomic<unsigned> rt_material_mirror_writers{};
+static bool RtClothQuietPerf() noexcept {
+    static const bool quiet = []() {
+        wchar_t val[16]{};
+        const DWORD n = GetEnvironmentVariableW(L"WWMI_RT_PERF_QUIET_CLOTH", val, DWORD(std::size(val)));
+        return n > 0 && n < std::size(val) && val[0] != L'0';
+    }();
+    return quiet;
+}
 bool RtDrawWindowOpen(){
     return field_state.load(std::memory_order_acquire)==1&&GetTickCount64()-field_begin<kRtDrawWindowMs;
 }
 struct RtFieldDraw {
     bool active;RtPassKey key{};unsigned subdraws=0,empty=0,author_t0=0;
-    explicit RtFieldDraw(bool candidate):active(candidate&&RtDrawWindowOpen()){}
+    explicit RtFieldDraw(bool candidate):active(candidate&&!RtClothQuietPerf()&&RtDrawWindowOpen()){}
     ~RtFieldDraw(){
         if(!active)return;
         std::lock_guard l(field_mx);if(field_state.load()!=1)return;
@@ -124,7 +132,11 @@ void RtWriteDrawWindow(ULONGLONG now,bool detach=false){
            (unsigned long long)k.vs,(unsigned long long)k.pso,k.rts,k.depth,k.path,row.candidates,row.subdraws,row.empty,row.author_t0);
         reshade::log::message(reshade::log::level::info,msg);
     }
-    char msg[144];std::snprintf(msg,sizeof(msg),"RT-VISIBLE end: elapsed_ms=%llu torso_candidates=%u",(unsigned long long)covered,total);
+    char msg[144];
+    if(RtClothQuietPerf())
+        std::snprintf(msg,sizeof(msg),"RT-VISIBLE end: elapsed_ms=%llu torso_candidates=suppressed",(unsigned long long)covered);
+    else
+        std::snprintf(msg,sizeof(msg),"RT-VISIBLE end: elapsed_ms=%llu torso_candidates=%u",(unsigned long long)covered,total);
     reshade::log::message(reshade::log::level::info,msg);
 }
 }
@@ -284,7 +296,9 @@ const std::array<std::wstring,2> &RtArmRequests(){
     return paths;
 }
 std::string_view RtArmSession(char (&token)[256]){
-    const auto n=GetEnvironmentVariableA("WWMI_RT_CAPTURE_SESSION",token,sizeof(token));
+    auto n=GetEnvironmentVariableA("WWMI_RT_PERF_SESSION",token,sizeof(token));
+    if(n&&n<sizeof(token))return std::string_view(token,n);
+    n=GetEnvironmentVariableA("WWMI_RT_CAPTURE_SESSION",token,sizeof(token));
     return n&&n<sizeof(token)?std::string_view(token,n):std::string_view{};
 }
 }

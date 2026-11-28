@@ -20,7 +20,8 @@ struct GpuWorkSample {
 struct AuthorWorkBin {
     std::uint64_t first_frame=0,last_frame=0;
     std::uint64_t created_full=0,created_component=0,distinct_created=0,identity_excluded=0;
-    std::uint64_t equivalent_pending=0,storage_reuse=0,position_bytes=0,tangent_bytes=0;
+    std::uint64_t equivalent_pending=0,equivalent_unsubmitted=0,equivalent_inflight=0,storage_reuse=0,position_bytes=0,tangent_bytes=0;
+    std::uint64_t page_breaks_desc=0,page_breaks_const=0,page_const_high_water=0;
     std::uint64_t local_acquire=0,cross_ready=0,uncommitted_reset=0;
     std::uint64_t prefix_submit_full=0,prefix_submit_component=0,prefix_vertices=0,command_retired=0;
     std::uint64_t sections=0,parts=0,indices=0,current_default=0,current_bootstrap=0,previous_default=0,previous_bootstrap=0;

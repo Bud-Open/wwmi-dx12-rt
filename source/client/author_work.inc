@@ -43,6 +43,7 @@
             // Preserve actual source ranges, recording identities and write
             // orders; equal palettes and unequal pointers alone prove neither.
             std::vector<std::uint64_t> key{pose.pack->load_generation,pose.pack->key,pose.pack->revision,coverage,
+                std::uint64_t(batch.tangents!=nullptr),
                 pose.recording.list,pose.recording.creation,pose.recording.generation,pose.content.object,pose.content.creation,pose.content_offset};
             key.reserve(key.size()+18*pose.source_orders.size());
             for(std::size_t i=0;i<pose.source_orders.size();++i){
@@ -56,19 +57,22 @@
             }
             auto &row=work.generations[std::move(key)];
             if(bin){
-                const bool pending=std::any_of(row.outputs.begin(),row.outputs.end(),[&](const auto &weak){
+                bool unsubmitted=false, inflight=false;
+                for(const auto &weak:row.outputs){
                     const auto other=weak.lock();
-                    if(!other||other->batch->gpu_recording==batch.gpu_recording)return false;
-                    if(!other->submitted)return true;
+                    if(!other||other->batch->gpu_recording==batch.gpu_recording)continue;
+                    if(!other->submitted){unsubmitted=true;continue;}
                     const auto signal=other->production;const auto q=queues.find(signal.queue);
                     if(!signal.value||q==queues.end()||reinterpret_cast<std::uint64_t>(q->second.author_ready.Get())!=signal.fence||
-                       q->second.author_completed>=signal.value)return false;
+                       q->second.author_completed>=signal.value)continue;
                     // Only an exact equivalent duplicate warrants a read of
                     // its existing fence when cached completion is older.
                     const auto completed=q->second.author_ready->GetCompletedValue();
-                    return completed!=UINT64_MAX&&completed<signal.value;
-                });
-                bin->equivalent_pending+=pending;
+                    if(completed!=UINT64_MAX&&completed<signal.value)inflight=true;
+                }
+                bin->equivalent_unsubmitted+=unsubmitted;
+                bin->equivalent_inflight+=inflight;
+                bin->equivalent_pending+=(unsubmitted||inflight);
                 if(!row.created_here){++bin->distinct_created;row.created_here=true;}
             }
             row.outputs.push_back(out);++work.generation_entries;
@@ -224,7 +228,7 @@
             const unsigned state=!a.bootstrap?0:!a.geometry||(a.producer&&!a.signalled)?3:a.producer?2:1;
             const auto &g=*(a.bootstrap?a.bootstrap:a.geometry);const auto &p=*g.pack;
             ++bin.asset_count[state];
-            bin.asset_bytes[state]+=p.positions.size()+p.blends.size()+p.indices.size()+
+            bin.asset_bytes[state]+=p.positions.size()+p.blends.size()+(g.indices?g.indices->GetDesc().Width:p.indices.size())+
                 (g.vectors?p.vectors.size():0)+(g.uv?p.uv.size():0)+(g.color?p.color.size():0);
         }
         std::map<const GeometryBatch *,unsigned> owners;
@@ -239,10 +243,11 @@
         const auto history=[&](const auto &outputs){
             if(!outputs)return;
             const auto note=[&](const auto &o){if(o)owners[o->batch.get()]|=4;};
-            note(outputs->full);for(const auto &part:outputs->parts)note(part);
+            note(outputs->full);note(outputs->full_positions_only);for(const auto &part:outputs->parts)note(part);
         };
         for(const auto &h:surface_history)history(h.author_outputs);
         for(const auto &p:previous_prepared)history(p.author_outputs);
+        for(const auto &hp:hybrid_poses)history(hp.outputs);
         for(const auto &cmd:author_commands)if(cmd->producing)owners[cmd->producing.get()]|=8;
         for(const auto &storage:author_stream_pool.storage){
             const auto batch=storage->resident.lock();const auto owner=batch?owners[batch.get()]:0;
@@ -275,12 +280,13 @@
                 const auto coverage=observed_ms==0?"unobserved":observed_ms==AuthorWorkWindow::bin_ms?"full":"partial";
                 const auto &b=work.bins[i];
                 std::snprintf(line,sizeof(line),
-                    "RT-AUTHOR-WORK bin=%u begin_ms=%llu end_ms=%llu first_frame=%llu last_frame=%llu created_full=%llu created_component=%llu distinct_created=%llu identity_excluded=%llu equivalent_pending=%llu storage_reuse=%llu new_position_bytes=%llu new_tangent_bytes=%llu local_acquire=%llu cross_ready=%llu uncommitted_reset=%llu prefix_submit_full=%llu prefix_submit_component=%llu prefix_vertices=%llu commands_retired=%llu sections=%llu parts=%llu indices=%llu current_default=%llu current_bootstrap=%llu previous_default=%llu previous_bootstrap=%llu current_unknown=%llu previous_unknown=%llu first_current_output=%llu first_previous_output=%llu consumer_executes=%llu consumer_commit_sections=%llu consumer_observed_sections=%llu consumer_replays=%llu observed_ms=%llu coverage=%s",
+                    "RT-AUTHOR-WORK bin=%u begin_ms=%llu end_ms=%llu first_frame=%llu last_frame=%llu created_full=%llu created_component=%llu distinct_created=%llu identity_excluded=%llu equivalent_pending=%llu equivalent_unsubmitted=%llu equivalent_inflight=%llu storage_reuse=%llu new_position_bytes=%llu new_tangent_bytes=%llu local_acquire=%llu cross_ready=%llu uncommitted_reset=%llu prefix_submit_full=%llu prefix_submit_component=%llu prefix_vertices=%llu commands_retired=%llu sections=%llu parts=%llu indices=%llu current_default=%llu current_bootstrap=%llu previous_default=%llu previous_bootstrap=%llu current_unknown=%llu previous_unknown=%llu first_current_output=%llu first_previous_output=%llu consumer_executes=%llu consumer_commit_sections=%llu consumer_observed_sections=%llu consumer_replays=%llu page_breaks_desc=%llu page_breaks_const=%llu page_const_hwm=%llu observed_ms=%llu coverage=%s",
                     i,U(start),U(end),U(b.first_frame),U(b.last_frame),
-                    U(b.created_full),U(b.created_component),U(b.distinct_created),U(b.identity_excluded),U(b.equivalent_pending),U(b.storage_reuse),U(b.position_bytes),U(b.tangent_bytes),
+                    U(b.created_full),U(b.created_component),U(b.distinct_created),U(b.identity_excluded),U(b.equivalent_pending),U(b.equivalent_unsubmitted),U(b.equivalent_inflight),U(b.storage_reuse),U(b.position_bytes),U(b.tangent_bytes),
                     U(b.local_acquire),U(b.cross_ready),U(b.uncommitted_reset),U(b.prefix_submit_full),U(b.prefix_submit_component),U(b.prefix_vertices),U(b.command_retired),
                     U(b.sections),U(b.parts),U(b.indices),U(b.current_default),U(b.current_bootstrap),U(b.previous_default),U(b.previous_bootstrap),U(b.current_unclassified),U(b.previous_unclassified),
                     U(b.first_current),U(b.first_previous),U(b.consumer_executes),U(b.consumer_sections),U(b.consumer_recorded_in_window),U(b.consumer_replays),
+                    U(b.page_breaks_desc),U(b.page_breaks_const),U(b.page_const_high_water),
                     U(observed_ms),coverage);
                 reshade::log::message(reshade::log::level::info,line);
                 if(b.inventory){

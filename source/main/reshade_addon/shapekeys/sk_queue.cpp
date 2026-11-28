@@ -4,6 +4,7 @@
 
 std::mutex                 g_sk_pending_mtx;
 std::vector<SkPendingList> g_sk_pending;
+std::atomic<uint32_t>      g_sk_pending_count{ 0 };
 
 static thread_local unsigned long long t_sk_cur_cs = 0;
 static thread_local unsigned           t_sk_cur_tgy = 0;
@@ -90,6 +91,7 @@ void SkBeginDispatchScope(uint64_t cs_hash, uint32_t group_count_y, const SkU0Id
             t_sk_cur_tgy,
             t_sk_cur_owner,
             cur_inst, t_sk_cb0_failed, t_sk_probe_generation });
+        g_sk_pending_count.store(static_cast<uint32_t>(g_sk_pending.size()), std::memory_order_release);
         ++t_q_count;
         t_q_reason = 0; // 0 = queued, which is the success case
     },
@@ -102,4 +104,5 @@ void SkForgetPendingFor(ID3D12Resource* dead)
     g_sk_pending.erase(std::remove_if(g_sk_pending.begin(), g_sk_pending.end(),
                            [dead](const SkPendingList& e) { return e.inst == dead; }),
         g_sk_pending.end());
+    g_sk_pending_count.store(static_cast<uint32_t>(g_sk_pending.size()), std::memory_order_release);
 }

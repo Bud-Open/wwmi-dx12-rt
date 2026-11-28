@@ -6,12 +6,14 @@ struct RtHybridAsset {
     std::vector<hybrid::BoneWindow> bones;
     struct Input {
         const WwmiMod::Resource* decl = nullptr;
+        const void* handle = nullptr;
         PortApi::BufferResourceInfo bind;
         Microsoft::WRL::ComPtr<ID3D12Resource> hold;
         std::vector<unsigned char> bytes;
     };
     std::array<Input,hybrid::stream_count> streams;
     const WwmiMod::Resource* merged_skeleton = nullptr;
+    const void* merged_skeleton_handle = nullptr;
     bool local_skeleton = false;
     bool mod_ib_r16 = false;
     std::vector<std::int16_t> vertex_comp;
@@ -20,9 +22,20 @@ struct RtHybridAsset {
     struct RemapPair {
         const WwmiMod::Resource* blend = nullptr;
         const WwmiMod::Resource* skeleton = nullptr;
+        const void* blend_handle = nullptr;
+        const void* skeleton_handle = nullptr;
     };
     std::unordered_map<int,RemapPair> remapped_comps;
+    mutable std::atomic<std::uint64_t> verified_forget_epoch{0};
 };
+static bool RtHybridStreamsStillInitial(const RtHybridAsset& a) noexcept {
+    const std::uint64_t epoch=hybrid_origin::current_forget_epoch();
+    if(a.verified_forget_epoch.load(std::memory_order_acquire)==epoch)return true;
+    for(const auto &in:a.streams)
+        if(in.hold&&!hybrid_origin::still_initial(in.hold.Get(),in.bind.byte_width))return false;
+    a.verified_forget_epoch.store(epoch,std::memory_order_release);
+    return true;
+}
 extern bool WwmiIsHybridBaseSkinMode() noexcept;
 static bool RtHybridBaseAllowed(){
     return WwmiIsHybridBaseSkinMode();
@@ -35,6 +48,10 @@ static bool RtHybridFormat(const WwmiMod::Resource& resource,const wchar_t* form
 }
 static bool RtHybridBufferDecl(const WwmiMod::Resource* res,PortApi::BufferResourceInfo& info){
     return res&&PortApi::GetBufferResource(res->fq.c_str(),&info)&&info.dx12&&info.gpu_va&&info.byte_width;
+}
+static bool RtHybridBufferHandle(const void* handle,const WwmiMod::Resource* fallback,PortApi::BufferResourceInfo& info){
+    if(handle)return PortApi::ReadBufferResourceHandle(handle,&info)&&info.dx12&&info.gpu_va&&info.byte_width;
+    return RtHybridBufferDecl(fallback,info);
 }
 static bool RtHybridBuffer(const WwmiMod::Mod& mod,const wchar_t* name,PortApi::BufferResourceInfo& info){
     return RtHybridBufferDecl(WwmiMod::Find(mod,name),info);
@@ -115,29 +132,30 @@ static std::shared_ptr<const RtHybridAsset> RtLoadHybridAsset(int mod){
         L"DXGI_FORMAT_R16G16_FLOAT",L"DXGI_FORMAT_R8G8B8A8_UNORM",L"DXGI_FORMAT_R32_UINT",
         L"DXGI_FORMAT_R16_UINT",L"DXGI_FORMAT_R16_UINT",L"DXGI_FORMAT_R16_UINT"
     };
-    const auto valid=[&](const auto &inputs){
+    const auto valid=[&](const RtHybridAsset &asset){
         for(unsigned i=0;i<hybrid::stream_count;++i){
-            const auto &v=inputs[i];
+            const auto &v=asset.streams[i];
             if(!v.hold)continue;
             PortApi::BufferResourceInfo live{};
-            if(!RtHybridBufferDecl(v.decl,live)||live.dx12!=v.bind.dx12||live.gpu_va!=v.bind.gpu_va||
-               live.byte_width!=v.bind.byte_width||live.stride!=v.bind.stride||
-               !hybrid_origin::still_initial(v.hold.Get(),live.byte_width))return false;
+            if(!RtHybridBufferHandle(v.handle,v.decl,live)||live.dx12!=v.bind.dx12||live.gpu_va!=v.bind.gpu_va||
+               live.byte_width!=v.bind.byte_width||live.stride!=v.bind.stride)return false;
         }
-        return true;
+        return RtHybridStreamsStillInitial(asset);
     };
-    if(const auto i=cache.find(mod);i!=cache.end()&&valid(i->second->streams))return i->second;
+    if(const auto i=cache.find(mod);i!=cache.end()&&valid(*i->second))return i->second;
     const auto reject_static=[&]()->std::shared_ptr<const RtHybridAsset>{
         static_rejected.insert(mod);
         return {};
     };
     auto a=std::make_shared<RtHybridAsset>();
+    const std::uint64_t init_forget_epoch=hybrid_origin::current_forget_epoch();
     a->abi.load=load;a->abi.mod=std::uint64_t(mod)+1;a->abi.version=++version;a->abi.vertices=m.mesh_vertex_count;
     const auto shapes=PortApi::GetVarNs(g_geomods[mod].wcl_ns.c_str(),L"shapekey_vertex_count",0.f);
     if(!std::isfinite(shapes)||shapes<0.f||double(shapes)>double(UINT32_MAX)/4||
        float(unsigned(shapes))!=shapes)return {};
     a->abi.shapes=unsigned(shapes);
     a->merged_skeleton=WwmiMod::Find(m,L"ResourceMergedSkeleton");
+    if(a->merged_skeleton)a->merged_skeleton_handle=PortApi::FindCustomResourceHandle(a->merged_skeleton->fq.c_str());
     for(unsigned i=0;i<hybrid::stream_count;++i){
         if(i==hybrid::shape_ids&&a->abi.shapes==0)continue;
         const auto *decl=WwmiMod::Find(m,names[i]);auto &in=a->streams[i];
@@ -148,11 +166,12 @@ static std::shared_ptr<const RtHybridAsset> RtLoadHybridAsset(int mod){
         const bool required=i<=hybrid::indices||(i==hybrid::shape_ids&&a->abi.shapes>0);
         if(!decl){if(required)return reject_static();continue;}
         in.decl=decl;
+        in.handle=PortApi::FindCustomResourceHandle(decl->fq.c_str());
         if(i==hybrid::indices){
             if(RtHybridFormat(*decl,L"DXGI_FORMAT_R16_UINT"))a->mod_ib_r16=true;
             else if(!RtHybridFormat(*decl,L"DXGI_FORMAT_R32_UINT"))return reject_static();
         }else if(formats[i]&&!RtHybridFormat(*decl,formats[i]))return reject_static();
-        if(!RtHybridBufferDecl(decl,in.bind))return {};
+        if(!RtHybridBufferHandle(in.handle,decl,in.bind))return {};
         in.hold=in.bind.dx12;
         if(!hybrid_origin::still_initial(in.hold.Get(),in.bind.byte_width))return {};
         in.bytes.resize(in.bind.byte_width);
@@ -194,9 +213,12 @@ static std::shared_ptr<const RtHybridAsset> RtLoadHybridAsset(int mod){
             a->bones.push_back({unsigned(c.index),c.vg_offset,c.vg_count});
             if(c.remapped){
                 const auto suffix=std::to_wstring(c.index);
+                const auto *rb=WwmiMod::Find(m,(L"ResourceRemappedBlendBufferComponent"+suffix).c_str());
+                const auto *rs=WwmiMod::Find(m,(L"ResourceRemappedSkeletonComponent"+suffix).c_str());
                 a->remapped_comps[c.index]={
-                    WwmiMod::Find(m,(L"ResourceRemappedBlendBufferComponent"+suffix).c_str()),
-                    WwmiMod::Find(m,(L"ResourceRemappedSkeletonComponent"+suffix).c_str())
+                    rb,rs,
+                    rb?PortApi::FindCustomResourceHandle(rb->fq.c_str()):nullptr,
+                    rs?PortApi::FindCustomResourceHandle(rs->fq.c_str()):nullptr
                 };
             }
         }
@@ -293,6 +315,7 @@ static std::shared_ptr<const RtHybridAsset> RtLoadHybridAsset(int mod){
         a->abi.streams[hybrid::blends]={a->canonical_blends.data(),a->canonical_blends.size(),32u};
     }
     a->abi.bones=a->bones.data();a->abi.bone_windows=unsigned(a->bones.size());
+    a->verified_forget_epoch.store(init_forget_epoch,std::memory_order_release);
     cache[mod]=a;return a;
 }
 static bool RtHybridVb(unsigned slot,const PortApi::BufferResourceInfo& want){
@@ -340,7 +363,7 @@ static bool RtFreezeHybridPart(StreamContext& ctx,SectionDraw& sd,StreamDraw& dr
     if(!a)a=RtLoadHybridAsset(ctx.mod);
     if(!a||!sd.wc)return fail("freeze-asset");
     const auto &s=a->streams;
-    for(const auto &in:s)if(in.hold&&!hybrid_origin::still_initial(in.hold.Get(),in.bind.byte_width))return fail("freeze-mutated");
+    if(!RtHybridStreamsStillInitial(*a))return fail("freeze-mutated");
     const auto &state=MigotoPort::State();
     const auto *ib=MigotoPort::AsWrapResource(state.ib);
     const DXGI_FORMAT expected_ib_fmt=a->mod_ib_r16?DXGI_FORMAT_R16_UINT:DXGI_FORMAT_R32_UINT;
@@ -384,14 +407,14 @@ static bool RtFreezeHybridPart(StreamContext& ctx,SectionDraw& sd,StreamDraw& dr
         return ok?true:fail("freeze-local-win");
     }
     PortApi::BufferResourceInfo palette{};
-    if(RtHybridVb(4,s[hybrid::blends].bind)&&RtHybridBufferDecl(a->merged_skeleton,palette)&&RtHybridCb(4,palette))
+    if(RtHybridVb(4,s[hybrid::blends].bind)&&RtHybridBufferHandle(a->merged_skeleton_handle,a->merged_skeleton,palette)&&RtHybridCb(4,palette))
         return true;
     if(!sd.wc->remapped||sd.wc->remap_id<0||!sd.wc->remap_vg)return fail("freeze-merged-cb4");
     const auto ri=a->remapped_comps.find(sd.wc->index);
     if(ri==a->remapped_comps.end())return fail("freeze-remap-comp");
     PortApi::BufferResourceInfo remapped{};
-    if(!RtHybridBufferDecl(ri->second.blend,remapped)||!RtHybridVb(4,remapped)||
-       !RtHybridBufferDecl(ri->second.skeleton,palette)||!RtHybridCb(4,palette))return fail("freeze-remap-cb4");
+    if(!RtHybridBufferHandle(ri->second.blend_handle,ri->second.blend,remapped)||!RtHybridVb(4,remapped)||
+       !RtHybridBufferHandle(ri->second.skeleton_handle,ri->second.skeleton,palette)||!RtHybridCb(4,palette))return fail("freeze-remap-cb4");
     p.blend=hybrid::paired_remap;p.remap_row=unsigned(sd.wc->remap_id);p.remap_count=sd.wc->remap_vg;
     return true;
 }
@@ -449,8 +472,7 @@ static bool RtFinishHybridSection(StreamContext& ctx,bool complete,InjectFrame& 
         ++ctx.empty_selections;ctx.replaced=true;return true;
     }
     if(!ctx.hybrid_asset)return reject("asset-missing");
-    for(const auto &in:ctx.hybrid_asset->streams)
-        if(in.hold&&!hybrid_origin::still_initial(in.hold.Get(),in.bind.byte_width))return reject("asset-changed");
+    if(!RtHybridStreamsStillInitial(*ctx.hybrid_asset))return reject("asset-changed");
     const auto &world=ctx.surface();
     std::vector<hybrid::Part> recipe;recipe.reserve(ctx.requested.size());
     for(const auto& p:ctx.requested)recipe.push_back(p.hybrid);

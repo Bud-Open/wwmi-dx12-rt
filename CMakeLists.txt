@@ -47,7 +47,7 @@ if(WIN32 AND WWMI_BUILD_WIN_SETUP)
         target_compile_options(WWMI-DX12-RT-Setup PRIVATE "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8;/W3;/EHsc>")
     endif()
     target_link_libraries(WWMI-DX12-RT-Setup PRIVATE
-        kernel32 user32 gdi32 shell32 ole32 advapi32 shlwapi comctl32 bcrypt
+        kernel32 user32 gdi32 shell32 ole32 advapi32 shlwapi comctl32 bcrypt winhttp
     )
 endif()
 

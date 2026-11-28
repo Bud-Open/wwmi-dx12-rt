@@ -193,9 +193,12 @@ bool RtRasterAttach(){
     auto host=g_wwmi_host_module?g_wwmi_host_module:GetModuleHandleW(L"dxgi.dll");
     r->capture_restore=reinterpret_cast<CaptureNativeBindingRestore>(GetProcAddress(host,"WWMI_ComputeState_CaptureRestore_v1"));
     auto reg=reinterpret_cast<decltype(&WWMI_BindingTrace_Register_v1)>(GetProcAddress(host,"WWMI_BindingTrace_Register_v1"));
+    auto reg_ex=reinterpret_cast<decltype(&WWMI_BindingTrace_RegisterEx_v1)>(GetProcAddress(host,"WWMI_BindingTrace_RegisterEx_v1"));
     r->unreg=reinterpret_cast<decltype(r->unreg)>(GetProcAddress(host,"WWMI_BindingTrace_Unregister_v1"));
-    if(!reg || !r->unreg || !r->identify || !r->palette || !r->frame || !r->reserve || !r->reset ||
-       !r->capture_restore || reg(event,r.get())!=0)return false;
+    if((!reg && !reg_ex) || !r->unreg || !r->identify || !r->palette || !r->frame || !r->reserve || !r->reset ||
+       !r->capture_restore)return false;
+    const int32_t reg_rc=reg_ex?reg_ex(event,r.get(),WWMI_BIND_REG_SKIP_DRAWS):reg(event,r.get());
+    if(reg_rc!=0)return false;
     paired.store(std::move(r));return true;
 }
 extern "C" __declspec(dllexport) uint32_t WWMI_RtAuthorPlanConsumer_v1(uint64_t device){
@@ -259,6 +262,10 @@ static RtGateModCounters* RtGateCountFor(int mod) noexcept {
 }
 static void RtGateEmitSummary(bool force) noexcept {
     const uint64_t now=GetTickCount64();
+    if(!force){
+        const uint64_t last=g_rt_gate_last_emit_ms.load(std::memory_order_relaxed);
+        if(now-last<15000)return;
+    }
     uint64_t total=0;
     for(const auto& c:g_rt_gate_counts)total+=c.snapshot_total();
     if(!total)return;
@@ -467,6 +474,10 @@ static RtDrawOutcome RtSelectGpuSkinDraw(reshade::api::command_list *list,uint32
     if(!shape_ok&&field_state.load(std::memory_order_relaxed)!=1)return {};
     const uint64_t fc_key=FirstCountKey(first,count);
     auto slot=g_first_to_comp.find(fc_key);if(slot==g_first_to_comp.end())return {};
+    rt_phase_cpu::Scope gate_cpu(rt_phase_cpu::rt_gate_select);
+    const bool gate_active=gate_cpu.ticket.start!=0;
+    rt_phase_cpu::GateActiveGuard gate_flag(gate_active);
+    PortApi::NextDrawCall();
     const auto component_hint=g_merged_comps[slot->second].comp_idx;
     const int mod_hint=g_merged_comps[slot->second].mod_id;
     auto* hint_counts=RtGateCountFor(mod_hint);
@@ -499,9 +510,12 @@ static RtDrawOutcome RtSelectGpuSkinDraw(reshade::api::command_list *list,uint32
     field.key.path=1; // first/count candidate only, identity not proved
     WWMI_RtDrawIdentityReceipt_v1 local_receipt{};local_receipt.struct_size=sizeof(local_receipt);local_receipt.abi_version=1;
     auto *receipt=cloth.row?&cloth.row->receipt:&local_receipt;
-    const auto identified=author_consumer?r->author_snapshot(&q,sizeof(q),&author,sizeof(author),receipt,sizeof(*receipt)):
-        (receipt&&r->identify_receipt)?r->identify_receipt(&q,sizeof(q),&id,sizeof(id),receipt,sizeof(*receipt)):
-        r->identify(&q,sizeof(q),&id,sizeof(id),nullptr,0);
+    const auto identified=[&]{
+        rt_phase_cpu::ConditionalScope id_cpu(gate_active,rt_phase_cpu::gate_identify);
+        return author_consumer?r->author_snapshot(&q,sizeof(q),&author,sizeof(author),receipt,sizeof(*receipt)):
+            (receipt&&r->identify_receipt)?r->identify_receipt(&q,sizeof(q),&id,sizeof(id),receipt,sizeof(*receipt)):
+            r->identify(&q,sizeof(q),&id,sizeof(id),nullptr,0);
+    }();
     if(!identified){
         bool has_aux_skip=false;
         auto check_aux=[&](int idx){
@@ -640,6 +654,7 @@ static RtDrawOutcome RtSelectGpuSkinDraw(reshade::api::command_list *list,uint32
     RtObservedPsFormats native_formats{};
     bool format_observed=false;
     if(author.token){
+        rt_phase_cpu::ConditionalScope world_cpu(gate_active,rt_phase_cpu::gate_world);
         // Obtain the original shader and Primitive scope before the VM and
         // before any geometry, history or material readiness decision.
         if(program){
@@ -671,14 +686,14 @@ static RtDrawOutcome RtSelectGpuSkinDraw(reshade::api::command_list *list,uint32
     int hybrid_mod=-1, matched=0;
     const hybrid::HistoryRead previous{original_world.prev_resource,original_world.prev_offset,original_world.prev_bytes};
     if(stream&&author.token&&instance.resource&&r->hybrid_probe&&r->hybrid_acquire&&r->hybrid_commit){
+        rt_phase_cpu::ConditionalScope probe_cpu(gate_active,rt_phase_cpu::gate_identify);
         const auto candidate=[&](int idx){
             if(!section_matches(idx))return;
             const auto mod=g_merged_comps[idx].mod_id;const auto &gm=g_geomods[mod];
             if(!gm.geom_enabled)return;
             ++matched;
-            const float sk_verts=PortApi::GetVarNs(gm.wcl_ns.c_str(),L"shapekey_vertex_count",0.f);
-            const bool force_hybrid=(sk_verts>0.f)||!WwmiMod::Find(gm.mod,L"ResourceMergedSkeleton")||
-                std::any_of(gm.mod.comps.begin(),gm.mod.comps.end(),[](const auto& c){return c.remapped;});
+            const bool force_hybrid=!gm.has_merged_skeleton||gm.any_remapped||
+                (PortApi::GetVarNs(gm.wcl_ns.c_str(),L"shapekey_vertex_count",0.f)>0.f);
             const auto load_gen=PortApi::LoadGeneration();
             const auto mod_key=std::uint64_t(mod)+1;
             // For shapekey==0 merged-skeleton non-remapped mods, let Frame 1
@@ -887,6 +902,7 @@ static RtDrawOutcome RtSelectGpuSkinDraw(reshade::api::command_list *list,uint32
                 // while an old static selection remains contractless.
                 ctx.world.contracts=original_world.contracts;
                 {
+                    rt_phase_cpu::ConditionalScope world_cpu(gate_active,rt_phase_cpu::gate_world);
                     RtAuxNoteScope note(section_aux);
                     RtAuxVertexEndGuard aux_end(target.native_vertex_first+target.native_vertex_count);
                     have_world=RtReadWorldSurface(list,*program,target.object_guid,target.content_hash,mc.comp_idx,ctx.world,r->frame2!=nullptr,r->reserve2!=nullptr);
@@ -902,7 +918,10 @@ static RtDrawOutcome RtSelectGpuSkinDraw(reshade::api::command_list *list,uint32
         }
         if(stream&&ctx.author.token&&!(hybrid?instance.resource!=0:scope.plan!=0)){refuse(11);return;}
         if(cloth_section){const auto &world=ctx.surface();cloth_section->reads_previous=world.reads_previous;cloth_section->previous_bound=world.prev_resource!=0;cloth_section->previous_resolution=world.previous_resolution;}
-        if(stream && !PrepareWorldSkinInputs(ctx,list,mc.comp_idx)){refuse(12);if(program&&!depth_only){RtWorldNote(2,vs,mc.comp_idx,0);}return;}
+        {
+            rt_phase_cpu::ConditionalScope world_cpu(gate_active,rt_phase_cpu::gate_world);
+            if(stream && !PrepareWorldSkinInputs(ctx,list,mc.comp_idx)){refuse(12);if(program&&!depth_only){RtWorldNote(2,vs,mc.comp_idx,0);}return;}
+        }
         InjectFrame fr{da,dc};fr.save_ib=ia.ib;fr.save_ib_set=true;
         for(unsigned i=0;i<8;++i){fr.save_vb[i]=ia.vb[i];fr.save_vb_set[i]=(ia.known&(~ia.nulls)&(1u<<i))!=0;}
         struct Restore {InjectFrame& f;const Ia& original;ID3D12GraphicsCommandList* cl;
@@ -977,6 +996,8 @@ static RtDrawOutcome RtSelectGpuSkinDraw(reshade::api::command_list *list,uint32
     const bool did=outcome.cancels_native();
     finish_aux(outcome);
     if(!did&&related){
+        extern void RecordNativeReadAsBound(reshade::api::command_list*);
+        RecordNativeReadAsBound(list);
         const auto note=[&](int idx){if(section_matches(idx))
             RtMaterialDrawNote(list,g_merged_comps[idx].mod_id,target.component,rt.rtv_count,g.gfx_pso,
                 RtNoteRoute::native_pass_through,"caller-resumes-native",first,count,base);

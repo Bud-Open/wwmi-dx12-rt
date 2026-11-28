@@ -59,6 +59,9 @@
 #define WWMI_BIND_UNPROVEN_RENDER_EPOCH (UINT64_C(1)<<4)
 #define WWMI_BIND_UNPROVEN_GPU_EXECUTION (UINT64_C(1)<<5)
 #define WWMI_BIND_UNPROVEN_ALL UINT64_C(0x3f)
+// Optional session-scoped registration flags for WWMI_BindingTrace_RegisterEx_v1.
+// Fixed for the lifetime of the registration so draw-before/draw-after stay paired.
+#define WWMI_BIND_REG_SKIP_DRAWS (UINT32_C(1)<<0)
 
 #pragma pack(push,8)
 typedef struct WWMI_BindingView_v1 {
@@ -117,7 +120,10 @@ typedef uint64_t (WWMI_BIND_CALL *WWMI_BindingTrace_SubmitFn_v1)(const WWMI_Bind
 // Single subscriber. 0 success, -1 invalid, -2 busy, -3 recursive, -4 mismatch.
 // Unregister drains callbacks; never invoke from DllMain or unload first.
 WWMI_BIND_EXPORT int32_t WWMI_BIND_CALL WWMI_BindingTrace_Register_v1(WWMI_BindingTrace_Callback_v1,void*);
+WWMI_BIND_EXPORT int32_t WWMI_BIND_CALL WWMI_BindingTrace_RegisterEx_v1(WWMI_BindingTrace_Callback_v1,void*,uint32_t flags);
 WWMI_BIND_EXPORT int32_t WWMI_BIND_CALL WWMI_BindingTrace_Unregister_v1(WWMI_BindingTrace_Callback_v1,void*);
+// Lock-free fast check: nonzero iff an active subscriber receives draw-before/draw-after events.
+WWMI_BIND_EXPORT uint32_t WWMI_BIND_CALL WWMI_BindingTrace_DrawTraceActive_v1(void);
 // Returns this event's sequence, or zero when inactive/rejected. A draw-after
 // input must carry the corresponding nonzero draw-before return value. All
 // input CPU arrays have already been copied into this POD. No native calls here.

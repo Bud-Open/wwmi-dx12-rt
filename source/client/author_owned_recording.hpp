@@ -60,21 +60,31 @@ inline bool completed_author_batch_valid(const GeometryBatch &batch) {
 
 // Called before the ordinary UAV-producing portion of record_native.
 // Only destination resources change state. Published sources remain read-only.
-inline bool copy_completed_author_pairs(GeometryBatch &batch,ID3D12GraphicsCommandList4 *list) {
+enum class CompletedAuthorCopy : unsigned { none, partial, all };
+inline CompletedAuthorCopy copy_completed_author_pairs(GeometryBatch &batch,ID3D12GraphicsCommandList4 *list) {
     const auto &pack=*batch.assets->pack;
-    bool pairs=false;
-    for(unsigned c=0;c<pack.components.size();++c)
-        if(author_component_used(pack,c,batch.single_component) &&
-           batch.final_positions[c].mode==WWMI_RT_POSITION_FINAL && batch.final_positions[c].completed_author)
-            pairs=true;
-    if(!pairs)return false;
-    const auto transition=[&](ID3D12Resource *resource,D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after){
-        D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition={resource,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,before,after};
-        list->ResourceBarrier(1,&b);
+    if(batch.assets->raster_only)return CompletedAuthorCopy::none;
+    bool any_copied=false, any_uncopied=false;
+    for(unsigned c=0;c<pack.components.size();++c){
+        if(!author_component_used(pack,c,batch.single_component))continue;
+        if(batch.final_positions[c].mode==WWMI_RT_POSITION_FINAL && batch.final_positions[c].completed_author)
+            any_copied=true;
+        else
+            any_uncopied=true;
+    }
+    if(!any_copied)return CompletedAuthorCopy::none;
+    const auto transition_pair=[&](D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after){
+        D3D12_RESOURCE_BARRIER barriers[2]{};
+        UINT count=0;
+        barriers[count].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[count++].Transition={batch.positions.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,before,after};
+        if(batch.tangents){
+            barriers[count].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[count++].Transition={batch.tangents.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,before,after};
+        }
+        list->ResourceBarrier(count,barriers);
     };
-    transition(batch.positions.Get(),position_read_state,D3D12_RESOURCE_STATE_COPY_DEST);
-    if(batch.tangents)transition(batch.tangents.Get(),position_read_state,D3D12_RESOURCE_STATE_COPY_DEST);
+    transition_pair(position_read_state,D3D12_RESOURCE_STATE_COPY_DEST);
     for(unsigned c=0;c<pack.components.size();++c){
         if(!author_component_used(pack,c,batch.single_component))continue;
         const auto &position=batch.final_positions[c];
@@ -90,9 +100,9 @@ inline bool copy_completed_author_pairs(GeometryBatch &batch,ID3D12GraphicsComma
             batch.tangent_ready[c]=true;
         }
     }
-    transition(batch.positions.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if(batch.tangents)transition(batch.tangents.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    return true;
+    transition_pair(D3D12_RESOURCE_STATE_COPY_DEST,
+        any_uncopied?D3D12_RESOURCE_STATE_UNORDERED_ACCESS:position_read_state);
+    return any_uncopied?CompletedAuthorCopy::partial:CompletedAuthorCopy::all;
 }
 
 } // namespace hsin_rt

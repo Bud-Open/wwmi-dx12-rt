@@ -8,6 +8,9 @@
 #include "tex_dhash.h"
 #include "tex_dhash_table.h"
 #include "wwmi_upload_footprint.h"
+#include "wwmi_post_execute.h"
+#include "tex_readback_policy.hpp"
+#include "tex_live_sig_retention.hpp"
 #include "tex_lod.h"
 #include "../instrumentation/removal_pin.h"
 #include "../config.h"
@@ -55,6 +58,46 @@ bool        TexLookIsCutoutMask(uint32_t hash);
 void        TexLookMarkCutoutMask(uint32_t hash);
 bool        TexLodPromoteLookalike(uint32_t from_hash, uint32_t to_hash);
 
+#include "tex_struct_recipe_cache.hpp"
+
+static wwmi_tex_live_sig::ResidentHashRefCounts g_live_texhash_counts;
+
+void TexResHashSetLocked(uint64_t key, uint32_t crc)
+{
+    auto it = g_res_texhash.find(key);
+    const uint32_t prev = (it != g_res_texhash.end()) ? it->second : 0u;
+    if (it != g_res_texhash.end())
+        it->second = crc;
+    else
+        g_res_texhash.emplace(key, crc);
+    g_live_texhash_counts.OnSet(prev, crc);
+    g_res_texhash_gen.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool TexResHashEraseLocked(uint64_t key)
+{
+    auto it = g_res_texhash.find(key);
+    if (it == g_res_texhash.end()) return false;
+    const uint32_t prev = it->second;
+    g_res_texhash.erase(it);
+    g_live_texhash_counts.OnErase(prev);
+    g_res_texhash_gen.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+bool TexHashHasResidentCarrier(uint32_t hash)
+{
+    if (!hash) return false;
+    std::shared_lock l(g_tex_mutex);
+    return g_live_texhash_counts.IsResident(hash);
+}
+
+wwmi_struct_tex::PublishSeq& TexStructMetaSeq() noexcept
+{
+    static wwmi_struct_tex::PublishSeq s_seq;
+    return s_seq;
+}
+
 static std::shared_mutex                    g_vis_parent_mtx;
 static wwmi_struct_tex::VisualMipParentTable g_vis_mip_parents;
 static std::atomic<bool>                    g_vis_parent_any{ false };
@@ -70,6 +113,7 @@ void TexNoteVisualMipParent(uint32_t child, uint32_t parent)
 {
     if (!g_tex_struct_fallback || !child || !parent || child == parent || TexLodDegenerate(child)) return;
     std::unique_lock l(g_vis_parent_mtx);
+    wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
     if (g_vis_mip_parents.Note(child, parent))
         g_vis_parent_any.store(true, std::memory_order_release);
 }
@@ -96,7 +140,21 @@ public:
         uint64_t src_off, uint64_t bytes, ID3D12Resource* dst, const D3D12_RESOURCE_DESC& dd, uint32_t sub,
         const uint32_t* cpu_crc);
     void OnExecute(command_queue* queue, command_list* list);
+    void OnPostExecute(ID3D12CommandQueue* native_queue, const uint64_t* api_lists, uint32_t list_count);
     void Drain();
+    void Reset()
+    {
+        std::lock_guard l(mtx_);
+        pending_.clear();
+        spare_.clear();
+        fences_.clear();
+        tried_.clear();
+        rb_.Reset();
+        cursor_ = 0;
+        dev_ = nullptr;
+        unsignalled_.store(0, std::memory_order_release);
+        has_work_.store(false, std::memory_order_release);
+    }
     void Forget(ID3D12Resource* dst)
     {
         std::lock_guard l(mtx_);
@@ -106,15 +164,17 @@ public:
     } // destroyed: its address is free again; never touch or restamp stale pending readbacks
 private:
     struct QueueFence {
-        ID3D12CommandQueue* queue = nullptr;
-        ComPtr<ID3D12Fence> fence;
-        uint64_t            next = 0;
+        ComPtr<ID3D12CommandQueue> queue;
+        ComPtr<ID3D12Fence>        fence;
+        uint64_t                   next = 0;
     };
     struct Pending {
         ID3D12Resource*        dst = nullptr;
         D3D12_RESOURCE_DESC    dst_desc = {}; // copied at schedule time so Arrived never dereferences dst
         uint64_t               dst_gen = 0;   // monotonic live generation of dst for ABA-safe destruction gating
         bool                   dst_dead = false;
+        bool                   once = false;      // one-shot texture-to-texture readback (tracked in tried_)
+        bool                   submitted = false; // confirmed returned from _orig->ExecuteCommandLists
         uint32_t               off = 0;
         uint32_t               rowPitch = 0;
         uint32_t               sub = 0;         // an upload's mip
@@ -123,8 +183,10 @@ private:
         ComPtr<ID3D12Resource> own;            // not in the shared buffer
         const void*            list = nullptr; // the game's list the copy is recorded on
         uint64_t               gen = 0;        // ...in this recording of it
-        QueueFence*            qf = nullptr;   // the queue it was submitted to
-        uint32_t               tid = 0;        // ...by this thread
+        QueueFence*                qf = nullptr;   // the queue it was submitted to
+        ID3D12CommandQueue*        exec_queue = nullptr; // native queue recorded at OnExecute (exact post-execute match)
+        ComPtr<ID3D12CommandQueue> retry_queue; // held ONLY if CreateFence failed, released once FenceOf succeeds
+        uint32_t                   tid = 0;        // ...by this thread
         uint64_t               resets = 0;     // ...at this t_list_resets
         ULONGLONG              exec_ms = 0;
         uint64_t               value = 0; // signalled on qf behind the submission; the copy has run once the fence reaches it
@@ -133,7 +195,7 @@ private:
         ComPtr<ID3D12Resource> buf;
         uint64_t               bytes = 0;
     };
-    bool        Reserve(ID3D12Device* dev, uint64_t total, bool once, Pending& p, ID3D12Resource** buf);
+    bool        Reserve(ID3D12Device* dev, uint64_t total, bool once, Pending& p, ComPtr<ID3D12Resource>& buf);
     void        KeepSpare(ComPtr<ID3D12Resource> b);
     static void Arrived(const Pending& p, const uint8_t* data);
     QueueFence* FenceOf(ID3D12CommandQueue* q);
@@ -808,7 +870,10 @@ void TexRulesPublish()
         },
         tr);
     static std::vector<const TexRules*> s_retired;
-    if (const TexRules* old = g_tex_rules.exchange(tr, std::memory_order_acq_rel)) s_retired.push_back(old);
+    {
+        wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
+        if (const TexRules* old = g_tex_rules.exchange(tr, std::memory_order_acq_rel)) s_retired.push_back(old);
+    }
     std::string s;
     char        b[16];
     for (uint32_t h : tr->targets) {
@@ -1525,8 +1590,7 @@ static void TexHashFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOURCE_DES
                 auto git = g_tex_res_gen.find(destKey);
                 if (git != g_tex_res_gen.end()) cur_gen_tail = git->second;
             }
-            g_res_texhash[destKey] = crc;
-            g_res_texhash_gen.fetch_add(1, std::memory_order_acq_rel);
+            TexResHashSetLocked(destKey, crc);
             g_res_inherited.erase(destKey);
         }
         if (inherited_tail && prev_tail && prev_tail != crc && !TexRuleHashFor(prev_tail))
@@ -1561,8 +1625,7 @@ static void TexHashFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOURCE_DES
             auto git = g_tex_res_gen.find(destKey);
             if (git != g_tex_res_gen.end()) cur_gen = git->second;
         }
-        g_res_texhash[destKey] = crc;
-        g_res_texhash_gen.fetch_add(1, std::memory_order_acq_rel);
+        TexResHashSetLocked(destKey, crc);
         inherited = g_res_inherited.erase(destKey) != 0;
     }
     if (g_texovr_ready && g_texlod_cache && !TexRuleHashFor(crc)) {
@@ -1595,8 +1658,7 @@ static void TexHashFromUploadDesc(ID3D12Resource* dest, const D3D12_RESOURCE_DES
             {
                 std::lock_guard l(g_tex_mutex);
                 if (TexResStillLiveLocked(destKey, expected_gen)) {
-                    g_res_texhash[destKey] = prev;
-                    g_res_texhash_gen.fetch_add(1, std::memory_order_acq_rel);
+                    TexResHashSetLocked(destKey, prev);
                 }
             }
             if (g_debug && DiagOnce("TEXID-UNCONFIRMED", (int)r_prev))
@@ -1852,8 +1914,7 @@ static void PropagateTexLineage(uint64_t srcH, uint64_t dstH, bool same_image)
             // a smaller source hash (LineageAlias will propagate rule/cutout classification).
             existing_verified_dst = it->second;
         } else if (it == g_res_texhash.end() || it->second != shash) {
-            g_res_texhash[dstH] = shash; // dest now swaps as the mod target on next placement
-            g_res_texhash_gen.fetch_add(1, std::memory_order_acq_rel);
+            TexResHashSetLocked(dstH, shash); // dest now swaps as the mod target on next placement
             g_modtex_res.insert(dstH);
             g_res_inherited.insert(dstH); // a belief until its own mip0 says otherwise
             ++g_tex_lineage_count;
@@ -2037,7 +2098,42 @@ void TexReadbackOnExecute(command_queue* queue, command_list* list)
     g_tex_readback.OnExecute(queue, list);
 }
 
-bool TexReadback::Reserve(ID3D12Device* dev, uint64_t total, bool once, Pending& p, ID3D12Resource** buf)
+static std::atomic<WWMI_RegisterPostExecuteFn_v1> g_post_exec_reg_fn{ nullptr };
+static std::atomic<bool>                          g_post_exec_registered{ false };
+
+static void __cdecl TexReadbackHostPostExecute(
+    uint64_t api_queue, uint64_t native_queue, const uint64_t* api_lists, uint32_t list_count, uint64_t)
+{
+    if (!api_queue || !native_queue || !api_lists || !list_count) return;
+    auto* q = reinterpret_cast<command_queue*>(api_queue);
+    if (!g_reshade_device || q->get_device() != g_reshade_device) return;
+    g_tex_readback.OnPostExecute(reinterpret_cast<ID3D12CommandQueue*>(native_queue), api_lists, list_count);
+}
+
+void TexReadbackRegisterPostExecute(HMODULE host)
+{
+    if (g_post_exec_registered.load(std::memory_order_acquire)) return;
+    HMODULE h = host ? host : GetModuleHandleW(L"dxgi.dll");
+    if (!h) return;
+    auto fn = reinterpret_cast<WWMI_RegisterPostExecuteFn_v1>(GetProcAddress(h, "WWMI_RegisterPostExecute_v1"));
+    if (!fn) return;
+    const uint64_t ctx = reinterpret_cast<uint64_t>(&g_tex_readback);
+    if (fn(&TexReadbackHostPostExecute, ctx) == 0) {
+        g_post_exec_reg_fn.store(fn, std::memory_order_release);
+        g_post_exec_registered.store(true, std::memory_order_release);
+    }
+}
+
+void TexReadbackUnregisterPostExecute()
+{
+    if (g_post_exec_registered.exchange(false, std::memory_order_acq_rel)) {
+        auto fn = g_post_exec_reg_fn.exchange(nullptr, std::memory_order_acq_rel);
+        if (fn) fn(nullptr, reinterpret_cast<uint64_t>(&g_tex_readback));
+    }
+    g_tex_readback.Reset();
+}
+
+bool TexReadback::Reserve(ID3D12Device* dev, uint64_t total, bool once, Pending& p, ComPtr<ID3D12Resource>& buf)
 {
     const auto      t_wait = std::chrono::steady_clock::now();
     std::lock_guard l(mtx_);
@@ -2088,8 +2184,9 @@ bool TexReadback::Reserve(ID3D12Device* dev, uint64_t total, bool once, Pending&
         own_used_ms_ = GetTickCount64();
         if (!p.own) return false;
     }
-    *buf = p.own ? p.own.Get() : rb_.Get();
-    pending_.push_back(p);
+    buf = p.own ? p.own : rb_;
+    p.once = once;
+    pending_.push_back(std::move(p));
     unsignalled_.fetch_add(1, std::memory_order_relaxed);
     has_work_.store(true, std::memory_order_release);
     if (once) tried_.insert(p.dst);
@@ -2118,10 +2215,10 @@ bool TexReadback::Schedule(ID3D12Device* dev, command_list* list, ID3D12Graphics
     p.rowPitch = fp.Footprint.RowPitch;
     p.list = list;
     p.gen = CmdGen(list);
-    ID3D12Resource* own_or_shared = nullptr;
-    if (!Reserve(dev, total, true, p, &own_or_shared)) return false;
+    ComPtr<ID3D12Resource> own_or_shared;
+    if (!Reserve(dev, total, true, p, own_or_shared)) return false;
     D3D12_TEXTURE_COPY_LOCATION d = {};
-    d.pResource = own_or_shared;
+    d.pResource = own_or_shared.Get();
     d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     d.PlacedFootprint = fp;
     d.PlacedFootprint.Offset = p.off;
@@ -2148,9 +2245,9 @@ bool TexReadback::ScheduleUpload(ID3D12Device* dev, command_list* list, ID3D12Gr
         p.compare = true;
         p.cpu_crc = *cpu_crc;
     }
-    ID3D12Resource* buf = nullptr;
-    if (!Reserve(dev, bytes, false, p, &buf)) return false;
-    cl->CopyBufferRegion(buf, p.off, src, src_off, bytes); // an upload heap is always copy-source-ready
+    ComPtr<ID3D12Resource> buf;
+    if (!Reserve(dev, bytes, false, p, buf)) return false;
+    cl->CopyBufferRegion(buf.Get(), p.off, src, src_off, bytes); // an upload heap is always copy-source-ready
     return true;
 }
 
@@ -2178,10 +2275,9 @@ void TexReadback::Arrived(const Pending& p, const uint8_t* data)
 TexReadback::QueueFence* TexReadback::FenceOf(ID3D12CommandQueue* q)
 {
     for (QueueFence& f : fences_)
-        if (f.queue == q) return &f;
+        if (f.queue.Get() == q) return &f;
     QueueFence f;
     if (!dev_ || FAILED(dev_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f.fence)))) return nullptr;
-    q->AddRef();
     f.queue = q;
     fences_.push_back(std::move(f));
     return &fences_.back();
@@ -2210,51 +2306,151 @@ void TexReadback::OnExecute(command_queue* queue, command_list* list)
     auto* const    q = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
     const uint32_t tid = GetCurrentThreadId();
     const uint64_t gen = CmdGen(list);
+    const bool     post_exec_active = g_post_exec_registered.load(std::memory_order_acquire);
     std::lock_guard l(mtx_);
-    for (QueueFence& f : fences_)
-        if (f.queue == q) SignalBehind(&f, [&](const Pending& p) { return p.tid == tid && p.resets != t_list_resets; });
+    for (Pending& p : pending_)
+        if (!p.value && !p.qf && p.exec_queue == q) {
+            p.qf = FenceOf(q);
+            if (p.qf) p.retry_queue.Reset();
+        }
+    if (!post_exec_active) {
+        for (QueueFence& f : fences_)
+            if (f.queue.Get() == q)
+                SignalBehind(&f, [&](const Pending& p) {
+                    return wwmi_tex_readback::ShouldSignalPreExecuteReset(
+                        post_exec_active, p.value != 0, p.tid == tid, p.resets != t_list_resets);
+                });
+    }
     for (Pending& p : pending_)
         if (!p.exec_ms && p.list == list && p.gen == gen) {
+            p.exec_queue = q;
             p.qf = FenceOf(q);
+            if (!p.qf) p.retry_queue = q;
             p.tid = tid;
             p.resets = t_list_resets;
             p.exec_ms = GetTickCount64();
-            if (!p.qf) unsignalled_.fetch_sub(1, std::memory_order_relaxed);
         }
+}
+
+void TexReadback::OnPostExecute(ID3D12CommandQueue* native_queue, const uint64_t* api_lists, uint32_t list_count)
+{
+    if (!native_queue || !api_lists || !list_count || unsignalled_.load(std::memory_order_relaxed) == 0) return;
+    const uint32_t  tid = GetCurrentThreadId();
+    std::lock_guard l(mtx_);
+    QueueFence*     target_qf = nullptr;
+    bool            any_submitted = false;
+    for (Pending& p : pending_) {
+        if (p.value || p.submitted) continue;
+        // Match ONLY entries already tagged by OnExecute on this exact thread & queue inside
+        // the same ExecuteCommandLists call, so a list concurrently reset and reused by another
+        // worker after _orig->ExecuteCommandLists returns can never be falsely marked submitted.
+        if (!p.exec_ms || p.tid != tid || p.exec_queue != native_queue) continue;
+        const uint64_t plist = reinterpret_cast<uint64_t>(p.list);
+        bool           in_batch = false;
+        for (uint32_t i = 0; i < list_count; ++i) {
+            if (api_lists[i] == plist) {
+                in_batch = true;
+                break;
+            }
+        }
+        if (!in_batch) continue;
+        if (!p.qf) {
+            p.qf = FenceOf(native_queue);
+            if (p.qf) p.retry_queue.Reset();
+        }
+        p.submitted = true;
+        if (p.qf && p.qf->queue.Get() == native_queue) {
+            target_qf = p.qf;
+            any_submitted = true;
+        }
+    }
+    if (any_submitted && target_qf) {
+        SignalBehind(target_qf, [](const Pending& p) {
+            return wwmi_tex_readback::ShouldSignalConfirmed(p.value != 0, p.submitted);
+        });
+    }
 }
 
 void TexReadback::Drain()
 {
     if (!has_work_.load(std::memory_order_acquire)) return;
-    std::vector<Pending> arrived;
-    uint32_t             mapped_end = 0;
+    std::vector<Pending>   arrived;
+    ComPtr<ID3D12Resource> shared_rb;
+    uint32_t               mapped_end = 0;
     {
         std::lock_guard l(mtx_);
         const ULONGLONG now = GetTickCount64();
-        for (QueueFence& f : fences_)
-            g_ts_rb_late.fetch_add(SignalBehind(&f, [&](const Pending& p) { return now - p.exec_ms >= 1000; }),
-                std::memory_order_relaxed);
+        const bool      post_exec_active = g_post_exec_registered.load(std::memory_order_acquire);
+        bool            device_removed = dev_ && FAILED(dev_->GetDeviceRemovedReason());
+        if (!device_removed) {
+            for (Pending& p : pending_)
+                if (!p.value && !p.qf && p.retry_queue) {
+                    p.qf = FenceOf(p.retry_queue.Get());
+                    if (p.qf) {
+                        p.retry_queue.Reset();
+                    } else if (dev_ && FAILED(dev_->GetDeviceRemovedReason())) {
+                        device_removed = true;
+                        break;
+                    }
+                }
+        }
+        if (!device_removed) {
+            for (QueueFence& f : fences_) {
+                SignalBehind(&f, [](const Pending& p) {
+                    return wwmi_tex_readback::ShouldSignalConfirmed(p.value != 0, p.submitted);
+                });
+                if (!post_exec_active) {
+                    g_ts_rb_late.fetch_add(SignalBehind(&f, [&](const Pending& p) {
+                        return wwmi_tex_readback::ShouldSignalLateFallback(
+                            p.value != 0, p.submitted, p.exec_ms, now, post_exec_active, 1000);
+                    }),
+                        std::memory_order_relaxed);
+                }
+            }
+        }
         size_t keep = 0;
         for (size_t i = 0; i < pending_.size(); ++i) {
-            Pending&   p = pending_[i];
-            const bool dropped = !p.exec_ms && CmdGen(p.list) != p.gen;
-            const bool ran = p.value ? p.qf->fence->GetCompletedValue() >= p.value : (p.exec_ms && !p.qf && now - p.exec_ms >= 2000);
-            if (!dropped && !ran) {
+            Pending&       p = pending_[i];
+            const uint64_t completed = (p.value && !device_removed) ? p.qf->fence->GetCompletedValue() : 0;
+            const bool     fence_removed = p.value && !device_removed && wwmi_tex_readback::FenceValueIsRemoved(completed);
+            if (fence_removed) device_removed = true;
+            const bool entry_removed = device_removed || fence_removed;
+            const bool fence_done = p.value && !entry_removed && (completed >= p.value);
+            const bool gen_changed = (!p.exec_ms && !p.submitted) ? (CmdGen(p.list) != p.gen) : false;
+            const auto dec = wwmi_tex_readback::EvaluateDrainEntry(
+                p.value != 0, fence_done, p.qf != nullptr, p.exec_ms != 0, p.submitted, gen_changed, p.once, p.dst_dead,
+                entry_removed);
+            if (!dec.drop && !dec.ready) {
                 if (keep != i) pending_[keep] = std::move(p);
                 ++keep;
                 continue;
             }
-            if (dropped) unsignalled_.fetch_sub(1, std::memory_order_relaxed);
-            if (ran && !p.dst_dead) {
+            if (dec.release_unsignalled) unsignalled_.fetch_sub(1, std::memory_order_relaxed);
+            if (dec.release_once_retry) tried_.erase(p.dst);
+            p.retry_queue.Reset();
+            if (dec.ready && !p.dst_dead && !entry_removed) {
                 arrived.push_back(std::move(p));
-            } else {
+            } else if (!entry_removed) {
                 KeepSpare(std::move(p.own));
             }
         }
         pending_.erase(pending_.begin() + keep, pending_.end());
+        if (device_removed) {
+            pending_.clear();
+            unsignalled_.store(0, std::memory_order_release);
+            arrived.clear();
+            spare_.clear();
+            fences_.clear();
+            rb_.Reset();
+            cursor_ = 0;
+            has_work_.store(false, std::memory_order_release);
+            return;
+        }
         mapped_end = cursor_;
+        if (!arrived.empty()) shared_rb = rb_;
     }
-    void* shared = nullptr;
+    void*                        shared = nullptr;
+    std::vector<ID3D12Resource*> map_failed_once;
     for (const Pending& p : arrived) {
         if (p.dst_dead || !TexResStillLive(reinterpret_cast<uint64_t>(p.dst), p.dst_gen)) continue;
         if (p.own) {
@@ -2263,21 +2459,27 @@ void TexReadback::Drain()
                 Arrived(p, (const uint8_t*)q);
                 D3D12_RANGE wr = { 0, 0 };
                 p.own->Unmap(0, &wr);
+            } else if (p.once) {
+                map_failed_once.push_back(p.dst);
             }
             continue;
         }
-        if (!shared) {
+        if (!shared && shared_rb) {
             D3D12_RANGE rr = { 0, mapped_end };
-            if (FAILED(rb_->Map(0, &rr, &shared))) shared = nullptr;
+            if (FAILED(shared_rb->Map(0, &rr, &shared))) shared = nullptr;
         }
-        if (shared) Arrived(p, (const uint8_t*)shared + p.off);
+        if (shared)
+            Arrived(p, (const uint8_t*)shared + p.off);
+        else if (p.once)
+            map_failed_once.push_back(p.dst);
     }
-    if (shared) {
+    if (shared && shared_rb) {
         D3D12_RANGE wr = { 0, 0 };
-        rb_->Unmap(0, &wr);
+        shared_rb->Unmap(0, &wr);
     }
     {
         std::lock_guard l(mtx_);
+        for (ID3D12Resource* dst : map_failed_once) tried_.erase(dst);
         for (Pending& p : arrived) KeepSpare(std::move(p.own));
         if (!spare_.empty() && GetTickCount64() - own_used_ms_ >= 10000) spare_.clear();
         if (std::none_of(pending_.begin(), pending_.end(), [](const Pending& p) { return !p.own; })) cursor_ = 0;

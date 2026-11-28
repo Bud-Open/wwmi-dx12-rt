@@ -7,9 +7,11 @@
 
 #include "descriptor_heap.hpp"
 #include "reshade_api_object_impl.hpp"
+#include "wwmi_flat_view_map.hpp"
+#include <atomic>
 #include <map>
-#include <unordered_map>
-#include <concurrent_vector.h>
+#include <memory>
+#include <vector>
 
 class D3D12DescriptorHeap;
 struct WWMI_AsTableSlot_v1;
@@ -165,19 +167,48 @@ namespace reshade::d3d12
 		descriptor_heap_gpu<D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 128, 128> _gpu_sampler_heap;
 		descriptor_heap_gpu<D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 50000, 2048> _gpu_view_heap;
 
-		mutable std::shared_mutex _resource_mutex;
+		struct alignas(64) ViewShard
+		{
+			mutable std::shared_mutex mutex;
+			wwmi::FlatViewMap<SIZE_T, std::pair<ID3D12Resource *, api::resource_view_desc>> views;
+		};
+		static constexpr size_t kViewShardCount = 64;
+		static size_t view_shard_index(SIZE_T handle_ptr) noexcept
+		{
+			const uint64_t h = static_cast<uint64_t>(handle_ptr);
+			return static_cast<size_t>(((h >> 5) ^ (h >> 12) ^ (h >> 20)) & (kViewShardCount - 1));
+		}
 #if RESHADE_ADDON >= 2
 		wwmi::rt_as::Heap *find_gpu_heap_locked(uint64_t handle) const;
 		wwmi::rt_as::Range wwmi_internal_as_range(D3D12_GPU_DESCRIPTOR_HANDLE handle) const;
 		template <typename Visit>
 		bool wwmi_visit_table_slot(uint64_t table, uint32_t offset, uint64_t bound_heap_generation, Visit visit) const;
 
-		concurrency::concurrent_vector<wwmi::rt_as::Heap *> _descriptor_heaps;
+		static constexpr size_t kFastDescriptorHeapCount = 16384;
+		wwmi::rt_as::Heap *descriptor_heap_at(size_t index) const noexcept
+		{
+			if (index < kFastDescriptorHeapCount)
+				return _fast_descriptor_heaps[index].load(std::memory_order_acquire);
+			const std::shared_lock<std::shared_mutex> lock(_heap_gpu_ranges_mutex);
+			const size_t overflow_index = index - kFastDescriptorHeapCount;
+			return overflow_index < _overflow_descriptor_heaps.size() ? _overflow_descriptor_heaps[overflow_index] : nullptr;
+		}
+		wwmi::rt_as::Heap *descriptor_heap_at_locked(size_t index) const noexcept
+		{
+			if (index < kFastDescriptorHeapCount)
+				return _fast_descriptor_heaps[index].load(std::memory_order_acquire);
+			const size_t overflow_index = index - kFastDescriptorHeapCount;
+			return overflow_index < _overflow_descriptor_heaps.size() ? _overflow_descriptor_heaps[overflow_index] : nullptr;
+		}
+
+		std::unique_ptr<std::atomic<wwmi::rt_as::Heap *>[]> _fast_descriptor_heaps;
+		std::vector<wwmi::rt_as::Heap *> _overflow_descriptor_heaps;
+		std::atomic<size_t> _descriptor_heap_count { 0 };
 		mutable std::shared_mutex _heap_gpu_ranges_mutex;
 		std::map<UINT64, std::pair<UINT64, wwmi::rt_as::Heap *>> _heap_gpu_ranges; // start -> { end, heap }
 		std::map<D3D12_GPU_VIRTUAL_ADDRESS, std::tuple<UINT64, ID3D12Resource *, bool>> _buffer_gpu_addresses; // address -> { size, resource, acceleration_structure }
 #endif
-		std::unordered_map<SIZE_T, std::pair<ID3D12Resource *, api::resource_view_desc>> _views;
+		std::unique_ptr<ViewShard[]> _view_shards;
 
 		com_ptr<ID3D12PipelineState> _mipmap_pipeline;
 		com_ptr<ID3D12RootSignature> _mipmap_signature;

@@ -25,6 +25,7 @@ static_assert(sizeof(WWMI_BindingDraw_v1)==24,"draw ABI");
 static_assert(std::is_trivially_copyable<WWMI_BindingRecord_v1>::value,"POD ABI");
 namespace {
 std::atomic<uint64_t> active{0};
+std::atomic<uint32_t> active_flags{0};
 std::atomic<uint64_t> failures{0}, reentrant{0}, observation_failures{0};
 thread_local unsigned callback_depth=0;
 constexpr size_t kMaximumLists=65536, kMaximumPending=65536;
@@ -41,6 +42,7 @@ struct State {
     std::condition_variable drained;
     WWMI_BindingTrace_Callback_v1 callback=nullptr;
     void *user=nullptr;
+    uint32_t flags=0;
     bool closing=false;
     size_t in_flight=0;
     uint64_t next_session=0,session=0,sequence=0,creation=0;
@@ -69,8 +71,13 @@ void callback_isolated(WWMI_BindingTrace_Callback_v1 callback,const WWMI_Binding
 }
 void clock_metadata(WWMI_BindingRecord_v1 &r) {
 #if defined(_WIN32)
-    LARGE_INTEGER tick{},freq{};QueryPerformanceCounter(&tick);QueryPerformanceFrequency(&freq);
-    r.qpc=static_cast<uint64_t>(tick.QuadPart);r.qpc_frequency=static_cast<uint64_t>(freq.QuadPart);
+    static const uint64_t freq=[]() noexcept {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return static_cast<uint64_t>(f.QuadPart);
+    }();
+    LARGE_INTEGER tick{};QueryPerformanceCounter(&tick);
+    r.qpc=static_cast<uint64_t>(tick.QuadPart);r.qpc_frequency=freq;
     r.clock_domain=1;r.thread_id=GetCurrentThreadId();
 #else
     r.qpc=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -103,19 +110,23 @@ void snapshot(const List &l,WWMI_BindingRecord_v1 &r) {
     for(unsigned i=0;i<32;++i) r.vertex_views[i]=l.vertices[i];
 }
 }
-extern "C" int32_t WWMI_BIND_CALL WWMI_BindingTrace_Register_v1(WWMI_BindingTrace_Callback_v1 callback,void *user) {
-    if(!callback) return -1;
+extern "C" int32_t WWMI_BIND_CALL WWMI_BindingTrace_RegisterEx_v1(WWMI_BindingTrace_Callback_v1 callback,void *user,uint32_t flags) {
+    if(!callback || (flags & ~WWMI_BIND_REG_SKIP_DRAWS)!=0) return -1;
     if(callback_depth) return -3;
     try {
         State &s=state();std::lock_guard<std::mutex> lock(s.mutex);
         if(s.closing) return -2;
-        if(s.callback) return s.callback==callback&&s.user==user?0:-2;
+        if(s.callback) return (s.callback==callback&&s.user==user&&s.flags==flags)?0:-2;
         if(s.next_session==std::numeric_limits<uint64_t>::max()) return -2;
         s.lists.clear();s.pending.clear();s.sequence=0;s.creation=0;s.closed_pending=s.closed_lists=0;
         failures=0;reentrant=0;observation_failures=0;
-        s.callback=callback;s.user=user;s.session=++s.next_session;
+        s.callback=callback;s.user=user;s.flags=flags;s.session=++s.next_session;
+        active_flags.store(flags,std::memory_order_release);
         active.store(s.session,std::memory_order_release);return 0;
     } catch(...) { return -2; }
+}
+extern "C" int32_t WWMI_BIND_CALL WWMI_BindingTrace_Register_v1(WWMI_BindingTrace_Callback_v1 callback,void *user) {
+    return WWMI_BindingTrace_RegisterEx_v1(callback,user,0);
 }
 extern "C" int32_t WWMI_BIND_CALL WWMI_BindingTrace_Unregister_v1(WWMI_BindingTrace_Callback_v1 callback,void *user) {
     if(!callback) return -1;
@@ -127,12 +138,20 @@ extern "C" int32_t WWMI_BIND_CALL WWMI_BindingTrace_Unregister_v1(WWMI_BindingTr
         s.closing=true;active.store(0,std::memory_order_release);
         s.drained.wait(lock,[&]{return !s.in_flight;});
         s.closed_pending=s.pending.size();s.closed_lists=s.lists.size();
-        s.callback=nullptr;s.user=nullptr;s.session=0;s.lists.clear();s.pending.clear();s.closing=false;
+        s.callback=nullptr;s.user=nullptr;s.flags=0;s.session=0;s.lists.clear();s.pending.clear();s.closing=false;
+        active_flags.store(0,std::memory_order_release);
         return 0;
     } catch(...) { return -2; }
 }
+extern "C" uint32_t WWMI_BIND_CALL WWMI_BindingTrace_DrawTraceActive_v1(void) {
+    if(!active.load(std::memory_order_acquire)) return 0;
+    return (active_flags.load(std::memory_order_relaxed)&WWMI_BIND_REG_SKIP_DRAWS)?0u:1u;
+}
 extern "C" uint64_t WWMI_BIND_CALL WWMI_BindingTrace_Submit_v1(const WWMI_BindingInput_v1 *input) {
     const auto session=active.load(std::memory_order_acquire);if(!session) return 0;
+    if(input&&(input->kind==WWMI_BIND_DRAW_BEFORE||input->kind==WWMI_BIND_DRAW_AFTER)&&
+       (active_flags.load(std::memory_order_relaxed)&WWMI_BIND_REG_SKIP_DRAWS))
+        return 0;
     if(callback_depth) { reentrant.fetch_add(1,std::memory_order_relaxed);return 0; }
     if(!input) { observation_failures.fetch_add(1,std::memory_order_relaxed);return 0; }
     try {

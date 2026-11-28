@@ -17,6 +17,7 @@ import sys
 import tarfile
 import zipfile
 from pathlib import Path
+from typing import Sequence
 
 from bootstrap_deps import (
     DXC_COMMIT, DXC_RELEASE_URL, DXC_URL, PINNED_GIT, git_output,
@@ -48,10 +49,22 @@ WINDOWS_GUIDE = """\
 3. Play normally:
    - Launch Wuthering Waves directly from the official Kuro Launcher or Steam.
    - In-game hotkeys: [F10] Hot-Reload mods, [F6] Toggle mods on/off, [Home] Overlay & status.
-4. Upgrade & Uninstall:
-   - To upgrade, extract over your existing external folder (preserving
-     `runtime\\install-ledger.json`) and re-run [Install & Enable], OR click
-     [Uninstall / Restore] in the old folder before moving to a new directory.
+4. Side-by-Side Upgrade (incl. from v1.0.2 / v1.0.3), Rollback & Uninstall:
+   - Recommended side-by-side upgrade: extract the new release ZIP into a NEW folder
+     (e.g. D:\\Tools\\WWMI-DX12-RT-v1.0.4) and run `WWMI-DX12-RT-Setup.exe`.
+     Setup verifies the existing Win64 install (including legacy v1.0.2/v1.0.3 folders) against
+     the old folder's ledger, paired host DLL, and SHA-256 digests, automatically migrates your
+     `ReShade.ini` customizations, `wwmi_dx12.ini` user settings & active `wwmi_dir`, compatible
+     caches, and third-party `*.addon64` add-ons, retains your populated `WWMI` folder, and keeps
+     the old folder intact.
+   - Instant rollback (works even back to v1.0.2 / v1.0.3): click [Rollback] inside the NEW
+     version's `WWMI-DX12-RT-Setup.exe` (or run `WWMI-DX12-RT-Setup.exe --cli rollback`) to
+     restore the previous folder's bootstrap pair and ledger cleanly.
+   - In-place refresh (for v1.0.2/v1.0.3 overwrite users): extracting over the same folder
+     (keeping `runtime\\install-ledger.json`, `ReShade.ini`, `wwmi_dx12.ini`) and running Setup
+     once refreshes `Win64\\dxgi.dll` and preserves your settings (does not keep old binaries for rollback).
+   - Check for Updates: click [Check Updates] (opt-in manual check; zero automatic network
+     requests) to check GitHub Releases and verify archives with `SHA256SUMS.txt`.
    - Click [Uninstall / Restore] at any time to cleanly remove the 2 bootstrap files from Win64.
 5. Coexisting with Existing ReShade / Third-Party Add-ons (e.g. RenoDX):
    - WWMI-DX12-RT requires its paired `dxgi.dll` (do NOT replace it with stock ReShade `dxgi.dll`).
@@ -79,8 +92,11 @@ WINDOWS_GUIDE = """\
 3. 日常游玩：
    - 直接打开库洛官方启动器或 Steam 点击「开始游戏」即可；
    - 快捷键：`F10` 热重载、`F6` 实时开关 Mod、`Home` 打开状态面板。
-4. 升级与彻底卸载：
-   - 升级新版时，直接解压覆盖原外部目录（保留 `runtime\\install-ledger.json`）后重跑【一键安装启用】，或先在旧目录点击【一键卸载还原】再迁移新目录。
+4. 并排升级（含 v1.0.2 / v1.0.3 老用户）、一键回滚与彻底卸载：
+   - 推荐并排升级：将新版压缩包解压到**新的独立目录**（如 D:\\Tools\\WWMI-DX12-RT-v1.0.4），双击运行新版 `WWMI-DX12-RT-Setup.exe` 点击【并排升级】。工具会核验旧目录（含 v1.0.2/v1.0.3 老版）账本、配对宿主 DLL 与 Win64 双文件 SHA-256，自动迁移你的 `ReShade.ini` 自定义项、`wwmi_dx12.ini` 用户参数与生效 `wwmi_dir`、兼容缓存与第三方 `*.addon64`，默认沿用已有 `WWMI` Mod 目录并完整保留旧目录。
+   - 一键回滚（支持回滚至 v1.0.2 / v1.0.3）：在新版 `WWMI-DX12-RT-Setup.exe` 中点击【回滚旧版】（或命令行执行 `WWMI-DX12-RT-Setup.exe --cli rollback`），即可自动恢复旧目录的引导桥与账本。
+   - 原地覆盖刷新：v1.0.2 / v1.0.3 老用户也可直接解压覆盖原目录（保留 `runtime\\install-ledger.json` 与 `ReShade.ini`/`wwmi_dx12.ini`），覆盖后运行一次新版 `WWMI-DX12-RT-Setup.exe` 点【原地刷新】即可同步更新 `Win64\\dxgi.dll` 并写入新版本号（覆盖方式不保留旧载荷回滚）。
+   - 手动检查更新：点击【检查更新】（仅手动触发，启动与安装零联网）可查询 GitHub Releases 最新版本，下载后可用 `SHA256SUMS.txt` 核验完整性。
    - 随时点击【一键卸载还原】，即可安全清除 Win64 中的 2 个引导文件恢复纯净原厂目录。
 5. 与现有 ReShade / 第三方插件（如 RenoDX）共存：
    - WWMI-DX12-RT 必须使用本包配对的 `dxgi.dll`（切勿用官方原版 ReShade `dxgi.dll` 替换）。
@@ -117,12 +133,29 @@ LINUX_GUIDE = """\
 
 [Option 2: CLI Commands]
 - Health check (incl. Flatpak sandbox & RabbitFX): ./wwmi-dx12-setup doctor
-- Install & enable:                                ./wwmi-dx12-setup install --init-missing-wwmi
+- In-place install / refresh (default XDG base):   ./wwmi-dx12-setup install --init-missing-wwmi
+- Side-by-side upgrade (explicit --base-root):     ./wwmi-dx12-setup install --base-root ~/Tools/WWMI-DX12-RT-v1.0.4
+- Roll back to preserved previous folder:          ./wwmi-dx12-setup rollback --base-root ~/Tools/WWMI-DX12-RT-v1.0.4
 - Safe uninstall & restore:                        ./wwmi-dx12-setup uninstall
+- Opt-in update check (GitHub Releases):           ./wwmi-dx12-setup check-update
 
-[Upgrading]
-- Re-run install using the same external folder (preserving `runtime/install-ledger.json`),
-  or run `./wwmi-dx12-setup uninstall` before switching to a new folder.
+[Upgrading (incl. v1.0.2 / v1.0.3) & Rollback]
+- Default In-Place Refresh: Linux setup defaults `--base-root` to the XDG/Flatpak runtime
+  root (`~/.local/share/wwmi-dx12-rt` or Flatpak Steam data dir), independent of where you
+  extracted the archive. Running `./wwmi-dx12-setup install` without `--base-root` refreshes
+  that active root in place while preserving your `ReShade.ini`, `wwmi_dx12.ini`, caches, and
+  `WWMI` directory (works seamlessly for v1.0.2 / v1.0.3 users!).
+- Side-by-Side Upgrade with Instant Rollback: pass a distinct `--base-root` for the new
+  version (e.g. `./wwmi-dx12-setup install --base-root ~/Tools/WWMI-DX12-RT-v1.0.4`). Setup
+  verifies the active Win64 files against the previous root's ledger, paired host DLL, and
+  SHA-256 digests, migrates your settings/caches/third-party `*.addon64`, retains your active
+  `WWMI` Mod tree, and preserves the old root intact (pass `--migrate-from <old_root>` if
+  Win64's BasePath cannot be reverse-mapped automatically).
+- Roll back (works even back to v1.0.2 / v1.0.3): run `./wwmi-dx12-setup rollback --base-root <new_root>`
+  from the NEW package to restore the previous root's bootstrap pair and ledger cleanly.
+- If your base root changed and Steam Launch Options use `LD_PRELOAD`, update the
+  `wine-filename-utf8.so` path in Steam manually (Setup never modifies Steam configs).
+- Verify downloaded release archives against `SHA256SUMS.txt`.
 
 ========================================================================
   WWMI-DX12-RT (Linux / SteamOS / Steam Deck 通用便携版)
@@ -142,11 +175,18 @@ LINUX_GUIDE = """\
 
 【方式二：命令行一键操作】
 - 环境与 Flatpak/RabbitFX 自检：`./wwmi-dx12-setup doctor`
-- 一键安装启用：                `./wwmi-dx12-setup install --init-missing-wwmi`
+- 默认原地安装 / 升级刷新：     `./wwmi-dx12-setup install --init-missing-wwmi`
+- 指定目录并排升级（可回滚）：  `./wwmi-dx12-setup install --base-root ~/Tools/WWMI-DX12-RT-v1.0.4`
+- 一键回滚至旧版目录：          `./wwmi-dx12-setup rollback --base-root ~/Tools/WWMI-DX12-RT-v1.0.4`
 - 一键安全卸载还原：            `./wwmi-dx12-setup uninstall`
+- 手动检查新版本（零自动联网）：`./wwmi-dx12-setup check-update`
 
-【升级新版】
-- 在原外部挂载目录覆盖后重跑安装（保留 `runtime/install-ledger.json`），或先执行卸载后再更换目录。
+【升级（含 v1.0.2 / v1.0.3 老用户）与一键回滚】
+- 默认原地刷新：Linux 版默认挂载根固定在 XDG/Flatpak 目录（与解压目录无关），直接运行 `./wwmi-dx12-setup install` 会在原挂载根原地刷新载荷，自动保留 `ReShade.ini`、`wwmi_dx12.ini`、缓存与 `WWMI` 目录（v1.0.2 / v1.0.3 老用户零配置直接可用）。
+- 并排升级（保留旧版可回滚）：为新版显式指定新的 `--base-root`（例如 `./wwmi-dx12-setup install --base-root ~/Tools/WWMI-DX12-RT-v1.0.4`）。工具会核验旧根账本、配对宿主 DLL 与 Win64 双文件 SHA-256，自动迁移配置/缓存/第三方 `*.addon64`，默认沿用生效的 `WWMI` Mod 目录并保留旧目录（若旧 `BasePath` 无法自动反推可附带 `--migrate-from <旧根>`）。
+- 一键回滚（支持回滚至 v1.0.2 / v1.0.3）：直接在新版工具执行 `./wwmi-dx12-setup rollback --base-root <新根>`，即可恢复旧目录的引导桥与账本。
+- 若更换了 `--base-root` 且 Steam 启动选项使用了 `LD_PRELOAD`，请按提示手动同步 `wine-filename-utf8.so` 路径（本工具不会修改 Steam 配置或 XXMI）。
+- 下载新版压缩包后可用 `SHA256SUMS.txt` 核验校验和。
 """
 
 
@@ -171,7 +211,32 @@ def verify_build_manifest(stage5: Path, include_linux: bool) -> dict | None:
     return manifest
 
 
-def build_provenance(manifest: dict | None) -> dict:
+def resolve_release_version(
+    explicit_version: str | None = None,
+    repo_root: Path = ROOT,
+    commit: str | None = None,
+) -> str:
+    if explicit_version is not None:
+        cleaned = explicit_version.strip()
+        if cleaned:
+            return cleaned
+    if (repo_root / ".git").exists():
+        try:
+            tag = git_output(repo_root, "describe", "--tags", "--exact-match")
+            if tag:
+                return tag
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    short_sha = commit[:7] if commit else None
+    if not short_sha and (repo_root / ".git").exists():
+        try:
+            short_sha = git_output(repo_root, "rev-parse", "--short=7", "HEAD")
+        except (OSError, subprocess.CalledProcessError):
+            short_sha = None
+    return f"dev-{short_sha}" if short_sha else "dev"
+
+
+def build_provenance(manifest: dict | None, version: str | None = None) -> dict:
     commit = manifest.get("repository_commit") if manifest else None
     dirty = manifest.get("working_tree_dirty") if manifest else None
     if commit is None and (ROOT / ".git").exists():
@@ -180,7 +245,9 @@ def build_provenance(manifest: dict | None) -> dict:
             dirty = bool(git_output(ROOT, "status", "--porcelain"))
         except (OSError, subprocess.CalledProcessError):
             pass
+    resolved_version = resolve_release_version(version, ROOT, commit)
     return {
+        "version": resolved_version,
         "repository_commit": commit,
         "working_tree_dirty": dirty,
         "upstreams": [
@@ -194,6 +261,12 @@ def build_provenance(manifest: dict | None) -> dict:
             "python3 scripts/package_release.py",
         ],
     }
+
+
+def write_sha256sums(archives: Sequence[Path], out_path: Path) -> Path:
+    lines = [f"{core.sha256_file(archive)}  {archive.name}\n" for archive in archives]
+    out_path.write_text("".join(lines), encoding="utf-8", newline="\n")
+    return out_path
 
 
 def populate_common_runtime(dst_root: Path, payload_map: dict[str, Path], include_linux_so: bool) -> None:
@@ -260,6 +333,11 @@ def main() -> int:
         default="auto",
         help="Package target (default: 'all' on Linux hosts, 'win64' on Windows hosts)",
     )
+    ap.add_argument(
+        "--version",
+        default=None,
+        help="Explicit release version (e.g. v1.0.5); defaults to exact git tag or dev-<short_sha>",
+    )
     args = ap.parse_args()
     target = ("all" if sys.platform.startswith("linux") else "win64") if args.target == "auto" else args.target
     build_win = target in ("all", "win64")
@@ -280,9 +358,11 @@ def main() -> int:
     manifest = verify_build_manifest(ROOT / "payload/artifacts/stage5", include_linux=build_linux)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     dist_base = ROOT / "dist" / f"release-{stamp}"
-    provenance = json.dumps(build_provenance(manifest), ensure_ascii=False, indent=2) + "\n"
+    prov_obj = build_provenance(manifest, version=args.version)
+    provenance = json.dumps(prov_obj, ensure_ascii=False, indent=2) + "\n"
+    built_archives: list[Path] = []
 
-    print("Release packages built successfully:")
+    print(f"Release packages built successfully (version: {prov_obj['version']}):")
     if build_win:
         win_dir = dist_base / "WWMI-DX12-RT-win64"
         win_dir.mkdir(parents=True, exist_ok=True)
@@ -292,6 +372,7 @@ def main() -> int:
         (win_dir / "README-WINDOWS.txt").write_text(WINDOWS_GUIDE, encoding="utf-8", newline="\r\n")
         win_zip = dist_base / "WWMI-DX12-RT-win64.zip"
         make_zip(win_dir, win_zip)
+        built_archives.append(win_zip)
         print(f"  [Windows] {win_zip} ({win_zip.stat().st_size:,} bytes)")
 
     if build_linux:
@@ -319,7 +400,12 @@ def main() -> int:
         (lin_dir / "README-LINUX.txt").write_text(LINUX_GUIDE, encoding="utf-8")
         lin_tar = dist_base / "WWMI-DX12-RT-linux.tar.gz"
         make_targz(lin_dir, lin_tar)
+        built_archives.append(lin_tar)
         print(f"  [Linux]   {lin_tar} ({lin_tar.stat().st_size:,} bytes)")
+
+    if built_archives:
+        sums_path = write_sha256sums(built_archives, dist_base / "SHA256SUMS.txt")
+        print(f"  [SHA256]  {sums_path}")
     return 0
 
 

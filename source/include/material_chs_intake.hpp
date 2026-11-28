@@ -321,6 +321,7 @@ public:
 		try { layouts_.insert_or_assign(layout.handle, value); } catch (...) { writer.fail(); }
 	}
 	void destroy_layout(api::pipeline_layout layout) noexcept { layouts_.erase(layout.handle); }
+	bool active(const Writer &writer) const noexcept { return writer.enabled() || !exact_pin_.empty(); }
 	void pipeline(Writer &writer, uint64_t device, api::pipeline state, api::pipeline_layout declared_global_root,
 		unsigned count, const api::pipeline_subobject *subobjects) noexcept
 	{

@@ -58,6 +58,7 @@ static std::vector<SkPendingList> SkTakeOwnLists(const std::wstring& ns, int mod
         }
         left_for_others = keep.size();
         g_sk_pending.swap(keep); // whatever we did not claim stays queued for its owner
+        g_sk_pending_count.store(static_cast<uint32_t>(g_sk_pending.size()), std::memory_order_release);
     }
     return lists;
 }
@@ -523,6 +524,9 @@ static void SkReportDrain(const std::wstring& ns, int mod_id, const std::vector<
 
 void RunShapeKeyPasses(const std::wstring& ns, int mod_id, ID3D12Resource* inst, reshade::api::command_list* cmd_list)
 {
+    if (g_sk_pending_count.load(std::memory_order_acquire) == 0 &&
+        !MorphDump::Armed() && !wwmi::producer::SnapshotSession() && !logger::enabled(1) && !g_prof_enabled)
+        return;
     const void* cl = cmd_list ? reinterpret_cast<const void*>(cmd_list->get_native()) : nullptr; // every record/order key below is the native list
     wwmi::producer::Scope producer_drain(wwmi::producer::HintInput(WWMI_PRODUCER_DRAIN, 2001,
         reinterpret_cast<uint64_t>(cl), g_frame_id, mod_id, reinterpret_cast<uint64_t>(inst), ns));

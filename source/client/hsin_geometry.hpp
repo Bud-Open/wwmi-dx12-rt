@@ -21,7 +21,7 @@ struct GeometryAssets {
     std::shared_ptr<const ModPack> pack;
     bool raster_only=false;
     static std::shared_ptr<GeometryAssets> create(ID3D12Device5 *unwrapped_device,
-        std::shared_ptr<const ModPack> pack,std::span<const unsigned char> skin_dxil,std::span<const unsigned char> copy_dxil,std::span<const unsigned char> tangent_dxil,bool raster_only=false);
+        std::shared_ptr<const ModPack> pack,std::span<const unsigned char> skin_dxil,std::span<const unsigned char> copy_dxil,std::span<const unsigned char> tangent_dxil,bool raster_only=false,ComPtr<ID3D12Resource> external_indices={});
     void enable_shape_positions(std::span<const unsigned char> position,std::span<const unsigned char> tangent);
 };
 struct GeometryBatch {

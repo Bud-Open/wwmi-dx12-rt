@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <cstdint>
 #include <d3d12.h>
 #include <string_view>
 
@@ -40,11 +42,19 @@ private:
 // name or later filesystem contents. Set once; writable exposure or another
 // upload/copy permanently revokes the evidence for this object.
 inline constexpr GUID initial_position_id={0x1b35fcbc,0x71be,0x49d7,{0x93,0x6a,0x4e,0xcf,0x3c,0xc5,0x0b,0x4e}};
+inline std::atomic<std::uint64_t> &forget_epoch_counter() noexcept {
+    static std::atomic<std::uint64_t> epoch{1};
+    return epoch;
+}
+inline std::uint64_t current_forget_epoch() noexcept {
+    return forget_epoch_counter().load(std::memory_order_acquire);
+}
 inline void set_initial(ID3D12Resource *resource,const void *bytes,UINT count){
     resource->SetPrivateData(initial_position_id,count,bytes);
 }
 inline void forget(ID3D12Resource *resource){
     resource->SetPrivateData(initial_position_id,0,nullptr);
+    forget_epoch_counter().fetch_add(1,std::memory_order_release);
 }
 inline bool still_initial(ID3D12Resource *resource,UINT bytes){
     UINT size=0;

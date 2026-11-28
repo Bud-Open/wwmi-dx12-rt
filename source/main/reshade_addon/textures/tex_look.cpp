@@ -11,6 +11,8 @@
 #include "tex_lod.h"
 #include "tex_seed_dirs.hpp"
 #include "tex_struct_solver.hpp"
+#include "tex_struct_recipe_cache.hpp"
+#include "tex_live_sig_retention.hpp"
 #include "../../src/log.h"
 #include "../../src/dxgi_bc.h"
 #include "../config.h"
@@ -30,6 +32,7 @@
 #include <utility>
 
 extern bool g_tex_struct_fallback;
+bool        TexHashHasResidentCarrier(uint32_t hash);
 
 namespace {
 
@@ -416,12 +419,23 @@ public:
         if (!hash || sig.w < 256 || sig.h < 256 || (std::max)(sig.w, sig.h) > (std::min)(sig.w, sig.h) * 2 ||
             sig.px.empty())
             return;
+        std::vector<uint32_t> candidates;
+        {
+            std::shared_lock l(mtx_);
+            if (refs_.count(hash) || live_sigs_.count(hash)) return;
+            candidates = wwmi_tex_live_sig::PeekEvictCandidates(live_order_, live_sigs_.size());
+        }
+        std::vector<uint8_t> resident_flags;
+        if (!candidates.empty()) {
+            resident_flags.resize(candidates.size(), 0u);
+            for (size_t i = 0; i < candidates.size(); ++i)
+                resident_flags[i] = TexHashHasResidentCarrier(candidates[i]) ? 1u : 0u;
+        }
         std::unique_lock l(mtx_);
         if (refs_.count(hash) || live_sigs_.count(hash)) return;
-        constexpr size_t kMaxLiveSigs = 2048;
-        while (live_sigs_.size() >= kMaxLiveSigs && !live_order_.empty()) {
-            live_sigs_.erase(live_order_.front());
-            live_order_.pop_front();
+        wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
+        if (live_sigs_.size() >= wwmi_tex_live_sig::kSoftMaxLiveSigs) {
+            wwmi_tex_live_sig::ApplyResidentFirstEviction(live_sigs_, live_order_, candidates, resident_flags);
         }
         live_sigs_.emplace(hash, sig);
         live_order_.push_back(hash);
@@ -542,11 +556,17 @@ public:
         bool inserted = false;
         {
             std::unique_lock l(mtx_);
-            if (cutout_masks_.size() < 16384 || is_cutout)
-                inserted = cutout_masks_.emplace(hash, is_cutout).second;
+            if (is_cutout) {
+                wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
+                auto [it, ins] = cutout_masks_.emplace(hash, true);
+                inserted = ins;
+                if (!ins && !it->second) it->second = true;
+                has_cutout_mask_.store(true, std::memory_order_release);
+            } else if (cutout_masks_.size() < 16384) {
+                inserted = cutout_masks_.emplace(hash, false).second;
+            }
         }
         if (is_cutout) {
-            has_cutout_mask_.store(true, std::memory_order_release);
             if (inserted && s2.total > 0) {
                 const double inv = 1.0 / static_cast<double>(s2.total);
                 logger::probe("TexLook: cutout-mask detected hash=%08x %ux%u fmt=%u (white=%.3f black=%.3f mid=%.3f gray=%.3f opaque=%.3f)",
@@ -564,10 +584,11 @@ public:
     void MarkCutoutMask(uint32_t hash)
     {
         if (!hash) return;
-        {
-            std::unique_lock l(mtx_);
-            cutout_masks_[hash] = true;
-        }
+        std::unique_lock l(mtx_);
+        auto             it = cutout_masks_.find(hash);
+        if (it != cutout_masks_.end() && it->second) return;
+        wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
+        cutout_masks_[hash] = true;
         has_cutout_mask_.store(true, std::memory_order_release);
     }
 
@@ -756,6 +777,7 @@ bool LookIndex::keep_ref(uint32_t target, Ref&& r)
 { // caller holds mtx_
     auto it = refs_.find(target);
     if (it != refs_.end() && it->second.sig.pw * it->second.sig.ph >= r.sig.pw * r.sig.ph) return false;
+    wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
     refs_[target] = std::move(r);
     ++gen_;
     mark_dirty();
@@ -877,6 +899,7 @@ LookIndex::LoadStats LookIndex::load(const std::wstring& file, bool seed)
         if (seed)
             stats.refs_taken += keep_ref(target, std::move(r)) ? 1 : 0;
         else {
+            wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
             refs_[target] = std::move(r);
             ++stats.refs_taken;
         }

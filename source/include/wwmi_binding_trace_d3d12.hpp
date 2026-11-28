@@ -50,6 +50,10 @@ template<class T> inline void predicate(T *list,uint32_t source,uint32_t site,ID
     x.predicate_resource=pointer(buffer);x.predicate_offset=offset;x.predicate_operation=static_cast<uint32_t>(operation);WWMI_BindingTrace_Submit_v1(&x);
 }
 template<class T> inline void draw_indexed(T *list,uint32_t source,uint32_t site,UINT count,UINT instances,UINT first,INT base,UINT first_instance) {
+    if(!WWMI_BindingTrace_DrawTraceActive_v1()) {
+        list->DrawIndexedInstanced(count,instances,first,base,first_instance);
+        return;
+    }
     auto x=input(WWMI_BIND_DRAW_BEFORE,source,site,list);x.draw={count,instances,first,base,first_instance,0};
     const auto before=WWMI_BindingTrace_Submit_v1(&x);
     list->DrawIndexedInstanced(count,instances,first,base,first_instance);

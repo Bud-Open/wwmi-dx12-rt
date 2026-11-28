@@ -57,7 +57,7 @@ class RaygenIdentity {
     struct Pipeline {Programs programs;unsigned hit_group_bits=0;};
     std::unordered_map<std::uint64_t,Pipeline> pipelines_;
     struct Native {
-        NativeRaygenDomain domain;
+        std::shared_ptr<const NativeRaygenDomain> domain;
         unsigned hit_group_bits=0;
         bool has_live_raygen=false;
         unsigned fixed_offset=UINT32_MAX;
@@ -68,6 +68,7 @@ class RaygenIdentity {
     std::array<std::shared_ptr<const Code>,std::size(known_raygens)> pins_;
     std::unordered_map<std::uint64_t,Entry> occlusion_misses_;
     std::shared_ptr<const Code> occlusion_miss_pin_;
+    bool has_pins_=false;
     static std::optional<unsigned> as_slot(const NativeRaygenExport &e){
         if(!e.pin)return e.reflected_as;
         const auto exact=known_raygens[*e.pin].as_register;
@@ -89,10 +90,13 @@ class RaygenIdentity {
 public:
     void pin(unsigned i,Code bytes){
         pins_[i]=std::make_shared<const Code>(std::move(bytes));
+        has_pins_=true;
     }
     void pin_occlusion_miss(Code bytes){
         occlusion_miss_pin_=std::make_shared<const Code>(std::move(bytes));
+        has_pins_=true;
     }
+    bool has_pins()const noexcept{return has_pins_;}
     bool has_pipeline(std::uint64_t pipeline)const{
         if(const auto it=native_.find(pipeline);it!=native_.end())return it->second.has_live_raygen;
         return pipelines_.contains(pipeline);
@@ -181,27 +185,101 @@ public:
         if(retained)pipelines_.emplace(state.handle,Pipeline{std::move(programs),native_hit_group_bits(native)});
         if(miss_retained)occlusion_misses_.emplace(state.handle,std::move(miss));
     }
+    struct NativeInitSnapshot {
+        std::vector<std::pair<std::uint64_t,std::shared_ptr<const NativeRaygenDomain>>> parents;
+        std::vector<std::pair<std::uint64_t,std::uint64_t>> root_gens;
+        std::vector<std::pair<std::uint64_t,unsigned>> local_bytes;
+        std::array<std::shared_ptr<const Code>,std::size(known_raygens)> pins{};
+        std::shared_ptr<const Code> occlusion_miss_pin;
+        bool has_pins=false;
+    };
+    struct PreparedNative {
+        std::uint64_t state=0;
+        std::shared_ptr<const NativeRaygenDomain> domain;
+        unsigned hit_group_bits=0;
+        bool has_live_raygen=false;
+        unsigned fixed_offset=UINT32_MAX;
+        std::optional<size_t> single_pin;
+    };
     template<class RootGeneration,class LocalArgumentBytes>
-    void init_native(const WWMI_RtNativeStateObject_v1 &view,unsigned count,
-                     const api::pipeline_subobject *subobjects,RootGeneration root_generation,
-                     LocalArgumentBytes local_argument_bytes){
+    NativeInitSnapshot snapshot_native(const WWMI_RtNativeStateObject_v1 &view,
+                                       RootGeneration root_generation,
+                                       LocalArgumentBytes local_argument_bytes)const{
+        NativeInitSnapshot snap;
+        if(view.add_to_base){
+            if(const auto found=native_.find(view.add_to_base);found!=native_.end())
+                snap.parents.emplace_back(view.add_to_base,found->second.domain);
+        }
+        if(const auto *raw_desc=reinterpret_cast<const D3D12_STATE_OBJECT_DESC *>(view.desc);
+           raw_desc&&raw_desc->pSubobjects){
+            const auto &desc=*raw_desc;
+            for(unsigned i=0;i<desc.NumSubobjects;++i){
+                const auto &s=desc.pSubobjects[i];
+                if(!s.pDesc)continue;
+                switch(s.Type){
+                case D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION: {
+                    const auto &p=*static_cast<const D3D12_EXISTING_COLLECTION_DESC *>(s.pDesc);
+                    const auto parent=reinterpret_cast<std::uint64_t>(p.pExistingCollection);
+                    if(const auto found=native_.find(parent);found!=native_.end())
+                        snap.parents.emplace_back(parent,found->second.domain);
+                    break;
+                }
+                case D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE: {
+                    const auto &p=*static_cast<const D3D12_GLOBAL_ROOT_SIGNATURE *>(s.pDesc);
+                    if(p.pGlobalRootSignature){
+                        const auto root=reinterpret_cast<std::uint64_t>(p.pGlobalRootSignature);
+                        if(const auto gen=root_generation(root))
+                            snap.root_gens.emplace_back(root,gen);
+                    }
+                    break;
+                }
+                case D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE: {
+                    const auto &p=*static_cast<const D3D12_LOCAL_ROOT_SIGNATURE *>(s.pDesc);
+                    if(p.pLocalRootSignature){
+                        const auto root=reinterpret_cast<std::uint64_t>(p.pLocalRootSignature);
+                        if(const auto bytes=local_argument_bytes(root))
+                            snap.local_bytes.emplace_back(root,*bytes);
+                    }
+                    break;
+                }
+                default:break;
+                }
+            }
+        }
+        if(has_pins_){
+            snap.has_pins=true;
+            snap.pins=pins_;
+            snap.occlusion_miss_pin=occlusion_miss_pin_;
+        }
+        return snap;
+    }
+    static std::optional<PreparedNative> build_native_unlocked(
+        const WWMI_RtNativeStateObject_v1 &view,unsigned count,
+        const api::pipeline_subobject *subobjects,const NativeInitSnapshot &snap){
         auto domain=native_raygen_domain(view,count,subobjects,[&](uint64_t parent)->const NativeRaygenDomain *{
-            const auto found=native_.find(parent);
-            return found==native_.end()?nullptr:&found->second.domain;
+            for(const auto &[id,ptr]:snap.parents)if(id==parent)return ptr.get();
+            return nullptr;
         },[&](const api::shader_desc &shader,const wchar_t *alias)->std::optional<size_t>{
-            for(size_t k=0;k<pins_.size();++k){
-                const auto &p=pins_[k];const auto &name=known_raygens[k];
+            if(!snap.has_pins)return {};
+            for(size_t k=0;k<snap.pins.size();++k){
+                const auto &p=snap.pins[k];const auto &name=known_raygens[k];
                 if(p&&p->size()==shader.code_size&&!std::wcscmp(alias,name.alias)&&
                    !std::strcmp(shader.entry_point,name.entry)&&!std::memcmp(p->data(),shader.code,shader.code_size))
                     return k;
             }
             return {};
         },[&](const api::shader_desc &shader,const wchar_t *alias){
-            return occlusion_miss_pin_&&occlusion_miss_pin_->size()==shader.code_size&&
+            return snap.occlusion_miss_pin&&snap.occlusion_miss_pin->size()==shader.code_size&&
                 !std::wcscmp(alias,occlusion_miss_alias)&&!std::strcmp(shader.entry_point,"DefaultPayloadMS")&&
-                !std::memcmp(occlusion_miss_pin_->data(),shader.code,shader.code_size);
-        },root_generation,local_argument_bytes);
-        if(!domain)return;
+                !std::memcmp(snap.occlusion_miss_pin->data(),shader.code,shader.code_size);
+        },[&](uint64_t root)->uint64_t{
+            for(const auto &[id,gen]:snap.root_gens)if(id==root)return gen;
+            return 0;
+        },[&](uint64_t root)->std::optional<unsigned>{
+            for(const auto &[id,bytes]:snap.local_bytes)if(id==root)return bytes;
+            return {};
+        });
+        if(!domain)return {};
         auto *state=reinterpret_cast<ID3D12StateObject *>(view.state);
         ComPtr<ID3D12StateObjectProperties> properties;
         if(domain->executable)state->QueryInterface(IID_PPV_ARGS(&properties));
@@ -226,9 +304,32 @@ public:
             }else same_program=false;
         }
         const auto offset=complete_ids&&same_slot&&single_slot?*single_slot:UINT32_MAX;
-        const auto [_,added]=native_.emplace(view.state,Native{std::move(*domain),native_hit_group_bits(state),has_live_raygen,
-            offset,offset!=UINT32_MAX&&same_program?first_pin:std::nullopt});
-        if(added&&has_live_raygen)++native_live_;
+        PreparedNative out;
+        out.state=view.state;
+        out.domain=std::make_shared<const NativeRaygenDomain>(std::move(*domain));
+        out.hit_group_bits=native_hit_group_bits(state);
+        out.has_live_raygen=has_live_raygen;
+        out.fixed_offset=offset;
+        out.single_pin=offset!=UINT32_MAX&&same_program?first_pin:std::nullopt;
+        return out;
+    }
+    void commit_native(PreparedNative &&built){
+        if(const auto it=native_.find(built.state);it!=native_.end()){
+            if(it->second.has_live_raygen)--native_live_;
+            native_.erase(it);
+        }
+        const bool live=built.has_live_raygen;
+        const auto [_,added]=native_.emplace(built.state,Native{
+            std::move(built.domain),built.hit_group_bits,live,built.fixed_offset,built.single_pin});
+        if(added&&live)++native_live_;
+    }
+    template<class RootGeneration,class LocalArgumentBytes>
+    void init_native(const WWMI_RtNativeStateObject_v1 &view,unsigned count,
+                     const api::pipeline_subobject *subobjects,RootGeneration root_generation,
+                     LocalArgumentBytes local_argument_bytes){
+        const auto snap=snapshot_native(view,root_generation,local_argument_bytes);
+        if(auto built=build_native_unlocked(view,count,subobjects,snap))
+            commit_native(std::move(*built));
     }
 
     void destroy(api::pipeline state){
@@ -272,7 +373,7 @@ public:
         const auto it=native_.find(state.handle);
         if(it==native_.end())return "no_native_domain";
         const auto &native=it->second;
-        const auto &domain=native.domain;
+        const auto &domain=*native.domain;
         if(!domain.executable)return "not_executable";
         if(domain.conflicting_roots)return "root_conflict";
         if(domain.root!=root)return "root_mismatch";
@@ -293,7 +394,7 @@ public:
         out.closure=fixed_as_status(state,root,generation);
         if(const auto it=native_.find(state.handle);it!=native_.end()){
             const auto &native=it->second;
-            const auto &domain=native.domain;
+            const auto &domain=*native.domain;
             const bool same_root=domain.executable&&!domain.conflicting_roots&&domain.root==root&&
                 generation&&domain.root_generation==generation;
             for(const auto &e:domain.exports)if(e.raygen){
@@ -319,7 +420,7 @@ public:
         const auto it=native_.find(state.handle);
         if(it==native_.end()||!root_generation)return {};
         const auto &native=it->second;
-        const auto &domain=native.domain;
+        const auto &domain=*native.domain;
         if(!domain.executable||domain.conflicting_roots||domain.root!=root||domain.root_generation!=root_generation)return {};
         if(native.fixed_offset==UINT32_MAX)return {};
         AsDomain as{native.fixed_offset,{}};
@@ -333,7 +434,7 @@ public:
                                                std::span<const std::byte> record)const{
         const auto it=native_.find(state.handle);
         if(it==native_.end()||!generation||record.size()<sizeof(ShaderId))return {};
-        const auto &domain=it->second.domain;
+        const auto &domain=*it->second.domain;
         if(!domain.executable||domain.conflicting_roots||domain.root!=root||domain.root_generation!=generation)return {};
         const NativeRaygenExport *match=nullptr;
         for(const auto &e:domain.exports)if(e.raygen&&e.identifier&&
@@ -354,7 +455,7 @@ public:
         const auto fixed=fixed_as(state,root,generation);
         if(!fixed||!fixed->same_program||!fixed->same_program->known_no_procedural()||
            std::strcmp(fixed->same_program->name->entry,"OcclusionMainRG"))return {};
-        const auto &domain=native_.find(state.handle)->second.domain;
+        const auto &domain=*native_.find(state.handle)->second.domain;
         if(domain.default_local_association)return {};
         const NativeRaygenExport *rg=nullptr,*ms=nullptr;
         for(const auto &e:domain.exports){
@@ -371,7 +472,7 @@ public:
         if(record.size()<sizeof(ShaderId))return {};
         if(const auto native=native_.find(state.handle);native!=native_.end()){
             std::optional<size_t> match;
-            for(const auto &e:native->second.domain.exports)if(e.raygen&&e.identifier&&
+            for(const auto &e:native->second.domain->exports)if(e.raygen&&e.identifier&&
                 !std::memcmp(record.data(),e.identifier->data(),e.identifier->size())){
                 if(!e.pin||(match&&*match!=*e.pin))return {};
                 match=e.pin;

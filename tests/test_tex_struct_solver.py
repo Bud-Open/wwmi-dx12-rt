@@ -47,3 +47,6 @@ class TexStructSolverTests(unittest.TestCase):
 
     def test_visual_mip_parent_equivalence(self):
         subprocess.run([self.binary, "mipparent"], check=True, timeout=5)
+
+    def test_direct_ssim_owner_reconciliation(self):
+        subprocess.run([self.binary, "reconcile"], check=True, timeout=5)

@@ -1,49 +1,28 @@
 // Included inside the descriptor authority. A slot and a frozen copy own one
 // intrusive ID, not a resource or a second descriptor representation.
-constexpr uint32_t kPinnedRefBit = 0x80000000u;
-constexpr uint32_t kMaxPinnedContents = 131072u;
-constexpr uint32_t kPinCopyHitThreshold = 4u;
-
 struct DescriptorRefHeader {
     mutable std::atomic<uint32_t> references{1};
-    mutable std::atomic<uint32_t> copy_hits{0};
 };
 struct DescriptorContent;
 __declspec(noinline) void DeferDestroyDescriptor(const DescriptorContent*) noexcept;
-__declspec(noinline) void TryPinHotDescriptor(const DescriptorContent*, uint32_t observed_refs) noexcept;
 
 __forceinline void RetainDescriptor(const DescriptorContent* content) noexcept {
     if(!content)return;
-    const auto* hdr=reinterpret_cast<const DescriptorRefHeader*>(content);
-    const uint32_t r=hdr->references.load(std::memory_order_relaxed);
-    if(r&kPinnedRefBit)return;
-    const uint32_t prev=hdr->references.fetch_add(1,std::memory_order_relaxed);
-    const uint32_t hits=hdr->copy_hits.load(std::memory_order_relaxed)+1u;
-    hdr->copy_hits.store(hits,std::memory_order_relaxed);
-    if(hits>=kPinCopyHitThreshold)TryPinHotDescriptor(content,prev+1u);
+    reinterpret_cast<const DescriptorRefHeader*>(content)->references.fetch_add(1,std::memory_order_relaxed);
 }
 __forceinline bool TryRetainDescriptor(const DescriptorContent* content) noexcept {
     if(!content)return true;
-    const auto* hdr=reinterpret_cast<const DescriptorRefHeader*>(content);
-    auto& refs=hdr->references;
+    auto& refs=reinterpret_cast<const DescriptorRefHeader*>(content)->references;
     uint32_t r=refs.load(std::memory_order_relaxed);
-    if(r&kPinnedRefBit)return true;
     while(r!=0){
-        if(r&kPinnedRefBit)return true;
-        if(refs.compare_exchange_weak(r,r+1,std::memory_order_acquire,std::memory_order_relaxed)){
-            const uint32_t hits=hdr->copy_hits.load(std::memory_order_relaxed)+1u;
-            hdr->copy_hits.store(hits,std::memory_order_relaxed);
-            if(hits>=kPinCopyHitThreshold)TryPinHotDescriptor(content,r+1);
+        if(refs.compare_exchange_weak(r,r+1,std::memory_order_acquire,std::memory_order_relaxed))
             return true;
-        }
     }
     return false;
 }
 __forceinline void ReleaseDescriptor(const DescriptorContent* content) noexcept {
     if(!content)return;
     auto& refs=reinterpret_cast<const DescriptorRefHeader*>(content)->references;
-    const uint32_t r=refs.load(std::memory_order_relaxed);
-    if(r&kPinnedRefBit)return;
     if(refs.fetch_sub(1,std::memory_order_acq_rel)==1){
         DeferDestroyDescriptor(content);
     }
@@ -58,6 +37,9 @@ public:
     }
     void init_adopted(const DescriptorContent* value) noexcept {
         p.store(value,std::memory_order_relaxed);
+    }
+    void store_release(const DescriptorContent* value) noexcept {
+        p.store(value,std::memory_order_release);
     }
     ContentId(const ContentId& other) noexcept {
         const auto* v=other.p.load(std::memory_order_relaxed);
@@ -136,16 +118,29 @@ std::pmr::synchronized_pool_resource descriptor_content_pool;
 std::mutex retired_content_mutex;
 std::vector<const DescriptorContent*> retired_contents;
 std::atomic<size_t> retired_content_count{0};
-
-std::mutex pinned_content_mutex;
-std::vector<const DescriptorContent*> pinned_contents;
-std::atomic<uint32_t> pinned_content_count{0};
+std::atomic<uint64_t> reclaimed_content_batches{0};
+std::atomic<uint64_t> reclaimed_content_ticks{0};
 
 void DestroyDescriptorBatch(std::vector<const DescriptorContent*>& batch) noexcept {
     for(const auto* content:batch){
         content->~DescriptorContent();
         descriptor_content_pool.deallocate(const_cast<DescriptorContent*>(content),
             sizeof(DescriptorContent),alignof(DescriptorContent));
+    }
+}
+void ReclaimDetachedBatchWithGrace(std::vector<const DescriptorContent*>& batch) noexcept {
+    if(batch.empty())return;
+    const bool timed=rt_cpu::phase.load(std::memory_order_relaxed)==2;
+    const uint64_t t0=timed?rt_cpu::now():0;
+    // Publish a dedicated content grace epoch (separate from previous_retire_generation
+    // so heap TLS caches stay warm) before draining copy lanes.
+    content_grace_epoch.fetch_add(1,std::memory_order_seq_cst);
+    DrainCopyLanes(kCopyDepthMask);
+    DestroyDescriptorBatch(batch);
+    if(timed){
+        const uint64_t t1=rt_cpu::now();
+        reclaimed_content_batches.fetch_add(1,std::memory_order_relaxed);
+        if(t1>t0)reclaimed_content_ticks.fetch_add(t1-t0,std::memory_order_relaxed);
     }
 }
 __declspec(noinline) void DeferDestroyDescriptor(const DescriptorContent* content) noexcept {
@@ -157,61 +152,17 @@ __declspec(noinline) void DeferDestroyDescriptor(const DescriptorContent* conten
         // Never use-after-free under OOM during retirement.
     }
 }
-__declspec(noinline) void TryPinHotDescriptor(const DescriptorContent* content,uint32_t) noexcept {
-    if(!content)return;
-    // Only pin plain game views that own zero COM replicas/replacements.
-    const auto& d=content->definition;
-    if(d.replacement||d.replica||d.original_replica||d.original)return;
-    if(pinned_content_count.load(std::memory_order_relaxed)>=kMaxPinnedContents)return;
-    try{
-        std::lock_guard lock(pinned_content_mutex);
-        if(pinned_contents.size()>=kMaxPinnedContents)return;
-        uint32_t r=content->references.load(std::memory_order_relaxed);
-        while(r!=0&&!(r&kPinnedRefBit)){
-            // Set kPinnedRefBit and reset low count to 1 owned by pinned_contents.
-            if(content->references.compare_exchange_weak(r,kPinnedRefBit|1u,
-                std::memory_order_acq_rel,std::memory_order_relaxed)){
-                pinned_contents.push_back(content);
-                pinned_content_count.store(uint32_t(pinned_contents.size()),std::memory_order_relaxed);
-                return;
-            }
-        }
-    }catch(...){}
-}
-// Called ONLY inside PreviousReset() after all PreviousHeaps are retired & drained
-// and before previous_epoch re-opens (no live heap slots hold uncounted refs).
-// Note: raw_cpu_views might still hold ContentIds across PreviousReset? Wait!
-// Check if raw_cpu_views can hold a pinned ContentId across PreviousReset!
-// YES! raw_cpu_views is NOT cleared in PreviousReset! If raw_cpu_views held a
-// ContentId to a pinned object and we destroyed it in PreviousReset, ~RawCpuView
-// would touch freed memory! So ONLY unpin & destroy pinned_contents at DLL unload
-// (max 65,536 * ~280B = 18 MB ceiling, 0 bytes of VRAM)!
-struct PinnedContentsShutdownGuard {
-    ~PinnedContentsShutdownGuard() {
-        std::vector<const DescriptorContent*> batch;
-        {
-            std::lock_guard lock(pinned_content_mutex);
-            batch.swap(pinned_contents);
-            pinned_content_count.store(0,std::memory_order_relaxed);
-        }
-        // At static teardown inside the addon TU, destroy remaining pinned structs
-        // before descriptor_content_pool is destroyed (reverse declaration order).
-        // Clear kPinnedRefBit so any nested ~ContentId doesn't double-retire.
-        DestroyDescriptorBatch(batch);
-    }
-} pinned_contents_shutdown_guard;
 
 void TryReclaimRetiredContents() noexcept {
-    if(retired_content_count.load(std::memory_order_relaxed)<512)return;
+    if(retired_content_count.load(std::memory_order_relaxed)<512u)return;
     std::vector<const DescriptorContent*> batch;
     {
         std::unique_lock lock(retired_content_mutex,std::try_to_lock);
-        if(!lock.owns_lock()||retired_contents.size()<512)return;
+        if(!lock.owns_lock()||retired_contents.size()<512u)return;
         batch.swap(retired_contents);
         retired_content_count.store(0,std::memory_order_relaxed);
     }
-    DrainCopyLanes(kCopyDepthMask);
-    DestroyDescriptorBatch(batch);
+    ReclaimDetachedBatchWithGrace(batch);
 }
 void ReclaimRetiredContentsBlocking() noexcept {
     for(;;){
@@ -222,8 +173,7 @@ void ReclaimRetiredContentsBlocking() noexcept {
             retired_content_count.store(0,std::memory_order_relaxed);
         }
         if(batch.empty())return;
-        DrainCopyLanes(kCopyDepthMask);
-        DestroyDescriptorBatch(batch);
+        ReclaimDetachedBatchWithGrace(batch);
     }
 }
 

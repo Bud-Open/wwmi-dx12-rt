@@ -377,12 +377,13 @@
         else if(timer)timer->error="prefix_not_closed";
         return commands;
     }
-    std::shared_ptr<AuthorStaticAssets> prepare_author_static_assets(const std::shared_ptr<const ModPack> &pack,bool raster_only=false){
+    std::shared_ptr<AuthorStaticAssets> prepare_author_static_assets(const std::shared_ptr<const ModPack> &pack,bool raster_only=false,
+        ComPtr<ID3D12Resource> external_indices={}){
         if(const auto existing=author_static_assets.find(pack.get());existing!=author_static_assets.end())
             return existing->second;
         rt_cpu::Scope measured(rt_cpu::assets);
         auto generation=std::make_shared<AuthorStaticAssets>();
-        generation->bootstrap=GeometryAssets::create(native.Get(),pack,skin_dxil,copy_dxil,tangent_dxil,raster_only);
+        generation->bootstrap=GeometryAssets::create(native.Get(),pack,skin_dxil,copy_dxil,tangent_dxil,raster_only,std::move(external_indices));
         try{
             generation->geometry=make_default_author_assets(*generation->bootstrap);
             gpu::check(native->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&generation->ready)),"RT author static upload fence");
@@ -476,12 +477,16 @@
         return total;
     }
     std::shared_ptr<GeometryBatch> ready_author_batch(const std::shared_ptr<AuthorOutputs> &history,
-        const std::shared_ptr<const Pose> &pose,unsigned component){
+        const std::shared_ptr<const Pose> &pose,unsigned component,bool need_tangents=true){
         if(!history||history->pose!=pose)return {};
+        need_tangents=need_tangents&&component==UINT32_MAX;
         auto ready=[&](const std::shared_ptr<AuthorOutput> &value)->std::shared_ptr<GeometryBatch>{
             return value&&value->pose==pose&&author_production_ready(*value)?value->batch:nullptr;
         };
-        if(auto full=ready(history->full))return full;
+        if(auto full=ready(history->full);full&&(!need_tangents||full->tangents||!full->assets->vectors))return full;
+        if(!need_tangents){
+            if(auto pos_only=ready(history->full_positions_only))return pos_only;
+        }
         return component<history->parts.size()?ready(history->parts[component]):nullptr;
     }
     void execute_author_outputs(DrawBindingRecording &binding,ID3D12CommandQueue *native_queue){
@@ -532,7 +537,8 @@
             queue->producer_tail=commands;
             p.commands.reset();
             if(auto history=p.history.lock();history&&history->pose==p.output->pose){
-                auto &slot=history->slot(p.output->batch->single_component);
+                auto &slot=history->slot(p.output->batch->single_component,
+                    p.output->batch->tangents!=nullptr||!p.output->batch->assets->vectors);
                 // Keep the first real producer for this exact coverage.
                 // A duplicate never displaces an already shareable output.
                 if(!slot)slot=p.output;
@@ -541,20 +547,23 @@
     }
     std::shared_ptr<GeometryBatch> prepare_author_streams(std::shared_ptr<const Pose> pose,Recording consumer,api::command_list *list,
         unsigned component,std::shared_ptr<AuthorOutputs> &history,const std::shared_ptr<const NativeBlasIdentity> &identity={},
-        ComPtr<ID3D12Resource> *owned_previous_palette=nullptr,std::span<const SkinSample> writers={},bool raster_only=false){
+        ComPtr<ID3D12Resource> *owned_previous_palette=nullptr,std::span<const SkinSample> writers={},bool raster_only=false,
+        bool need_tangents=true,ComPtr<ID3D12Resource> external_indices={}){
         const auto binding=hold_draw_recording(consumer,list);
         if(!binding||!pose)return {};
+        need_tangents=need_tangents&&component==UINT32_MAX;
         auto *native_list=reinterpret_cast<ID3D12GraphicsCommandList *>(list->get_native());
         if(!native_list||native_list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT)return {};
         if(history&&history->pose!=pose)history.reset();
         for(const auto &p:binding->author_prefixes)
             if(p.output->pose==pose&&
-               (p.output->batch->single_component==UINT32_MAX||p.output->batch->single_component==component)){
+               (p.output->batch->single_component==UINT32_MAX||p.output->batch->single_component==component)&&
+               (!need_tangents||p.output->batch->tangents||!p.output->batch->assets->vectors)){
                 rt_cpu::hit(rt_cpu::author_local_acquire);
                 if(auto *bin=author_work.current())++bin->local_acquire;
                 return p.output->batch;
             }
-        if(auto ready=ready_author_batch(history,pose,component)){
+        if(auto ready=ready_author_batch(history,pose,component,need_tangents)){
             auto &holds=records[consumer.list];
             if(std::none_of(holds.begin(),holds.end(),[&](const auto &v){return v.get()==ready.get();})){
                 holds.push_back(ready);binding->author_batches.push_back(ready.get());
@@ -566,7 +575,7 @@
             return ready;
         }
         if(!completed_author_inputs_valid(*pose,component,native.Get()))return {};
-        auto static_assets=prepare_author_static_assets(pose->pack,raster_only);
+        auto static_assets=prepare_author_static_assets(pose->pack,raster_only,std::move(external_indices));
         if(!static_assets)return {};
         const auto &assets=static_assets->bootstrap?static_assets->bootstrap:static_assets->geometry;
         bool shape=false;
@@ -575,7 +584,7 @@
                pose->final_positions[c].mode==position_author_shape_delta_float6)shape=true;
         if(shape){
             if(shape_dxil.empty())shape_dxil=read_asset(L"ShapePositions.cso");
-            const bool vectors=component==UINT32_MAX&&bool(assets->vectors);
+            const bool vectors=need_tangents&&component==UINT32_MAX&&bool(assets->vectors);
             if(vectors&&shape_tangent_dxil.empty())shape_tangent_dxil=read_asset(L"ShapeTangents.cso");
             // DEFAULT is a separate GeometryAssets object: initialize the
             // pipeline on the exact object this batch is about to retain.
@@ -588,7 +597,7 @@
         rt_cpu::Scope allocation_measured(rt_cpu::batch_create);
         bool reused_storage=false;
         auto batch=prepare_pooled_author_streams(assets,*pose,component,owned_previous_palette,author_stream_pool,reused_storage,
-            ++next_author_output,!static_assets->bootstrap);
+            ++next_author_output,!static_assets->bootstrap,need_tangents);
         allocation_measured.end();
         batch->gpu_recording=consumer;
         rt_cpu::Scope recording_measured(rt_cpu::skin_record);auto command=closed_author_commands(*batch);recording_measured.end();

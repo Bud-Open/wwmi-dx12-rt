@@ -10,11 +10,11 @@
 #include "rt_history_roots.h"
 #include "rt_material_layout.h"
 #include "rt_torso_ps.h"
+#include "wc_copy_seh.hpp"
 #include <cstring>
 #include <new>
 #include <unordered_map>
 #include <tuple>
-#include <smmintrin.h>
 
 bool RtNativeIaHasColor(uint64_t);
 namespace {
@@ -69,30 +69,6 @@ const NoHistoryProgram* no_history_program(List* list,uint64_t vs,const RtProgra
     const auto i=legacy.find(std::tuple{vs,ps,rt.rtv_count});
     return i==legacy.end()?nullptr:i->second;
 }
-inline void copy_from_wc(void* dst,const void* src,size_t n) noexcept {
-    auto* d=static_cast<unsigned char*>(dst);
-    const auto* s=static_cast<const unsigned char*>(src);
-    if(n<32){std::memcpy(d,s,n);return;}
-    const uintptr_t mis=reinterpret_cast<uintptr_t>(s)&15u;
-    if(mis){const size_t head=16u-mis;std::memcpy(d,s,head);d+=head;s+=head;n-=head;}
-    while(n>=64){
-        const __m128i v0=_mm_stream_load_si128(reinterpret_cast<const __m128i*>(s));
-        const __m128i v1=_mm_stream_load_si128(reinterpret_cast<const __m128i*>(s+16));
-        const __m128i v2=_mm_stream_load_si128(reinterpret_cast<const __m128i*>(s+32));
-        const __m128i v3=_mm_stream_load_si128(reinterpret_cast<const __m128i*>(s+48));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(d),v0);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(d+16),v1);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(d+32),v2);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(d+48),v3);
-        d+=64;s+=64;n-=64;
-    }
-    while(n>=16){
-        const __m128i v=_mm_stream_load_si128(reinterpret_cast<const __m128i*>(s));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(d),v);
-        d+=16;s+=16;n-=16;
-    }
-    if(n)std::memcpy(d,s,n);
-}
 bool check_upload_window(const RootCbvBind& binding,uint32_t bytes){
     if(!binding.res || !binding.va || !bytes || bytes>binding.size)return false;
     const auto base=binding.res->GetGPUVirtualAddress();
@@ -116,20 +92,25 @@ template<class Read> bool read_upload(const RootCbvBind& binding,uint32_t begin,
     const bool map_full=full && expand_range;
     D3D12_RANGE read{SIZE_T(origin+(map_full?0:begin)),SIZE_T(origin+(map_full?full_bytes:end))},written{};
     void* mapped=nullptr;if(FAILED(binding.res->Map(0,&read,&mapped)))return false;
-    if(mapped)copy(static_cast<const unsigned char*>(mapped)+origin,origin,full);
-    binding.res->Unmap(0,&written);return mapped!=nullptr;
+    const bool ok=mapped&&copy(static_cast<const unsigned char*>(mapped)+origin,origin,full);
+    binding.res->Unmap(0,&written);return ok;
 }
 bool upload_bytes(const RootCbvBind& binding,uint32_t offset,void* dst,uint32_t bytes){
-    return read_upload(binding,offset,offset+bytes,[&](const auto* mapped,uint64_t,bool){copy_from_wc(dst,mapped+offset,bytes);});
+    return read_upload(binding,offset,offset+bytes,[&](const auto* mapped,uint64_t,bool){
+        return wwmi::safe_copy_from_wc(dst,mapped+offset,bytes);
+    });
 }
-void copy_author_instance(const RootCbvBind& cb,const unsigned char* p,uint64_t origin,WWMI_RtAuthorInstance_v1& out){
-    out.resource=reinterpret_cast<uint64_t>(cb.res);out.byte_origin=origin;
+bool copy_author_instance(const RootCbvBind& cb,const unsigned char* p,uint64_t origin,WWMI_RtAuthorInstance_v1& out){
     static_assert(sizeof(out.primitive_words)==WWMI_RT_NH_PRIMITIVE_BYTES);
-    copy_from_wc(out.primitive_words,p,sizeof(out.primitive_words));
+    WWMI_RtAuthorInstance_v1 staged{};
+    if(!wwmi::safe_copy_from_wc(staged.primitive_words,p,sizeof(staged.primitive_words)))return false;
     // The actual VS uses b1[0..3].xyz for current position. b1[10..13]
     // belongs only to the previous-position transform, not instance scope.
-    const auto* cached=reinterpret_cast<const unsigned char*>(out.primitive_words);
-    for(unsigned i=0;i<4;++i)std::memcpy(out.local_to_world+3*i,cached+16*i,12);
+    const auto* cached=reinterpret_cast<const unsigned char*>(staged.primitive_words);
+    for(unsigned i=0;i<4;++i)std::memcpy(staged.local_to_world+3*i,cached+16*i,12);
+    staged.resource=reinterpret_cast<uint64_t>(cb.res);staged.byte_origin=origin;
+    out=staged;
+    return true;
 }
 bool reg_of(List* list,bool srv,int reg,RegBind& out){
     if(reg<0||unsigned(reg)>=RegisterFileWidth(srv?TargetClass::ShaderResource:TargetClass::ConstantBuffer))return false;
@@ -180,7 +161,9 @@ bool RtReadAuthorInstance(List* list,int primitive_reg,WWMI_RtAuthorInstance_v1&
     if(!reg_of(list,false,primitive_reg,binding)||binding.is_table)return false;
     const auto cb=CmdCbv(list).binds[binding.param];
     if(cb.size<WWMI_RT_NH_PRIMITIVE_BYTES)return false;
-    return read_upload(cb,0,WWMI_RT_NH_PRIMITIVE_BYTES,[&](const auto* p,uint64_t origin,bool){copy_author_instance(cb,p,origin,out);});
+    return read_upload(cb,0,WWMI_RT_NH_PRIMITIVE_BYTES,[&](const auto* p,uint64_t origin,bool){
+        return copy_author_instance(cb,p,origin,out);
+    });
 }
 static thread_local uint32_t t_rt_aux_native_vertex_end=0;
 uint32_t RtSetAuxNativeVertexEnd(uint32_t end) noexcept {
@@ -249,34 +232,51 @@ bool RtReadWorldSurface(List* list,const RtLocalProgram& prog,uint32_t guid,uint
     // RtPrepareHistoryInvalid (only when previous_missing actually fires).
     bool view_read=false;
     bool vs_history_ready=false;
-    if(!read_upload(primitive_bind,instance?0u:capture_previous_scope?16u*10:fields.primitive_gate_offset,fields.primitive_gate_offset+4,[&](const auto* p,uint64_t origin,bool primitive_full){
+    WWMI_RtAuthorInstance_v1 staged_instance{};
+    bool have_staged_instance=false;
+    decltype(out.previous_scope) staged_scope{};
+    if(!read_upload(primitive_bind,instance?0u:capture_previous_scope?16u*10:fields.primitive_gate_offset,fields.primitive_gate_offset+4,[&](const auto* p,uint64_t origin,bool primitive_full) -> bool {
            const unsigned char* prim_src=p;
            if(instance&&primitive_full){
-               copy_author_instance(primitive_bind,p,origin,*instance);
-               prim_src=reinterpret_cast<const unsigned char*>(instance->primitive_words);
+               if(!copy_author_instance(primitive_bind,p,origin,staged_instance))return false;
+               have_staged_instance=true;
+               prim_src=reinterpret_cast<const unsigned char*>(staged_instance.primitive_words);
            }
            if(prim_src!=p && fields.primitive_gate_offset+4<=WWMI_RT_NH_PRIMITIVE_BYTES)
                memcpy(&flag,prim_src+fields.primitive_gate_offset,4);
-           else
-               memcpy(&flag,p+fields.primitive_gate_offset,4);
+           else if(!wwmi::safe_copy_from_wc(&flag,p+fields.primitive_gate_offset,4))
+               return false;
            if(capture_previous_scope){
-               scope.primitive_resource=reinterpret_cast<uint64_t>(primitive_bind.res);scope.primitive_byte_origin=origin;
+               staged_scope.primitive_resource=reinterpret_cast<uint64_t>(primitive_bind.res);
+               staged_scope.primitive_byte_origin=origin;
                // 16*(10..13)+12 = 220 <= WWMI_RT_NH_PRIMITIVE_BYTES (720)
-               for(unsigned i=0;i<4;++i)memcpy(scope.primitive_words+3*i,prim_src+16*(10+i),12);
-               scope.primitive_words[12]=flag;
-           }
-           if(!has_previous){view_read=true;return;}
-           view_read=read_upload(view_bind,capture_previous_scope?16*95:view_gate_offset,view_gate_offset+4,[&](const auto* v,uint64_t view_origin,bool view_full){
-               memcpy(&view_velocity,v+view_gate_offset,4);
-               if(capture_previous_scope){
-                   scope.view_resource=reinterpret_cast<uint64_t>(view_bind.res);scope.view_byte_origin=view_origin;
-                   copy_from_wc(scope.view_words,v+16*95,64);memcpy(scope.view_words+16,v+16*117,12);scope.view_words[19]=view_velocity;
+               if(prim_src!=p){
+                   for(unsigned i=0;i<4;++i)memcpy(staged_scope.primitive_words+3*i,prim_src+16*(10+i),12);
+               }else{
+                   for(unsigned i=0;i<4;++i)
+                       if(!wwmi::safe_copy_from_wc(staged_scope.primitive_words+3*i,p+16*(10+i),12))return false;
                }
-               if(unconditional_previous||!primitive_full||!view_full||!((flag&fields.primitive_gate_mask)|view_velocity))return;
+               staged_scope.primitive_words[12]=flag;
+           }
+           if(!has_previous){view_read=true;return true;}
+           view_read=read_upload(view_bind,capture_previous_scope?16*95:view_gate_offset,view_gate_offset+4,[&](const auto* v,uint64_t view_origin,bool view_full) -> bool {
+               if(!wwmi::safe_copy_from_wc(&view_velocity,v+view_gate_offset,4))return false;
+               if(capture_previous_scope){
+                   staged_scope.view_resource=reinterpret_cast<uint64_t>(view_bind.res);
+                   staged_scope.view_byte_origin=view_origin;
+                   if(!wwmi::safe_copy_from_wc(staged_scope.view_words,v+16*95,64)||
+                      !wwmi::safe_copy_from_wc(staged_scope.view_words+16,v+16*117,12))return false;
+                   staged_scope.view_words[19]=view_velocity;
+               }
+               if(unconditional_previous||!primitive_full||!view_full||!((flag&fields.primitive_gate_mask)|view_velocity))return true;
                vs_history_ready=true;
+               return true;
            },snapshot_vs?WWMI_RT_NH_VIEW_BYTES:0,false);
+           return view_read;
        },(instance||snapshot_vs)?WWMI_RT_NH_PRIMITIVE_BYTES:0,instance!=nullptr)||!view_read||
        !upload_bytes(cb.binds[local.param],0,out.local.data(),24))return false;
+    if(have_staged_instance&&instance)*instance=staged_instance;
+    if(capture_previous_scope)scope=staged_scope;
     out.native_cb=cb.binds[local.param].va;out.local_param=local.param;
     out.native_layout=layout;out.native_pso=CmdGfx(list).gfx_pso;
     out.reads_previous=has_previous&&(unconditional_previous||((flag&fields.primitive_gate_mask)|view_velocity)!=0);
@@ -474,12 +474,16 @@ bool RtPrepareWorldMaterialInputs(List* list,const RtLocalProgram& p,const RtWor
     static std::mutex mx;
     static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> cpu;
     static ID3D12Device *cpu_device=nullptr;
+    static D3D12_CPU_DESCRIPTOR_HANDLE cpu_start{};
+    static UINT cpu_inc=0;
     inputs.scratch=std::unique_lock(mx);
     if(!cpu||cpu_device!=g_d3d12_device){D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,4,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
         if(FAILED(g_d3d12_device->CreateDescriptorHeap(&desc,IID_PPV_ARGS(cpu.ReleaseAndGetAddressOf())))){target.failure=9;return false;}
-        cpu_device=g_d3d12_device;}
-    auto handle=cpu->GetCPUDescriptorHandleForHeapStart();
-    const auto inc=g_d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        cpu_device=g_d3d12_device;
+        cpu_start=cpu->GetCPUDescriptorHandleForHeapStart();
+        cpu_inc=g_d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);}
+    auto handle=cpu_start;
+    const auto inc=cpu_inc;
     const auto stream=[&](unsigned slot,D3D12_CPU_DESCRIPTOR_HANDLE src){
         const auto &b=world.streams[slot];
         if(b.param>=64||!src.ptr)return false;

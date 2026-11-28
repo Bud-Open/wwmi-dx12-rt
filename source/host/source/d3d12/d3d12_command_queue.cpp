@@ -12,6 +12,92 @@
 #include "addon_manager.hpp"
 #include "wwmi_native_trace.hpp"
 #include "wwmi_rt_forward.hpp"
+#include "wwmi_post_execute.h"
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+
+namespace {
+struct PostExecuteState {
+	WWMI_PostExecuteFn_v1 fn = nullptr;
+	uint64_t context = 0;
+	std::atomic<uint64_t> epoch{ 0 };
+	std::atomic<unsigned> entered{ 0 };
+	std::mutex lifecycle;
+	std::condition_variable idle;
+	bool draining = false;
+};
+PostExecuteState g_post_execute;
+thread_local bool t_in_post_execute = false;
+
+bool PostExecuteActive() noexcept
+{
+	return (g_post_execute.epoch.load(std::memory_order_acquire) & 1u) != 0u;
+}
+void PostExecuteLeave() noexcept
+{
+	if (g_post_execute.entered.fetch_sub(1, std::memory_order_acq_rel) == 1 && !PostExecuteActive())
+	{
+		std::lock_guard<std::mutex> lock(g_post_execute.lifecycle);
+		g_post_execute.idle.notify_all();
+	}
+}
+void PostExecuteInvoke(reshade::api::command_queue *api_queue, ID3D12CommandQueue *native_queue,
+	const uint64_t *api_lists, uint32_t count) noexcept
+{
+	if (t_in_post_execute || !count) return;
+	const uint64_t observed = g_post_execute.epoch.load(std::memory_order_acquire);
+	if ((observed & 1u) == 0u) return;
+	g_post_execute.entered.fetch_add(1, std::memory_order_acq_rel);
+	if (g_post_execute.epoch.load(std::memory_order_acquire) != observed)
+	{
+		PostExecuteLeave();
+		return;
+	}
+	t_in_post_execute = true;
+	const auto fn = g_post_execute.fn;
+	const uint64_t ctx = g_post_execute.context;
+	if (fn)
+	{
+		try { fn(reinterpret_cast<uint64_t>(api_queue), reinterpret_cast<uint64_t>(native_queue), api_lists, count, ctx); }
+		catch (...) {}
+	}
+	t_in_post_execute = false;
+	PostExecuteLeave();
+}
+}
+
+extern "C" int32_t __cdecl WWMI_RegisterPostExecute_v1(WWMI_PostExecuteFn_v1 callback, uint64_t context)
+{
+	if (t_in_post_execute) return -3;
+	std::unique_lock<std::mutex> lock(g_post_execute.lifecycle);
+	if (callback == nullptr)
+	{
+		if (g_post_execute.draining)
+		{
+			if (g_post_execute.context != context) return -2;
+			g_post_execute.idle.wait(lock, [] { return !g_post_execute.draining; });
+			return 0;
+		}
+		if (!PostExecuteActive()) return (g_post_execute.context == 0 || g_post_execute.context == context) ? 0 : -2;
+		if (g_post_execute.context != context) return -2;
+		g_post_execute.draining = true;
+		g_post_execute.epoch.fetch_add(1, std::memory_order_acq_rel);
+		g_post_execute.idle.wait(lock, [] { return g_post_execute.entered.load(std::memory_order_acquire) == 0; });
+		g_post_execute.fn = nullptr;
+		g_post_execute.context = 0;
+		g_post_execute.draining = false;
+		g_post_execute.idle.notify_all();
+		return 0;
+	}
+	if (!context || g_post_execute.draining) return -2;
+	if (PostExecuteActive())
+		return (g_post_execute.fn == callback && g_post_execute.context == context) ? 0 : -2;
+	g_post_execute.fn = callback;
+	g_post_execute.context = context;
+	g_post_execute.epoch.fetch_add(1, std::memory_order_release);
+	return 0;
+}
 
 D3D12CommandQueue::D3D12CommandQueue(D3D12Device *device, ID3D12CommandQueue *original) :
 	command_queue_impl(device, original)
@@ -184,11 +270,13 @@ void    STDMETHODCALLTYPE D3D12CommandQueue::ExecuteCommandLists(UINT NumCommand
 
 	temp_mem<ID3D12CommandList *> command_lists(NumCommandLists);
 	const bool wwmi_notify = wwmi::rt_forward::enabled();
-	temp_mem<reshade::api::command_list *, 32> wwmi_lists(wwmi_notify ? NumCommandLists : 0);
+	const bool post_exec_notify = PostExecuteActive();
+	const bool track_lists = wwmi_notify || post_exec_notify;
+	temp_mem<reshade::api::command_list *, 32> wwmi_lists(track_lists ? NumCommandLists : 0);
 	for (UINT i = 0; i < NumCommandLists; ++i)
 	{
 		assert(ppCommandLists[i] != nullptr);
-		if (wwmi_notify) wwmi_lists[i] = nullptr;
+		if (track_lists) wwmi_lists[i] = nullptr;
 
 		if (com_ptr<D3D12GraphicsCommandList> command_list_proxy;
 			SUCCEEDED(ppCommandLists[i]->QueryInterface(&command_list_proxy)))
@@ -199,7 +287,7 @@ void    STDMETHODCALLTYPE D3D12CommandQueue::ExecuteCommandLists(UINT NumCommand
 
 			// Get original command list pointer from proxy object
 			command_lists[i] = command_list_proxy->_orig;
-			if (wwmi_notify) wwmi_lists[i] = command_list_proxy.get();
+			if (track_lists) wwmi_lists[i] = command_list_proxy.get();
 		}
 		else
 		{
@@ -218,6 +306,15 @@ void    STDMETHODCALLTYPE D3D12CommandQueue::ExecuteCommandLists(UINT NumCommand
 	if (wwmi_notify)
 		for (UINT i = 0; i < NumCommandLists; ++i)
 			if (wwmi_lists[i]) wwmi::rt_forward::queue_after(this, _orig, wwmi_lists[i]);
+	if (post_exec_notify)
+	{
+		temp_mem<uint64_t, 32> post_lists(NumCommandLists);
+		uint32_t post_count = 0;
+		for (UINT i = 0; i < NumCommandLists; ++i)
+			if (wwmi_lists[i]) post_lists[post_count++] = reinterpret_cast<uint64_t>(wwmi_lists[i]);
+		if (post_count)
+			PostExecuteInvoke(this, _orig, post_lists.p, post_count);
+	}
 }
 void    STDMETHODCALLTYPE D3D12CommandQueue::SetMarker(UINT Metadata, const void *pData, UINT Size)
 {

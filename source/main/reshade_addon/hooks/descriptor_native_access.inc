@@ -28,6 +28,7 @@ std::array<CopyLane,copy_lane_count> copy_lanes;
 std::atomic<uint32_t> raw_edits_pending{0};
 std::atomic<uint32_t> copy_lane_waiters{0};
 std::atomic<uint64_t> previous_retire_generation{1};
+std::atomic<uint64_t> content_grace_epoch{1};
 
 struct ThreadCopyLane {
     CopyLane* lane=nullptr;
@@ -96,7 +97,11 @@ struct CopyLaneGuard {
                 held_fast_raw=true;
             }
         }
-        retire_gen=previous_retire_generation.load(std::memory_order_acquire);
+        retire_gen=previous_retire_generation.load(std::memory_order_seq_cst);
+        // Pair with ReclaimBatchWithGrace's seq_cst bump in the single SC total
+        // order so any reader entering after DrainCopyLanes passed its lane
+        // strictly observes prior unlinks before loading any bare pointer.
+        (void)content_grace_epoch.load(std::memory_order_seq_cst);
     }
     CopyLaneGuard(const CopyLaneGuard&)=delete;
     bool has_copy_depth() const noexcept {return held_copy;}

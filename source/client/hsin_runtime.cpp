@@ -24,6 +24,7 @@
 #include "native_profile_archive.hpp"
 #include "rt_pack_identity.h"
 #include "runtime_boundaries.hpp"
+#include "runtime_lease.hpp"
 #include "rt_cpu_profile.hpp"
 #include "rt_cpu_window.h"
 #include "rt_draw_window.h"
@@ -37,6 +38,7 @@
 #include <deque>
 #include <map>
 #include <condition_variable>
+#include <shared_mutex>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -86,8 +88,9 @@ ComputeEnableFn compute_enable=nullptr;ForwardRegisterFn register_forward=nullpt
 ForwardRegisterV2Fn register_forward_v2=nullptr;
 AuthorConsumerFn author_consumer=nullptr;
 WWMI_RtSetDescriptorObservationFn_v1 descriptor_lease=nullptr;WWMI_RtReadDescriptorSourceFn_v1 descriptor_source=nullptr;
-std::mutex devices_mutex;
-std::condition_variable devices_idle;
+std::shared_mutex devices_mutex;
+std::condition_variable_any devices_idle;
+ClientLockTracker g_client_lock_stats;
 bool accepting_devices=false;
 std::set<api::device *> initializing_devices;
 WWMI_RtModReadGeometrySectionFn_v1 mod_geometry_section=nullptr;
@@ -252,8 +255,12 @@ struct AuthorOutputs {
     explicit AuthorOutputs(size_t n):parts(n){}
     std::shared_ptr<const Pose> pose;
     std::shared_ptr<AuthorOutput> full;
+    std::shared_ptr<AuthorOutput> full_positions_only;
     std::vector<std::shared_ptr<AuthorOutput>> parts;
-    std::shared_ptr<AuthorOutput>& slot(unsigned component){return component==UINT32_MAX?full:parts[component];}
+    std::shared_ptr<AuthorOutput>& slot(unsigned component,bool has_tangents=true){
+        if(component!=UINT32_MAX)return parts[component];
+        return has_tangents?full:full_positions_only;
+    }
 };
 struct AuthorPrefix {
     std::shared_ptr<const NativeBlasIdentity> identity;
@@ -487,6 +494,7 @@ struct Runtime {
     std::unordered_map<std::uint64_t,Holds> records;
     std::unordered_map<std::uint64_t,std::weak_ptr<DrawBindingRecording>> binding_recordings;
     std::vector<std::pair<api::command_list *,std::weak_ptr<DrawBindingRecording>>> pending_draw_resets;
+    std::atomic<std::uint32_t> pending_draw_resets_count_{0};
     std::vector<std::shared_ptr<DrawBindingPage>> binding_pages;
     std::unordered_map<std::uint64_t,std::vector<std::shared_ptr<GeometryBatch>>> generated_records;
     std::vector<SurfaceHistory> surface_history;
@@ -558,7 +566,7 @@ struct Runtime {
     void refresh(){auto next=source.refresh(catalog);if(next.load_generation==catalog.load_generation&&next.revision==catalog.revision&&next.native_revision==catalog.native_revision)return;
         // A load-generation change ends the old pack lifetime. Selection
         // revisions and character switches must not discard reusable capacity.
-        if(next.load_generation!=catalog.load_generation&&!author_stream_pool.storage.empty())
+        if(next.load_generation!=catalog.load_generation&&!author_stream_pool.empty())
             author_pool_release_due=true;
         inputs.set_catalog(next);
         auto retained=[&](const std::shared_ptr<const ModPack> &pack){return std::find(next.packs.begin(),next.packs.end(),pack)!=next.packs.end();};
@@ -739,7 +747,7 @@ struct Runtime {
         author_stream_pool.release_idle();
         // If the load left no pack, free the remaining backings as their
         // real owners retire. With a live pack, late retirements can be reused.
-        author_pool_release_due=catalog.packs.empty()&&!author_stream_pool.storage.empty();
+        author_pool_release_due=catalog.packs.empty()&&!author_stream_pool.empty();
     }
     void history_owners_changed()noexcept{
         if(history_dirty)return;
@@ -835,7 +843,7 @@ struct Runtime {
         }
         report_author_work(true);report_native_discovery(true);
         native_probe_pending.clear();native_probe_records.clear();native_probe_program.reset();
-        queues.clear();submissions.clear();records.clear();binding_recordings.clear();pending_draw_resets.clear();binding_pages.clear();generated_records.clear();surface_history.clear();previous_interests.clear();previous_prepared.clear();pending_previous_writers.clear();native_palettes.clear();tlas.clear();tlas_records.clear();scene_owners.clear();retiring_scene_owners.clear();targets.clear();
+        queues.clear();submissions.clear();records.clear();binding_recordings.clear();pending_draw_resets.clear();pending_draw_resets_count_.store(0,std::memory_order_release);binding_pages.clear();generated_records.clear();surface_history.clear();previous_interests.clear();previous_prepared.clear();pending_previous_writers.clear();native_palettes.clear();tlas.clear();tlas_records.clear();scene_owners.clear();retiring_scene_owners.clear();targets.clear();
         author_plans.clear();author_primitive_refs.clear();history_held_plans.clear();history_cohorts.clear();
         author_static_assets.clear();uploading_author_assets.clear();author_commands.clear();author_stream_pool.release_idle();
         reshade::log::message(reshade::log::level::info,("RT pack stopped: geometry="+std::to_string(geometry_count)+" tlas="+std::to_string(tlas_count)+" sbt="+std::to_string(sbt_count)+" errors="+std::to_string(errors)).c_str());
@@ -2106,6 +2114,12 @@ struct Runtime {
     std::shared_ptr<DrawBindingPage> take_binding_page(DrawBindingRecording &binding,unsigned n,unsigned slots){
         auto page=binding.pages.empty()?std::shared_ptr<DrawBindingPage>{}:binding.pages.back();
         if(!page||!page->fits(n,slots)){
+            if(page){
+                if(auto *bin=author_work.current()){
+                    if(n>page->capacity-page->descriptors_used)++bin->page_breaks_desc;
+                    else ++bin->page_breaks_const;
+                }
+            }
             // A recording keeps its pages even after its first successful
             // submit so later replay still sees immutable descriptor/CB data.
             page.reset();
@@ -2154,6 +2168,10 @@ struct Runtime {
         const auto cb_offset=page->constants_used*stride;
         page->constants_used+=slots;
         page->descriptors_used+=n;
+        if(auto *bin=author_work.current()){
+            const auto used_bytes=std::uint64_t(page->constants_used)*stride;
+            if(used_bytes>bin->page_const_high_water)bin->page_const_high_water=used_bytes;
+        }
         std::memcpy(page->mapped+cb_offset,request.local_vf,sizeof(request.local_vf));
         const auto cb_base=page->constants->GetGPUVirtualAddress();
         if(no_history_cb){
@@ -2172,31 +2190,39 @@ struct Runtime {
         return WWMI_RT_SURFACE_OK;
     }
     std::shared_ptr<DrawBindingRecording> draw_recording(std::uint64_t list) const{
+        if(binding_recordings.empty())return nullptr;
         auto p=binding_recordings.find(list);return p==binding_recordings.end()?nullptr:p->second.lock();
     }
     void forget_recording(api::command_list *c){
         const auto list=reinterpret_cast<std::uint64_t>(c);
         if(auto *bin=author_work.current())if(const auto draw=draw_recording(list))
             for(const auto &prefix:draw->author_prefixes)bin->uncommitted_reset+=!prefix.committed;
-        const bool released=records.erase(list)!=0;
-        binding_recordings.erase(list);generated_records.erase(list);tlas_records.erase(list);
-        native_probe_records.erase(list);
-        std::erase_if(native_probe_pending,[&](const auto &p){return p->evidence->recording.list==list&&!p->submissions;});
-        const bool writer=pending_previous_writers.erase(list)!=0;
+        const bool released=!records.empty()&&records.erase(list)!=0;
+        if(!binding_recordings.empty())binding_recordings.erase(list);
+        if(!generated_records.empty())generated_records.erase(list);
+        if(!tlas_records.empty())tlas_records.erase(list);
+        if(!native_probe_records.empty())native_probe_records.erase(list);
+        if(!native_probe_pending.empty())
+            std::erase_if(native_probe_pending,[&](const auto &p){return p->evidence->recording.list==list&&!p->submissions;});
+        const bool writer=!pending_previous_writers.empty()&&pending_previous_writers.erase(list)!=0;
         if(writer)history_dirty=true;
         if(released){
             history_owners_changed();
             if(author_pool_release_due&&catalog.packs.empty())release_unloaded_author_storage();
         }
     }
-    void reset_recording(api::command_list *c){
+    Recording reset_recording(api::command_list *c){
         auto binding=draw_recording(reinterpret_cast<std::uint64_t>(c));
-        if(!binding){inputs.reset_list(c);forget_recording(c);return;}
-        if(binding->reset.exchange(DrawBindingRecording::waiting,std::memory_order_relaxed)!=DrawBindingRecording::waiting)
+        if(!binding){const auto stamp=inputs.reset_list_deferred_stamp(c);forget_recording(c);return stamp;}
+        if(binding->reset.exchange(DrawBindingRecording::waiting,std::memory_order_relaxed)!=DrawBindingRecording::waiting){
             pending_draw_resets.emplace_back(c,binding);
+            pending_draw_resets_count_.store(static_cast<std::uint32_t>(pending_draw_resets.size()),std::memory_order_release);
+        }
         draw_reset_receipt=binding;
+        return {};
     }
     void drain_draw_resets(){
+        if(pending_draw_resets.empty())return;
         std::erase_if(pending_draw_resets,[&](const auto &p){
             auto binding=p.second.lock();if(!binding)return true;
             const auto result=binding->reset.load(std::memory_order_acquire);
@@ -2208,6 +2234,7 @@ struct Runtime {
             }
             return true;
         });
+        pending_draw_resets_count_.store(static_cast<std::uint32_t>(pending_draw_resets.size()),std::memory_order_release);
     }
     void submit_before(api::command_queue *q,api::command_list *c){
         rt_cpu::Scope measured(rt_cpu::submit_pre);
@@ -2386,13 +2413,111 @@ struct Runtime {
     }
 };
 std::unordered_map<api::device *,std::shared_ptr<Runtime>> devices;
+PrimaryRuntimeTable<Runtime,api::device *,std::uint64_t> primary_runtime;
+using RuntimeLease=PrimaryRuntimeTable<Runtime,api::device *,std::uint64_t>::Lease;
 std::vector<std::shared_ptr<Runtime>> unfinished; // only an actual failed GPU retirement, never a successful stop
-std::shared_ptr<Runtime> runtime(api::device *d){std::lock_guard lock(devices_mutex);auto p=devices.find(d);return p==devices.end()?nullptr:p->second;}
-std::shared_ptr<Runtime> runtime_native(std::uint64_t device){
-    std::lock_guard lock(devices_mutex);
-    for(const auto &[_,r]:devices)if(r->native_device_id==device)return r;
-    return {};
+RuntimeLease runtime(api::device *d){
+    const bool sample=rt_cpu::phase.load(std::memory_order_relaxed)==1&&g_client_lock_stats.window_id()!=0;
+    const auto t0=sample?rt_cpu::now():0;
+    if(auto fast=primary_runtime.try_acquire_api(d)){
+        if(sample){const auto t1=rt_cpu::now();g_client_lock_stats.record_devices_lookup(t1>t0?t1-t0:0);}
+        return fast;
+    }
+    std::shared_lock lock(devices_mutex);
+    auto p=devices.find(d);
+    auto out=p==devices.end()?nullptr:p->second;
+    lock.unlock();
+    if(sample){const auto t1=rt_cpu::now();g_client_lock_stats.record_devices_lookup(t1>t0?t1-t0:0);}
+    return RuntimeLease(std::move(out));
 }
+RuntimeLease runtime_native(std::uint64_t device){
+    const bool sample=rt_cpu::phase.load(std::memory_order_relaxed)==1&&g_client_lock_stats.window_id()!=0;
+    const auto t0=sample?rt_cpu::now():0;
+    if(auto fast=primary_runtime.try_acquire_native(device)){
+        if(sample){const auto t1=rt_cpu::now();g_client_lock_stats.record_devices_lookup(t1>t0?t1-t0:0);}
+        return fast;
+    }
+    std::shared_lock lock(devices_mutex);
+    std::shared_ptr<Runtime> out;
+    for(const auto &[_,r]:devices)if(r->native_device_id==device){out=r;break;}
+    lock.unlock();
+    if(sample){const auto t1=rt_cpu::now();g_client_lock_stats.record_devices_lookup(t1>t0?t1-t0:0);}
+    return RuntimeLease(std::move(out));
+}
+static void emit_client_lock_report(){
+    if(!g_client_lock_stats.claim_emit_once())return;
+    const auto snap=g_client_lock_stats.snapshot();
+    if(!snap.frequency)return;
+    const double ms=1000.0/double(snap.frequency);
+    char line[384];
+    std::snprintf(line,sizeof(line),
+        "RT-CLIENT-LOCK summary devs_calls=%llu devs_ms=%.3f devs_max_ms=%.3f copy_bypass_pre=%llu copy_bypass_rec=%llu empty_tables_bypass=%llu sdk_dispatch_bypass=%llu",
+        (unsigned long long)snap.devs_calls,snap.devs_ticks*ms,snap.devs_max_ticks*ms,
+        (unsigned long long)snap.copy_bypass_before,(unsigned long long)snap.copy_bypass_rec,
+        (unsigned long long)snap.empty_tables_bypass,(unsigned long long)snap.sdk_dispatch_bypass);
+    reshade::log::message(reshade::log::level::info,line);
+    const std::size_t op_limit=(std::min)(snap.ops.size(),std::size_t{24});
+    for(std::size_t i=0;i<op_limit;++i){
+        const auto &o=snap.ops[i];
+        std::snprintf(line,sizeof(line),
+            "RT-CLIENT-LOCK op=%s calls=%llu wait_ms=%.3f max_wait_ms=%.3f hold_ms=%.3f max_hold_ms=%.3f blamed_wait_ms=%.3f blamed_n=%llu",
+            client_lock_op_name(o.op),(unsigned long long)o.calls,
+            o.wait_ticks*ms,o.max_wait_ticks*ms,o.hold_ticks*ms,o.max_hold_ticks*ms,
+            o.blamed_wait_ticks*ms,(unsigned long long)o.blamed_count);
+        reshade::log::message(reshade::log::level::info,line);
+    }
+    for(std::size_t i=0;i<snap.slow_waits.size();++i){
+        const auto &s=snap.slow_waits[i];
+        std::snprintf(line,sizeof(line),
+            "RT-CLIENT-LOCK slow_wait rank=%u waiter=%s obs_owner=%s wait_ms=%.3f owner_held_ms=%.3f",
+            unsigned(i+1),client_lock_op_name(s.waiter),client_lock_op_name(s.obs_owner),
+            s.wait_ticks*ms,s.owner_held_ticks*ms);
+        reshade::log::message(reshade::log::level::info,line);
+    }
+}
+static void ensure_client_lock_window_armed(){
+    if(rt_cpu::phase.load(std::memory_order_acquire)==1&&!g_client_lock_stats.window_id()){
+        g_client_lock_stats.arm_once(rt_cpu::now(),
+            rt_cpu::deadline.load(std::memory_order_acquire),
+            rt_cpu::frequency.load(std::memory_order_acquire));
+    }
+}
+struct MeasuredDirectLock {
+    RuntimeMutex &mutex;
+    ClientLockOp op;
+    std::uint8_t sampled_wid=0;
+    std::uint64_t obs_owner=0,wait_ticks=0,acq_ticks=0,acq_rel=0;
+    MeasuredDirectLock(RuntimeMutex &m,ClientLockOp o):mutex(m),op(o){
+        if(rt_cpu::phase.load(std::memory_order_relaxed)==1){
+            ensure_client_lock_window_armed();
+            const auto t0=rt_cpu::now();
+            sampled_wid=g_client_lock_stats.active_window(t0);
+            if(sampled_wid){
+                obs_owner=mutex.owner_sample();
+                mutex.lock();
+                acq_ticks=rt_cpu::now();
+                const auto clamped_acq=g_client_lock_stats.clamp_to_deadline(acq_ticks);
+                wait_ticks=clamped_acq>t0?clamped_acq-t0:0;
+                acq_rel=g_client_lock_stats.relative_ticks(acq_ticks);
+                mutex.publish_owner_sample(ObservedOwnerCodec::pack(sampled_wid,op,acq_rel));
+                return;
+            }
+        }
+        mutex.lock();
+    }
+    ~MeasuredDirectLock(){
+        std::uint64_t hold_ticks=0;
+        if(sampled_wid){
+            const auto t_end=g_client_lock_stats.clamp_to_deadline(rt_cpu::now());
+            hold_ticks=t_end>acq_ticks?t_end-acq_ticks:0;
+            mutex.clear_owner_sample();
+        }
+        mutex.unlock();
+        if(sampled_wid){
+            g_client_lock_stats.record_lock_sample(op,sampled_wid,wait_ticks,hold_ticks,obs_owner,acq_rel);
+        }
+    }
+};
 static rt_cpu::Kind cpu_callback_kind(const char *name){
     if(std::strstr(name,"PreviousSurface"))return rt_cpu::api_previous;
     if(std::strstr(name,"NativePalette")||std::strstr(name,"AuthorPalette"))return rt_cpu::api_palette;
@@ -2405,57 +2530,112 @@ static rt_cpu::Kind cpu_callback_kind(const char *name){
 }
 struct RuntimeCall {
     Runtime &runtime;const char *name;
+    ClientLockOp lock_op=ClientLockOp::none;
+    std::uint8_t sampled_wid=0;
+    std::uint64_t obs_owner=0,wait_ticks=0,acq_ticks=0,acq_rel=0;
     rt_cpu::Scope api_measured,body_measured;
     // Declaration order also unlocks before COM release on construction failure.
     std::vector<ComPtr<ID3D12Resource>> release_outside_lock;
     std::unique_lock<RuntimeMutex> lock;
     RuntimeCall(Runtime &r,const char *n):runtime(r),name(n),lock(r.mutex,std::defer_lock){
         if(cpu_window)rt_cpu::observe(cpu_window(r.native_device_id));
-        api_measured.begin(rt_cpu::phase.load(std::memory_order_relaxed)==1?cpu_callback_kind(name):rt_cpu::other_callback);
+        const bool measuring=rt_cpu::phase.load(std::memory_order_relaxed)==1;
+        if(measuring){
+            ensure_client_lock_window_armed();
+            lock_op=client_lock_op_from_name(n);
+        }
+        api_measured.begin(measuring?cpu_callback_kind(name):rt_cpu::other_callback);
         rt_cpu::Scope wait_measured(rt_cpu::runtime_wait);
+        std::uint64_t t_wait0=0;
+        if(measuring){
+            t_wait0=rt_cpu::now();
+            sampled_wid=g_client_lock_stats.active_window(t_wait0);
+            if(sampled_wid)obs_owner=r.mutex.owner_sample();
+        }
         r.trace.emit(name,"runtime_lock_wait",reinterpret_cast<std::uint64_t>(&r),r.mutex.owner());
-        lock.lock();wait_measured.end();body_measured.begin(rt_cpu::runtime_body);r.trace.emit(name,"runtime_lock_acquired",reinterpret_cast<std::uint64_t>(&r),r.mutex.owner());r.drain_buffers(release_outside_lock);r.drain_draw_resets();
+        lock.lock();
+        if(sampled_wid){
+            acq_ticks=rt_cpu::now();
+            const auto clamped_acq=g_client_lock_stats.clamp_to_deadline(acq_ticks);
+            wait_ticks=clamped_acq>t_wait0?clamped_acq-t_wait0:0;
+            acq_rel=g_client_lock_stats.relative_ticks(acq_ticks);
+            r.mutex.publish_owner_sample(ObservedOwnerCodec::pack(sampled_wid,lock_op,acq_rel));
+        }
+        wait_measured.end();body_measured.begin(rt_cpu::runtime_body);r.trace.emit(name,"runtime_lock_acquired",reinterpret_cast<std::uint64_t>(&r),r.mutex.owner());r.drain_buffers(release_outside_lock);r.drain_draw_resets();
     }
     ~RuntimeCall(){
         runtime.drain_buffers(release_outside_lock);runtime.trace.emit(name,"runtime_call_end",reinterpret_cast<std::uint64_t>(&runtime));
-        lock.unlock();release_outside_lock.clear();body_measured.end();api_measured.end();
+        std::uint64_t hold_ticks=0;
+        if(sampled_wid){
+            const auto t_end=g_client_lock_stats.clamp_to_deadline(rt_cpu::now());
+            hold_ticks=t_end>acq_ticks?t_end-acq_ticks:0;
+            runtime.mutex.clear_owner_sample();
+        }
+        lock.unlock();
+        if(sampled_wid){
+            g_client_lock_stats.record_lock_sample(lock_op,sampled_wid,wait_ticks,hold_ticks,obs_owner,acq_rel);
+        }
+        release_outside_lock.clear();body_measured.end();api_measured.end();
+        if(!g_client_lock_stats.is_emitted()&&rt_cpu::phase.load(std::memory_order_relaxed)==3)emit_client_lock_report();
     }
 };
-template<class Fn> void with_runtime(Runtime &r,const char *name,Fn &&fn,bool lifetime=false){{RuntimeCall call(r,name);if(r.active||lifetime)try{fn(r);}catch(const std::exception &e){if(++r.errors==1)reshade::log::message(reshade::log::level::error,e.what());r.active=false;r.release_frame();}}rt_cpu::finish("client");}
+template<class Fn> void with_runtime(Runtime &r,const char *name,Fn &&fn,bool lifetime=false){{RuntimeCall call(r,name);if(r.active||lifetime)try{fn(r);}catch(const std::exception &e){if(++r.errors==1)reshade::log::message(reshade::log::level::error,e.what());r.active=false;r.release_frame();}}rt_cpu::finish("client");if(!g_client_lock_stats.is_emitted()&&rt_cpu::phase.load(std::memory_order_relaxed)==3)emit_client_lock_report();}
 template<class Fn> void with(api::device *d,const char *name,Fn &&fn,bool lifetime=false){auto r=runtime(d);if(r)with_runtime(*r,name,std::forward<Fn>(fn),lifetime);}
 struct DeviceInitializer {
     api::device *device=nullptr;
     std::shared_ptr<ProviderModule> provider;
     explicit DeviceInitializer(api::device *d){
-        std::lock_guard lock(devices_mutex);
+        std::unique_lock lock(devices_mutex);
         if(!accepting_devices||devices.contains(d)||initializing_devices.contains(d))return;
         provider=provider_module;if(!provider)return;
         initializing_devices.insert(d);device=d;
     }
-    ~DeviceInitializer(){if(device){std::lock_guard lock(devices_mutex);initializing_devices.erase(device);devices_idle.notify_all();}}
+    ~DeviceInitializer(){if(device){std::unique_lock lock(devices_mutex);initializing_devices.erase(device);devices_idle.notify_all();}}
 };
 void init_device(api::device *d){
     if(d->get_api()!=api::device_api::d3d12)return;
     DeviceInitializer lease(d);if(!lease.provider)return;
     try{
         auto r=std::make_shared<Runtime>(d,lease.provider);
-        {std::lock_guard lock(devices_mutex);if(accepting_devices){devices.emplace(d,r);return;}}
+        bool need_drain=false;
+        {
+            std::unique_lock lock(devices_mutex);
+            if(accepting_devices){
+                devices.emplace(d,r);
+                if(devices.size()==1)primary_runtime.publish_primary_locked(d,r->native_device_id,r.get());
+                else need_drain=primary_runtime.begin_unpublish_locked();
+                lock.unlock();
+                if(need_drain)primary_runtime.finish_drain_unlocked();
+                return;
+            }
+        }
         // Uninit closed admission while this constructor was outside the lock.
         // Undo the actual frame lease/Reader before acknowledging its drain.
         RuntimeCall call(*r,__func__);r->stop();
     }catch(const std::exception &e){reshade::log::message(reshade::log::level::error,e.what());}
 }
 void destroy_device(api::device *d){
-    auto r=runtime(d);if(!r)return;{std::lock_guard lock(devices_mutex);devices.erase(d);}
+    std::shared_ptr<Runtime> r;
+    bool need_drain=false;
+    {
+        std::unique_lock lock(devices_mutex);
+        auto p=devices.find(d);
+        if(p==devices.end())return;
+        r=std::move(p->second);
+        devices.erase(p);
+        need_drain=primary_runtime.begin_unpublish_locked(r.get());
+    }
+    if(need_drain)primary_runtime.finish_drain_unlocked();
     {
         RuntimeCall call(*r,__func__);
         try{r->stop();}catch(const std::exception &e){
             reshade::log::message(reshade::log::level::error,e.what());
-            std::lock_guard global(devices_mutex);
+            std::unique_lock global(devices_mutex);
             if(!unfinished_gpu_module)GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,reinterpret_cast<LPCWSTR>(self_module),&unfinished_gpu_module);
             unfinished.push_back(r);
         }
     }
+    if(rt_cpu::phase.load(std::memory_order_acquire)!=0){rt_cpu::finish("client",true);emit_client_lock_report();}
     if(r->author_work.start)rt_phase_cpu::report("client",r->author_work.start,rt_phase_cpu::runtime_wait,rt_phase_cpu::descriptor_copy,true);
 }
 void present(api::command_queue *q,api::swapchain *,const api::rect *,const api::rect *,unsigned,const api::rect *){
@@ -2480,15 +2660,32 @@ void init_resource(api::device *d,const api::resource_desc &desc,const api::subr
 void destroy_resource(api::device *d,api::resource resource){
     auto r=runtime(d);if(!r)return;r->buffer_events.destroyed(resource);r->trace.emit(__func__,"queued",resource.handle);
 }
-void init_list(api::command_list *c){with(c->get_device(),__func__,[&](Runtime &r){r.inputs.init_list(c);});}
-void reset_list(api::command_list *c){with(c->get_device(),__func__,[&](Runtime &r){r.reset_recording(c);},true);}
-void destroy_list(api::command_list *c){with(c->get_device(),__func__,[&](Runtime &r){
-    r.inputs.destroy_list(c);r.forget_recording(c);std::erase_if(r.pending_draw_resets,[&](const auto &p){return p.first==c;});
-},true);}
+void init_list(api::command_list *c){
+    Recording stamp{};
+    with(c->get_device(),__func__,[&](Runtime &r){stamp=r.inputs.init_list_deferred_stamp(c);});
+    if(mod_stamp&&stamp.list)mod_stamp(stamp.list,stamp.creation,stamp.generation);
+}
+void reset_list(api::command_list *c){
+    Recording stamp{};
+    with(c->get_device(),__func__,[&](Runtime &r){stamp=r.reset_recording(c);},true);
+    if(mod_stamp&&stamp.list)mod_stamp(stamp.list,stamp.creation,stamp.generation);
+}
+void destroy_list(api::command_list *c){
+    bool had_runtime=false;
+    with(c->get_device(),__func__,[&](Runtime &r){
+        had_runtime=true;
+        r.inputs.destroy_list_deferred_stamp(c);r.forget_recording(c);
+        if(!r.pending_draw_resets.empty()){
+            std::erase_if(r.pending_draw_resets,[&](const auto &p){return p.first==c;});
+            r.pending_draw_resets_count_.store(static_cast<std::uint32_t>(r.pending_draw_resets.size()),std::memory_order_release);
+        }
+    },true);
+    if(had_runtime&&mod_stamp)mod_stamp(reinterpret_cast<std::uint64_t>(c),0,0);
+}
 void close_list(api::command_list *c){
     if(!(timed_close_lists.load(std::memory_order_acquire)&timed_list_bit(reinterpret_cast<std::uint64_t>(c))))return;
     if(auto r=runtime(c->get_device())){
-        std::lock_guard lock(r->mutex);r->close_work_timers(c);
+        MeasuredDirectLock lock(r->mutex,ClientLockOp::close_list);r->close_work_timers(c);
     }
 }
 void init_layout(api::device *d,unsigned count,const api::pipeline_layout_param *p,api::pipeline_layout l){with(d,__func__,[&](Runtime &r){
@@ -2499,11 +2696,84 @@ void destroy_layout(api::device *d,api::pipeline_layout l){with(d,__func__,[&](R
     r.inputs.destroy_layout(l);r.ray_scene.destroy_layout(l);
     r.material_chs.destroy_layout(l);
 });}
-void init_pipeline(api::device *d,api::pipeline_layout l,unsigned n,const api::pipeline_subobject *s,api::pipeline p){with(d,__func__,[&](Runtime &r){
-    r.material_chs.pipeline(material_chs_writer,r.native_device_id,p,l,n,s);
-    r.inputs.init_pipeline(p,l,n,s);r.materials.init(p,n,s);
-    if(r.ray_scene.enabled)r.ray_scene.init_pipeline(r.native_device_id,p,n,s,read_native_state_object);
-});}
+void init_pipeline(api::device *d,api::pipeline_layout l,unsigned n,const api::pipeline_subobject *s,api::pipeline p){
+    // Off-lock pre-scan: pure graphics PSOs and non-skin compute PSOs (without
+    // shape evidence) never contend on RuntimeMutex.
+    const api::shader_desc *compute_shader=nullptr;
+    bool has_rt=false;
+    for(unsigned i=0;i<n;++i){
+        const auto &sub=s[i];
+        switch(sub.type){
+        case api::pipeline_subobject_type::compute_shader:
+            if(sub.count&&sub.data&&!compute_shader)
+                compute_shader=static_cast<const api::shader_desc *>(sub.data);
+            break;
+        case api::pipeline_subobject_type::libraries:
+        case api::pipeline_subobject_type::raygen_shader:
+        case api::pipeline_subobject_type::any_hit_shader:
+        case api::pipeline_subobject_type::closest_hit_shader:
+        case api::pipeline_subobject_type::miss_shader:
+        case api::pipeline_subobject_type::intersection_shader:
+        case api::pipeline_subobject_type::callable_shader:
+        case api::pipeline_subobject_type::shader_groups:
+        case api::pipeline_subobject_type::max_payload_size:
+        case api::pipeline_subobject_type::max_attribute_size:
+        case api::pipeline_subobject_type::max_recursion_depth:
+            if(sub.count)has_rt=true;
+            break;
+        default:break;
+        }
+    }
+    WWMI_RtNativeStateObject_v1 native_view{};
+    const bool has_native_state=read_native_state_object&&p.handle&&
+        read_native_state_object(p.handle,&native_view,sizeof(native_view))==0&&
+        native_view.state==p.handle;
+    if(!compute_shader&&!has_rt&&!has_native_state)return;
+
+    auto owner=runtime(d);
+    if(!owner)return;
+
+    skin::Kind compute_kind=skin::Kind::none;
+    if(compute_shader)compute_kind=InputCollector::classify_compute_shader(compute_shader->code,compute_shader->code_size);
+    if(!has_rt&&!has_native_state&&compute_kind==skin::Kind::none&&!owner->inputs.shape_evidence_enabled())return;
+
+    if(!has_rt&&!has_native_state){
+        with_runtime(*owner,__func__,[&](Runtime &r){
+            r.inputs.init_pipeline_classified(p,l,compute_kind,true,compute_shader->code,compute_shader->code_size);
+        });
+        return;
+    }
+
+    // DXR state objects: snapshot only parent domains & root layouts under a
+    // micro-lock, perform DXBC/RDAT parsing + GetShaderIdentifier completely
+    // unlocked, then commit the prepared record under a second micro-lock.
+    bool do_native=false;
+    RaygenIdentity::NativeInitSnapshot native_snap;
+    with_runtime(*owner,__func__,[&](Runtime &r){
+        if(r.material_chs.active(material_chs_writer))
+            r.material_chs.pipeline(material_chs_writer,r.native_device_id,p,l,n,s);
+        if(compute_shader)
+            r.inputs.init_pipeline_classified(p,l,compute_kind,true,compute_shader->code,compute_shader->code_size);
+        if(r.materials.has_code())
+            r.materials.init(p,n,s);
+        if(r.ray_scene.enabled){
+            if(r.ray_scene.raygens.has_pins())
+                r.ray_scene.raygens.init(p,n,s);
+            if(has_native_state&&native_view.device==r.native_device_id){
+                native_snap=r.ray_scene.snapshot_native_pipeline(native_view);
+                do_native=true;
+            }
+        }
+    });
+    if(!do_native)return;
+
+    auto prepared=RaygenIdentity::build_native_unlocked(native_view,n,s,native_snap);
+    if(!prepared)return;
+
+    with_runtime(*owner,__func__,[&](Runtime &r){
+        if(r.ray_scene.enabled)r.ray_scene.commit_native_pipeline(std::move(*prepared));
+    });
+}
 void destroy_pipeline(api::device *d,api::pipeline p){with(d,__func__,[&](Runtime &r){
     r.inputs.destroy_pipeline(p);r.materials.destroy(p);r.ray_scene.raygens.destroy(p);
     r.material_chs.destroy_pipeline(p);
@@ -2515,6 +2785,7 @@ void bind_pipeline(api::command_list *c,api::pipeline_stage s,api::pipeline p){
 }
 void bind_tables(api::command_list *c,api::shader_stage s,api::pipeline_layout l,unsigned first,unsigned n,const api::descriptor_table *t){
     if(!(static_cast<unsigned>(s)&static_cast<unsigned>(api::shader_stage::all_compute)))return;
+    if(!n){if(rt_cpu::phase.load(std::memory_order_relaxed)==1)g_client_lock_stats.note_empty_tables_bypass();return;}
     auto r=runtime(c->get_device());if(!r||!r->inputs.tracks_table_bind(c,l,first,n))return;
     with_runtime(*r,__func__,[&](Runtime &v){v.inputs.bind_tables(c,s,l,first,n,t);});
 }
@@ -2530,9 +2801,14 @@ bool copy_buffer(api::command_list *c,api::resource a,std::uint64_t ao,api::reso
 }
 bool copy_resource(api::command_list *c,api::resource a,api::resource b){const auto desc=c->get_device()->get_resource_desc(b);if(desc.type==api::resource_type::buffer)copy_buffer(c,a,0,b,0,desc.buffer.size);return false;}
 bool dispatch(api::command_list *c,unsigned,unsigned,unsigned){
-    auto r=runtime(c->get_device());if(!r||!r->inputs.has_skin_dispatch(c))return false;
-    if(!r->discovery_enabled)with_runtime(*r,__func__,[&](Runtime &v){const auto write=v.inputs.dispatch(c);if(write.resource)v.prepare_previous(c,write);});
-    return false; // enabled v3 BEFORE owns the post-cancellation observation
+    auto r=runtime(c->get_device());if(!r)return false;
+    if(r->discovery_enabled){
+        if(rt_cpu::phase.load(std::memory_order_relaxed)==1)g_client_lock_stats.note_sdk_dispatch_bypass();
+        return false; // enabled v3 BEFORE owns the post-cancellation observation
+    }
+    if(!r->inputs.has_skin_dispatch(c))return false;
+    with_runtime(*r,__func__,[&](Runtime &v){const auto write=v.inputs.dispatch(c);if(write.resource)v.prepare_previous(c,write);});
+    return false;
 }
 void report_occlusion_bindings(Runtime &r,api::command_list *list,const RaySceneInput &ray,
     const D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE &miss,unsigned width){
@@ -2635,8 +2911,8 @@ void native_dispatch_receipt(const WWMI_RtNativeDispatch_v2 *event,std::uint64_t
     auto *consumer=reinterpret_cast<api::command_list *>(event->api_list);
     if(consumer->get_native()!=event->native_list)return;
     auto native_owner=runtime(consumer->get_device());
-    if(auto owner=native_owner;owner&&owner->inputs.shape_evidence_enabled())
-        with_runtime(*owner,"passive_shape_dispatch",[&](Runtime &r){
+    if(native_owner&&native_owner->inputs.shape_evidence_enabled())
+        with_runtime(*native_owner,"passive_shape_dispatch",[&](Runtime &r){
             WWMI_ComputeStateInfo_v1 state{};state.size=sizeof(state);unsigned status=2;
             if(event->phase==WWMI_RT_DISPATCH_BEFORE_NATIVE&&(event->flags&WWMI_RT_DISPATCH_STATE_KNOWN)&&compute_query&&evidence_root_argument){
                 status=compute_query(event->api_list,&state);
@@ -2650,8 +2926,8 @@ void native_dispatch_receipt(const WWMI_RtNativeDispatch_v2 *event,std::uint64_t
                 }return result;
             });
         });
-    if(auto owner=native_owner;owner&&owner->discovery_enabled&&owner->inputs.has_skin_dispatch(consumer))
-        with_runtime(*owner,"native_skin_receipt",[&](Runtime &r){
+    if(native_owner&&native_owner->discovery_enabled&&native_owner->inputs.has_skin_dispatch(consumer))
+        with_runtime(*native_owner,"native_skin_receipt",[&](Runtime &r){
             if(event->phase==WWMI_RT_DISPATCH_BEFORE_NATIVE){
                 r.native_skin_state_unknown+=!(event->flags&WWMI_RT_DISPATCH_STATE_KNOWN);
                 r.native_skin_unpredicated_missing+=!(event->flags&WWMI_RT_DISPATCH_UNPREDICATED);
@@ -2667,7 +2943,7 @@ void native_dispatch_receipt(const WWMI_RtNativeDispatch_v2 *event,std::uint64_t
     if(probe)with(c->get_device(),__func__,[&](Runtime &r){r.note_occlusion_native_dispatch(c,*event);});
     if((finish||kind!=GpuWorkKind::count)&&c->get_device()->get_native()==timed_device.load(std::memory_order_relaxed))
         if(auto r=runtime(c->get_device())){
-            std::lock_guard lock(r->mutex);
+            MeasuredDirectLock lock(r->mutex,ClientLockOp::native_dispatch_timer);
             if(finish){r->end_native_timer(*event,timing.id);timing={};}
             else if(r->active){
                 if(const auto id=r->start_native_timer(c,*event,kind))timing={event->api_list,event->call_id,id};
@@ -2687,11 +2963,30 @@ void native_buffer_receipt(const WWMI_RtNativeBuffer_v3 *event,std::uint64_t){
             if(event->phase==WWMI_RT_BUFFER_BEFORE_NATIVE)r.issue_native_requests(list,NativeDiscovery::ReadPoint::index_consumer);
         });return;
     }
-    with_runtime(*owner,"native_buffer_receipt",[&](Runtime &r){
-        if(event->kind==WWMI_RT_BUFFER_COPY)r.inputs.native_copy(list,api::resource{event->source},event->source_offset,api::resource{event->destination},event->destination_offset,event->bytes,event->phase==WWMI_RT_BUFFER_NATIVE_RECORDED);
-        else if(event->kind==WWMI_RT_BUFFER_WRITE)r.inputs.native_written(api::resource{event->destination},event->destination_offset,event->bytes);
-        else if(event->kind==WWMI_RT_BUFFER_UNKNOWN)r.inputs.native_unknown();
-    });
+    if(event->kind==WWMI_RT_BUFFER_COPY){
+        const bool recorded=(event->phase==WWMI_RT_BUFFER_NATIVE_RECORDED);
+        if(!owner->inputs.may_need_native_copy(recorded)&&
+           !owner->buffer_events.queued()&&
+           owner->pending_draw_resets_count_.load(std::memory_order_acquire)==0){
+            if(rt_cpu::phase.load(std::memory_order_relaxed)==1)g_client_lock_stats.note_copy_bypass(recorded);
+            return;
+        }
+        with_runtime(*owner,recorded?"native_buffer_copy_rec":"native_buffer_copy_before",[&](Runtime &r){
+            r.inputs.native_copy(list,api::resource{event->source},event->source_offset,api::resource{event->destination},event->destination_offset,event->bytes,recorded);
+        });
+        return;
+    }
+    if(event->kind==WWMI_RT_BUFFER_WRITE){
+        with_runtime(*owner,"native_buffer_write",[&](Runtime &r){
+            r.inputs.native_written(api::resource{event->destination},event->destination_offset,event->bytes);
+        });
+        return;
+    }
+    if(event->kind==WWMI_RT_BUFFER_UNKNOWN){
+        with_runtime(*owner,"native_buffer_unknown",[&](Runtime &r){
+            r.inputs.native_unknown();
+        });
+    }
 }
 std::uint64_t observe_native_raygen(std::uint64_t list,std::uint64_t native_list,std::uint64_t desc,std::uint64_t){
     if(!ray_input_window())return 0;
@@ -2717,7 +3012,7 @@ void forward_queue(std::uint64_t queue,std::uint64_t native,std::uint64_t list,s
 extern "C" __declspec(dllexport) std::uint32_t WWMI_RtPackIdentifyDraw_v1(std::uint64_t device,std::uint64_t list,std::uint64_t base,
     std::uint32_t first,std::uint32_t count,WWMI_RtPackDrawIdentity_v1 *out,std::uint32_t out_size,void *palette,std::uint32_t capacity){
     if(!out||out_size!=sizeof(*out)||!list)return 0;*out={};
-    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[d,r]:devices)if(d->get_native()==device){found=r;break;}}
+    auto found=runtime_native(device);
     if(!found)return 0;RuntimeCall call(*found,__func__);if(!found->active||!found->frame_device)return 0;
     if(!found->inputs.identify_draw(reinterpret_cast<api::command_list *>(list),base,first,count,*out,palette,capacity))return 0;
     if(mod_detected)mod_detected(out->object_guid);return 1;
@@ -2727,7 +3022,7 @@ static std::uint32_t identify_draw(const WWMI_RtPackDrawQuery_v2 *query,std::uin
     WWMI_RtDrawIdentityReceipt_v1 *receipt,const char *operation){
     if(receipt)receipt->reason=WWMI_RT_IDENTIFY_QUERY;
     if(!query||query_size!=sizeof(*query)||query->struct_size!=sizeof(*query)||query->abi_version!=2||!out||out_size!=sizeof(*out))return 0;*out={};
-    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[d,r]:devices)if(d->get_native()==query->device){found=r;break;}}
+    auto found=runtime_native(query->device);
     if(!found){if(receipt)receipt->reason=WWMI_RT_IDENTIFY_DEVICE;return 0;}
     RuntimeCall call(*found,operation);
     if(!found->active||!found->frame_device){if(receipt)receipt->reason=WWMI_RT_IDENTIFY_INACTIVE;return 0;}
@@ -2751,7 +3046,7 @@ extern "C" __declspec(dllexport) std::uint32_t WWMI_RtPackIdentifyAuxSkipDraw_v1
     std::uint32_t *out_content_hash){
     if(out_content_hash)*out_content_hash=0;
     if(!query||query_size!=sizeof(*query)||query->struct_size!=sizeof(*query)||query->abi_version!=2||!out_content_hash)return 0;
-    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[d,r]:devices)if(d->get_native()==query->device){found=r;break;}}
+    auto found=runtime_native(query->device);
     if(!found)return 0;
     RuntimeCall call(*found,__func__);
     if(!found->active||!found->frame_device)return 0;
@@ -2764,7 +3059,7 @@ extern "C" __declspec(dllexport) std::uint32_t WWMI_RtPackAcquireGraphicsGeometr
     if(!request||request_size!=sizeof(*request)||request->struct_size!=sizeof(*request)||request->abi_version!=1||
         request->native_draw.struct_size!=sizeof(request->native_draw)||request->native_draw.abi_version!=2||
         !request->section_token||!request->load_generation||!request->mod_key||!request->mod_revision||!request->mod_index_count)return WWMI_RT_GEOMETRY_BAD_INPUT;
-    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[d,r]:devices)if(d->get_native()==request->native_draw.device){found=r;break;}}
+    auto found=runtime_native(request->native_draw.device);
     if(!found)return WWMI_RT_GEOMETRY_BATCH_NOT_READY;
     RuntimeCall call(*found,__func__);if(!found->active||!found->frame_device)return WWMI_RT_GEOMETRY_BATCH_NOT_READY;
     try{return found->acquire_graphics_geometry(*request,*out);}catch(const std::exception &e){
@@ -2778,7 +3073,7 @@ extern "C" __declspec(dllexport) std::uint32_t WWMI_RtPackAcquirePlannedGeometry
         (request->path_flags&~std::uint32_t(WWMI_RT_PLAN_MOD_AUTHOR_SHARED|WWMI_RT_PLAN_EXTRA_POSITION_INPUT)))return WWMI_RT_GEOMETRY_BAD_INPUT;const auto &draw=request->draw;
     if(draw.struct_size!=sizeof(draw)||draw.abi_version!=1||draw.native_draw.struct_size!=sizeof(draw.native_draw)||draw.native_draw.abi_version!=2||
         !draw.section_token||!draw.load_generation||!draw.mod_key||!draw.mod_revision||!draw.mod_index_count)return WWMI_RT_GEOMETRY_BAD_INPUT;
-    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[d,r]:devices)if(d->get_native()==draw.native_draw.device){found=r;break;}}
+    auto found=runtime_native(draw.native_draw.device);
     if(!found)return WWMI_RT_GEOMETRY_BATCH_NOT_READY;
     RuntimeCall call(*found,__func__);if(!found->active||!found->frame_device)return WWMI_RT_GEOMETRY_BATCH_NOT_READY;
     try{return found->acquire_graphics_geometry(draw,*out,request->frame_id,request->path_flags);}catch(const std::exception &e){
@@ -2789,7 +3084,7 @@ extern "C" __declspec(dllexport) std::uint32_t WWMI_RtPackAcquireNativePalette_v
     std::uint32_t expected_component,WWMI_RtNativePalette_v1 *out,std::uint32_t out_size){
     if(!out||out_size!=sizeof(*out))return WWMI_RT_PALETTE_BAD_INPUT;*out={};
     if(!query||query_size!=sizeof(*query)||query->struct_size!=sizeof(*query)||query->abi_version!=2||!query->device||!query->list)return WWMI_RT_PALETTE_BAD_INPUT;
-    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[d,r]:devices)if(d->get_native()==query->device){found=r;break;}}
+    auto found=runtime_native(query->device);
     if(!found)return WWMI_RT_PALETTE_NOT_READY;
     RuntimeCall call(*found,__func__);if(!found->active||!found->frame_device)return WWMI_RT_PALETTE_NOT_READY;
     try{return found->acquire_native_palette(*query,expected_component,*out);}catch(const std::exception &e){
@@ -2801,10 +3096,8 @@ static bool valid_surface_request(const WWMI_RtLocalVfRequest_v1 &r,bool empty_a
         !(p.path_flags&~std::uint32_t(WWMI_RT_PLAN_MOD_AUTHOR_SHARED|WWMI_RT_PLAN_EXTRA_POSITION_INPUT))&&d.struct_size==sizeof(d)&&d.abi_version==1&&d.section_token&&d.load_generation&&d.mod_key&&d.mod_revision&&(d.mod_index_count||empty_author_selection)&&
         d.native_draw.struct_size==sizeof(d.native_draw)&&d.native_draw.abi_version==2;
 }
-static std::shared_ptr<Runtime> hybrid_runtime(std::uint64_t device){
-    std::lock_guard lock(devices_mutex);
-    for(const auto &[_,r]:devices)if(r->native_device_id==device)return r;
-    return {};
+static RuntimeLease hybrid_runtime(std::uint64_t device){
+    return runtime_native(device);
 }
 extern "C" __declspec(dllexport) bool WWMI_RtPackProbeHybridRaster_v1(const WWMI_RtPackDrawQuery_v2 *q,std::uint64_t ticket,std::uint64_t load,std::uint64_t mod,const wwmi::hybrid::HistoryRead *previous){
     if(!q)return false;auto r=hybrid_runtime(q->device);if(!r)return false;
@@ -2827,13 +3120,13 @@ extern "C" __declspec(dllexport) bool WWMI_RtPackCommitHybridRaster_v1(std::uint
 }
 extern "C" __declspec(dllexport) std::uint32_t WWMI_RtPackAcquireLocalVfSurface_v1(const WWMI_RtLocalVfRequest_v1 *request,std::uint32_t request_size,WWMI_RtLocalVfSurface_v1 *out,std::uint32_t out_size){
     if(!out||out_size!=sizeof(*out))return WWMI_RT_SURFACE_BAD_INPUT;*out={};if(!request||request_size!=sizeof(*request)||!valid_surface_request(*request))return WWMI_RT_SURFACE_BAD_INPUT;
-    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[d,r]:devices)if(d->get_native()==request->planned.draw.native_draw.device){found=r;break;}}
+    auto found=runtime_native(request->planned.draw.native_draw.device);
     if(!found)return WWMI_RT_SURFACE_NOT_READY;RuntimeCall call(*found,__func__);if(!found->active||!found->frame_device)return WWMI_RT_SURFACE_NOT_READY;
     try{return found->acquire_surface(*request,*out);}catch(const std::exception &e){if(++found->errors==1)reshade::log::message(reshade::log::level::error,e.what());found->active=false;found->release_frame();return WWMI_RT_SURFACE_INTERNAL_ERROR;}
 }
 extern "C" __declspec(dllexport) std::uint32_t WWMI_RtPackAcquirePreviousSurface_v1(const WWMI_RtPreviousSurfaceRequest_v1 *request,std::uint32_t request_size,WWMI_RtPreviousSurface_v1 *out,std::uint32_t out_size){
     if(!out||out_size!=sizeof(*out))return WWMI_RT_SURFACE_BAD_INPUT;*out={};if(!request||request_size!=sizeof(*request)||!valid_surface_request(request->current))return WWMI_RT_SURFACE_BAD_INPUT;
-    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[d,r]:devices)if(d->get_native()==request->current.planned.draw.native_draw.device){found=r;break;}}
+    auto found=runtime_native(request->current.planned.draw.native_draw.device);
     if(!found)return WWMI_RT_SURFACE_NOT_READY;RuntimeCall call(*found,__func__);if(!found->active||!found->frame_device)return WWMI_RT_SURFACE_NOT_READY;
     try{return found->acquire_previous(*request,*out);}catch(const std::exception &e){if(++found->errors==1)reshade::log::message(reshade::log::level::error,e.what());found->active=false;found->release_frame();return WWMI_RT_SURFACE_INTERNAL_ERROR;}
 }
@@ -2847,7 +3140,7 @@ static std::uint32_t acquire_draw_frame(const WWMI_RtDrawFrameRequest_v1 *reques
        !request->source.blas_resource||!request->source.blas_creation||!request->source.blas_va||!request->source.pose_order)
         return WWMI_RT_SURFACE_BAD_INPUT;
     const auto device=request->inputs.current.planned.draw.native_draw.device;
-    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[_,r]:devices)if(r->native_device_id==device){found=r;break;}}
+    auto found=runtime_native(device);
     if(!found)return WWMI_RT_SURFACE_NOT_READY;RuntimeCall call(*found,operation);if(!found->active||found->frame_device!=device)return WWMI_RT_SURFACE_NOT_READY;
     try{return found->acquire_draw_frame(*request,*out,scope);}catch(const std::exception &e){if(++found->errors==1)reshade::log::message(reshade::log::level::error,e.what());found->active=false;found->release_frame();return WWMI_RT_SURFACE_INTERNAL_ERROR;}
 }
@@ -2956,7 +3249,7 @@ extern "C" __declspec(dllexport) std::uint64_t WWMI_RtPackObserveAuthorSection_v
     if(!request||size!=sizeof(*request)||!request->device||!request->list||!deadline||!frame)return 0;
     try{
         const auto r=runtime_native(request->device);if(!r)return 0;
-        std::lock_guard lock(r->mutex);
+        MeasuredDirectLock lock(r->mutex,ClientLockOp::api_observe_section);
         if(!r->active||!r->frame_device||!r->author_path)return 0;
         return r->observe_section_work(*request,deadline,frame,phase,timer,parts,indices);
     }catch(const std::exception &){return 0;}
@@ -2969,7 +3262,7 @@ static std::uint32_t reserve_draw_binding(const WWMI_RtDrawBindingRequest_v1 *re
        !request->descriptor_count||request->descriptor_count>64u*1024u||
        request->resource_count>128u+2u*request->descriptor_count||
        (request->resource_count&&!request->resources))return WWMI_RT_SURFACE_BAD_INPUT;
-    std::shared_ptr<Runtime> found;{std::lock_guard lock(devices_mutex);for(const auto &[_,r]:devices)if(r->native_device_id==request->device){found=r;break;}}
+    auto found=runtime_native(request->device);
     if(!found)return WWMI_RT_SURFACE_NOT_READY;RuntimeCall call(*found,operation);if(!found->active||found->frame_device!=request->device)return WWMI_RT_SURFACE_NOT_READY;
     try{return found->reserve_draw_binding(*request,*out,no_history_cb,no_history_va);}catch(const std::exception &){return WWMI_RT_SURFACE_INTERNAL_ERROR;}
 }
@@ -3046,7 +3339,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE module,HMODULE reshade_m
         register_forward_v2&&(draw_window||(read_as_slot&&capture_occlusion_compute))?
             register_forward_v2(&with_dispatch):register_forward(&callbacks);
     if(registered!=0){reshade::unregister_addon(module);clear_provider_exports();return false;}
-    {std::lock_guard lock(devices_mutex);provider_module=std::move(provider);accepting_devices=true;}
+    {std::unique_lock lock(devices_mutex);provider_module=std::move(provider);accepting_devices=true;}
     descriptor_lease(1);compute_enable(1);
     material_chs_writer.start();
 #define REGISTER(e,f) reshade::register_event<reshade::addon_event::e>(f);
@@ -3055,7 +3348,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE module,HMODULE reshade_m
     return true;
 }
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE module,HMODULE){
-    {std::lock_guard lock(devices_mutex);if(!accepting_devices)return;accepting_devices=false;}
+    {std::unique_lock lock(devices_mutex);if(!accepting_devices)return;accepting_devices=false;}
     // The host unregister drains entered forward calls before returning.
     unregister_forward(reinterpret_cast<std::uint64_t>(&devices));compute_enable(0);
     instance_dispatch_watch.store(0,std::memory_order_relaxed);
@@ -3065,14 +3358,14 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE module,HMODULE){
 #undef UNREGISTER
     material_chs_writer.stop();
     {std::unique_lock lock(devices_mutex);devices_idle.wait(lock,[]{return initializing_devices.empty();});}
-    std::vector<api::device *> remaining;{std::lock_guard lock(devices_mutex);for(auto &[d,_]:devices)remaining.push_back(d);}
+    std::vector<api::device *> remaining;{std::shared_lock lock(devices_mutex);for(auto &[d,_]:devices)remaining.push_back(d);}
     for(auto *d:remaining)destroy_device(d);
     // stop()/~Runtime first releases main's frame Reader, then InputCollector
     // performs its final provider stamps. Only now drop the observation lease.
     descriptor_lease(0);
     reshade::unregister_addon(module);
     std::shared_ptr<ProviderModule> provider;
-    {std::lock_guard lock(devices_mutex);provider=std::move(provider_module);}
+    {std::unique_lock lock(devices_mutex);provider=std::move(provider_module);}
     // Entered device/export calls and a genuine unfinished-GPU Runtime retain
     // their own owner until their final provider-using destructor completes.
     provider.reset();

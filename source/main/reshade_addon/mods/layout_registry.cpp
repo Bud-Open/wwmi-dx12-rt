@@ -10,6 +10,7 @@
 #include "layout_registry.h"
 
 std::unordered_map<uint64_t, int> g_layout_b4_root;
+std::atomic<uint64_t>             g_layout_regmap_epoch{ 1 };
 
 uint32_t LayoutParamRangeCount(const pipeline_layout_param& p)
 {
@@ -317,6 +318,7 @@ void                                     on_init_pipeline_layout(device*, uint32
         {
             std::lock_guard l(g_layout_regmap_mtx);
             g_layout_regmap[layout.handle] = m;
+            g_layout_regmap_epoch.fetch_add(1, std::memory_order_release);
             if(history.vs_only)rt_history_roots[layout.handle]=history;
         }
     }
@@ -452,7 +454,8 @@ void on_destroy_pipeline_layout(device*, pipeline_layout layout)
     }
     {
         std::lock_guard l(g_layout_regmap_mtx);
-        g_layout_regmap.erase(layout.handle);
+        if (g_layout_regmap.erase(layout.handle) > 0)
+            g_layout_regmap_epoch.fetch_add(1, std::memory_order_release);
         rt_history_roots.erase(layout.handle);
     }
     CmdBlocksForEach([&](CmdBlock& b) { if (b.cmp_layout == layout.handle) b.cmp_layout = 0; });

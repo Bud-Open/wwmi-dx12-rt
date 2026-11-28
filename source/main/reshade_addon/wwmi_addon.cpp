@@ -96,9 +96,12 @@ static void on_destroy_swapchain(swapchain*, bool resize)
     PortApi::SaveSettingsOnExit();
 }
 extern void RtStopStructTexFallbackWorker();
+extern void TexReadbackRegisterPostExecute(HMODULE host);
+extern void TexReadbackUnregisterPostExecute();
 
 static void on_destroy_device(device*)
 {
+    TexReadbackUnregisterPostExecute();
     StallWatchdogStop();
     DredWatchdogStop();
     RfxPatchWorkerStop(); // it creates PSOs on this device
@@ -680,6 +683,7 @@ static void ActivateD3D12()
         return true;
     };
     reshade::register_event<reshade::addon_event::execute_command_list>(OWN_DEVICE(HP(execute_command_list))); // submission order vs record order
+    TexReadbackRegisterPostExecute(g_wwmi_host_module);
 
     reshade::register_event<reshade::addon_event::destroy_resource>(OWN_DEVICE(HP(destroy_resource)));
     reshade::register_event<reshade::addon_event::init_resource_view>(OWN_DEVICE(HP(init_resource_view)));
@@ -864,8 +868,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE ww
     g_hide_outline = GetPrivateProfileIntW(L"wwmi-dx12", L"hide_outline", 0, ini_path.c_str()) != 0;
 #endif
     g_tex_deferred = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_background", 1, ini_path.c_str()) != 0;
-    g_texlod_resemblance = GetPrivateProfileIntW(L"wwmi-dx12", L"lod_resemblance", 1, ini_path.c_str()) != 0;
-    g_texlod_cache = GetPrivateProfileIntW(L"wwmi-dx12", L"lod_cache", 1, ini_path.c_str()) != 0;
+    g_texlod_resemblance.store(GetPrivateProfileIntW(L"wwmi-dx12", L"lod_resemblance", 1, ini_path.c_str()) != 0, std::memory_order_release);
+    g_texlod_cache.store(GetPrivateProfileIntW(L"wwmi-dx12", L"lod_cache", 1, ini_path.c_str()) != 0, std::memory_order_release);
     MigotoPort::g_buffers_in_vram = GetPrivateProfileIntW(L"wwmi-dx12", L"buffers_in_vram", 1, ini_path.c_str()) != 0;
     const int budget_step = (int)GetPrivateProfileIntW(L"wwmi-dx12", L"tex_mod_budget", 1, ini_path.c_str());
     g_tex_mod_budget = budget_step >= 0 && budget_step < kTexBudgetSteps ? budget_step : 1;
@@ -883,7 +887,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE ww
     g_tex_vram_cap_mb = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_vram_cap_mb", 0, ini_path.c_str());
 #endif
     ::logger::write("Config: decensor=%d hide_uid=%d lod_resemblance=%d lod_cache=%d buffers_in_vram=%d tex_mod_budget=%s tex_distance=%d tex_struct_fallback=%d texture_filters=%d",
-        (int)g_decensor, (int)g_hide_uid, (int)g_texlod_resemblance, (int)g_texlod_cache, (int)MigotoPort::g_buffers_in_vram,
+        (int)g_decensor, (int)g_hide_uid, (int)g_texlod_resemblance.load(std::memory_order_relaxed),
+        (int)g_texlod_cache.load(std::memory_order_relaxed), (int)MigotoPort::g_buffers_in_vram,
         TexBudgetName(g_tex_mod_budget), (int)g_tex_distance, (int)g_tex_struct_fallback, (int)g_tex_dhash_filters);
     g_tex_defer.Start();
     if (g_dx12_debug_layer) {
@@ -948,6 +953,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE ww
 
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE)
 {
+    TexReadbackUnregisterPostExecute();
     MigotoPort::ModUiClearShield();
     StopDescriptorPublisher();
     if (s_infoq1) {

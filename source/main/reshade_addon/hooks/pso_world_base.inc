@@ -41,6 +41,7 @@ struct PsoClone {
     RtProgramBuildMark private_build;
     bool private_intake_superseded=false;
     int private_position_only=-1, private_primitive_register=-2, private_ia_color=-1; // Cached for this immutable native pipeline only.
+    int private_only_vs_ps=-1, private_known_no_ps=-1, private_opaque_depth=-1;
     bool private_effects_ready=false;
     RtRasterEffects private_effects;
     struct {uint64_t vs=0,ps=0;uint32_t targets=0;bool unused=false;} private_previous;

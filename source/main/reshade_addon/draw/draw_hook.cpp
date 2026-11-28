@@ -24,9 +24,9 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
 {
     PROF(PROF_DrawIndexed);
     if (g_faulted || !g_is_dx12) return false;
-    PortApi::NextDrawCall();
     if (g_addon_disabled)
         return RtTryGpuSkinDraw(cmd_list,index_count,instance_count,first_index,vertex_offset,first_instance);
+    PortApi::NextDrawCall();
     MigotoPort::FrameAnalysisDrawScope fa_scope;
     uint64_t                           vs_hash = 0;
     cmd_list->get_private_data(s_iid_vs_hash, &vs_hash);

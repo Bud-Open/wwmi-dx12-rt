@@ -79,7 +79,7 @@ struct RtClothDraw {
     std::optional<RtClothRow> row;
     explicit RtClothDraw(int component){if(component>=0)start(component);}
     void start(int component){
-        if(row || field_state.load(std::memory_order_relaxed)!=1)return;
+        if(row || RtClothQuietPerf() || field_state.load(std::memory_order_relaxed)!=1)return;
         std::lock_guard lock(field_mx);if(field_state.load()!=1)return;
         const auto elapsed=GetTickCount64()-field_begin;
         if(elapsed>=kRtDrawWindowMs)return;

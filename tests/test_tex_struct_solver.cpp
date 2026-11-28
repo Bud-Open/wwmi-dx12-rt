@@ -284,6 +284,61 @@ static void SlotShaderKeySeparation()
     assert(ComputeSlotShaderKey(0, 0x3ull, true) == 0);
 }
 
+static void DirectSsimReconciliation()
+{
+    // Iuno comp=4 scenario: row 0 (weak 2048px) vs row 1 (direct SSIM=0.999 512px) on cand 0.
+    // Cand 0 is claimed by row 1 with direct SSIM -> must be excluded from row 0's rivals
+    // and flagged for revocation on row 0, while leaving cand 1 subject to VisualTier.
+    const Rows rows{
+        { Edge(0, .369, .210, .48), Edge(1, .328, .120, .50) },
+        { Edge(0, 1.045, .999, .99) },
+    };
+    const TwinGroups singleton{ { 0, 1 }, { 0, 0 }, { std::nullopt, std::nullopt } };
+    const auto out = Solve(rows, { 2048, 512 }, singleton, {});
+    assert((out.assigned == std::vector{ 1, 0 }));
+    assert(IsClaimedByOtherDirectSsim(0, 0, rows, out.assigned));
+    assert(!IsClaimedByOtherDirectSsim(1, 0, rows, out.assigned));
+    assert(!IsClaimedByOtherDirectSsim(0, 1, rows, out.assigned));
+
+    // Hiyuki dual-form scenario: non-co-occurring Form 1 (direct SSIM=0.99) and Form 2 (weak)
+    // share the sole candidate 0 via reuse (assigned[1] == 0 == assigned[0]).
+    // Because ev.ri == chosen_ri on row 1, row 1 keeps candidate 0 and is NOT displaced.
+    const Rows dual_form{
+        { Edge(0, 1.04, .99, .99) },
+        { Edge(0, .25, .10, .35) },
+    };
+    const TwinGroups sole{ { 0 }, { 0 }, { std::nullopt } };
+    const auto out_dual = Solve(dual_form, { 2048, 2048 }, sole, {});
+    assert((out_dual.assigned == std::vector{ 0, 0 }));
+    // When both rows are assigned candidate 0, worker takes the `ev.ri == chosen_ri` branch.
+    assert(out_dual.assigned[1] == 0);
+
+    // Two weak rows competing (neither has direct SSIM >= 0.75): must NOT exclude rival.
+    const Rows both_weak{
+        { Edge(0, .369, .210, .48), Edge(1, .328, .120, .50) },
+        { Edge(0, .420, .300, .55) },
+    };
+    const auto out_weak = Solve(both_weak, { 2048, 512 }, singleton, {});
+    assert((out_weak.assigned == std::vector{ 1, 0 }));
+    assert(!IsClaimedByOtherDirectSsim(0, 0, both_weak, out_weak.assigned));
+
+    // Proven-slot source attribution: revoking displaced weak key (0xa9b25e96) erases its own
+    // slot and legacy unattributed slots (0), while preserving the direct owner's slot (0x24d13e57).
+    assert(ShouldRevokeSlotForSource(0xa9b25e96u, 0xa9b25e96u));
+    assert(ShouldRevokeSlotForSource(0u, 0xa9b25e96u));
+    assert(!ShouldRevokeSlotForSource(0x24d13e57u, 0xa9b25e96u));
+
+    // Cross-component strong owner filtering: a shared candidate owned by comp=3 under 512px mip
+    // 0xc6355ec1 must STILL allow comp=7's 1024px streaming mip 0xdf243ddc when it matches with
+    // direct high SSIM (>= 0.75), while still excluding weak/flat unrelated textures on comp=7.
+    assert(!ShouldExcludeCrossCompStrongOwner(false, false, 0.999, 3, 0xc6355ec1u, 7, 0xdf243ddcu));
+    assert(ShouldExcludeCrossCompStrongOwner(false, false, 0.40, 3, 0xc6355ec1u, 7, 0xdf243ddcu));
+    assert(ShouldExcludeCrossCompStrongOwner(false, true, 1.00, 3, 0xc6355ec1u, 7, 0xdf243ddcu));
+    assert(!ShouldExcludeCrossCompStrongOwner(false, false, 0.40, 3, 0xc6355ec1u, 3, 0xdf243ddcu));
+    assert(!ShouldExcludeCrossCompStrongOwner(false, false, 0.40, 3, 0xc6355ec1u, 7, 0xc6355ec1u));
+    assert(!ShouldExcludeCrossCompStrongOwner(true, false, 0.20, 3, 0xc6355ec1u, 7, 0xdf243ddcu));
+}
+
 int main(int argc, char* argv[])
 {
     assert(argc == 2);
@@ -297,5 +352,6 @@ int main(int argc, char* argv[])
     else if (scenario == "cutout") CutoutMaskClassifier();
     else if (scenario == "slotkey") SlotShaderKeySeparation();
     else if (scenario == "mipparent") VisualMipParentEquivalence();
+    else if (scenario == "reconcile") DirectSsimReconciliation();
     else return 1;
 }

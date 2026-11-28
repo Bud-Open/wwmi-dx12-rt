@@ -218,7 +218,17 @@ extern "C" WWMI_RT_EXPORT uint32_t WWMI_RtModReadResource_v1(uint64_t gen,uint64
 }
 
 extern "C" WWMI_RT_EXPORT void WWMI_RtModStampRecording_v1(uint64_t list,uint64_t creation,uint64_t recording){
-    std::lock_guard lock(source_mutex);recordings.erase(list);if(creation&&recording)recordings.emplace(list,RecordingCopy{creation,recording,{}});
+    std::lock_guard lock(source_mutex);
+    if(!creation||!recording){recordings.erase(list);return;}
+    auto it=recordings.find(list);
+    if(it!=recordings.end()){
+        it->second.creation=creation;
+        it->second.recording=recording;
+        if(!it->second.positions.empty())it->second.positions.clear();
+        if(!it->second.geometry_positions.empty())it->second.geometry_positions.clear();
+    }else{
+        recordings.emplace(list,RecordingCopy{creation,recording,{}});
+    }
 }
 static uint32_t publish_position(uint64_t list,int32_t component,const WWMI_RtModPosition_v1 *v,uint32_t size,bool geometry){
     if(!v||size!=sizeof(*v)||v->struct_size!=sizeof(*v)||v->abi_version!=1||

@@ -353,7 +353,9 @@ struct BufferResourceInfo {
     unsigned           byte_width = 0; // their D3D11_BUFFER_DESC.ByteWidth -- the real size
     unsigned           stride = 0;     // their `stride =`, else the desc's StructureByteStride
 };
-bool GetBufferResource(const wchar_t* fq_name, BufferResourceInfo* out);
+bool        GetBufferResource(const wchar_t* fq_name, BufferResourceInfo* out);
+const void* FindCustomResourceHandle(const wchar_t* fq_name);
+bool        ReadBufferResourceHandle(const void* handle, BufferResourceInfo* out);
 size_t BufferInitialData(const wchar_t* fq_name, void* out, size_t cap);
 bool   UploadBufferResource(const wchar_t* fq_name, const void* data, size_t bytes);
 

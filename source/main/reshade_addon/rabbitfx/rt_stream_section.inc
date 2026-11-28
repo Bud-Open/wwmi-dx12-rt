@@ -166,8 +166,15 @@ static void RtBridgePsFilterForActiveSection(){
     if(!wc||wc->tail.empty())return;
     const unsigned load=PortApi::LoadGeneration();
 
+    // Fast confirmed-no-rules TLS memo (only populated when section resolution
+    // succeeded and explicitly returned false; never caches failed lookups).
+    struct NoRulesMemo { unsigned load=0; int mod=-1, comp=-1; };
+    static thread_local std::array<NoRulesMemo,32> t_no_rules{};
+    const size_t t_slot=(size_t(ctx.mod)*31u+size_t(comp))&(t_no_rules.size()-1);
+    if(t_no_rules[t_slot].load==load&&t_no_rules[t_slot].mod==ctx.mod&&t_no_rules[t_slot].comp==comp)return;
+
     // Fast cached section FQ name & presence of any `if ps == <filter_index>` rules.
-    struct SecInfo { std::wstring fq; bool has_rules=false; };
+    struct SecInfo { std::wstring fq; bool resolved=false; bool has_rules=false; };
     std::wstring fq_section;
     {
         static std::mutex s_sec_mtx;
@@ -183,11 +190,15 @@ static void RtBridgePsFilterForActiveSection(){
             const auto &ns=g_geomods[ctx.mod].wcl_ns;
             if(!ns.empty()&&PortApi::ResolveSection(ns.c_str(),nullptr,wc->tail.c_str(),buf,std::size(buf))&&buf[0]){
                 si.fq=buf;
+                si.resolved=true;
                 si.has_rules=PortApi::SectionHasPsFilterRules(si.fq.c_str());
             }
             it=s_sec_cache.emplace(key,std::move(si)).first;
         }
-        if(!it->second.has_rules)return;
+        if(!it->second.has_rules){
+            if(it->second.resolved)t_no_rules[t_slot]={load,ctx.mod,comp};
+            return;
+        }
         fq_section=it->second.fq;
     }
 
@@ -372,20 +383,25 @@ bool RtQueuePrivateSubdraw(SectionDraw& sd,unsigned count,unsigned first,int32_t
     if(!active_stream)return false;
     auto &ctx=*active_stream;
     if((!ctx.plan&&!ctx.hybrid)||!count)return true;
-    // Compare actual port VM binding, not an assumption based on ShapeKey count.
-    const auto *pos=RtCachedPositionResource(ctx.mod);
-    PortApi::BufferResourceInfo original{};void* bound=nullptr; unsigned long long va=0;unsigned size=0,stride=0;
-    const bool author_position=pos && PortApi::GetBufferResource(pos->fq.c_str(),&original) &&
-        PortApi::GetShimVertexBuffer(0,&bound,&va,&size,&stride,nullptr) &&
-        bound==original.dx12 && va==original.gpu_va && stride==12 && size>=original.byte_width;
-    const unsigned flags=author_position?0u:unsigned(WWMI_RT_PLAN_EXTRA_POSITION_INPUT);
-    if(!ctx.hybrid)WWMI_RtModPlanDraw_v1(ctx.plan,count,first,base,flags);
+    unsigned flags=0u;
+    RtAuthorPositionBinding author_pos{};
+    if(!ctx.hybrid){
+        // Compare actual port VM binding, not an assumption based on ShapeKey count.
+        const auto *pos=RtCachedPositionResource(ctx.mod);
+        PortApi::BufferResourceInfo original{};void* bound=nullptr; unsigned long long va=0;unsigned size=0,stride=0;
+        const bool author_position=pos && PortApi::GetBufferResource(pos->fq.c_str(),&original) &&
+            PortApi::GetShimVertexBuffer(0,&bound,&va,&size,&stride,nullptr) &&
+            bound==original.dx12 && va==original.gpu_va && stride==12 && size>=original.byte_width;
+        flags=author_position?0u:unsigned(WWMI_RT_PLAN_EXTRA_POSITION_INPUT);
+        WWMI_RtModPlanDraw_v1(ctx.plan,count,first,base,flags);
+        if(author_position)
+            author_pos={reinterpret_cast<uint64_t>(original.dx12),original.gpu_va,original.byte_width,original.stride};
+    }
     StreamDraw part{count,first,base,flags};
     part.rfx=ctx.rfx_latch;
     if(!ctx.hybrid)part.rfx.step=RtRfxStep::old_private;
     else if(!ctx.program)part.rfx.step=RtRfxStep::no_color;
-    if(author_position)
-        part.author_position={reinterpret_cast<uint64_t>(original.dx12),original.gpu_va,original.byte_width,original.stride};
+    part.author_position=author_pos;
     if(ctx.hybrid&&!RtFreezeHybridPart(ctx,sd,part)){
         if(!ctx.rejection){ctx.rejection="freeze-geometry";ctx.rejected_rfx=part.rfx;}
         ctx.hybrid_failed=true;return true;
@@ -411,8 +427,9 @@ bool RtQueuePrivateSubdraw(SectionDraw& sd,unsigned count,unsigned first,int32_t
         const uint64_t cur_pso=CmdGfx(sd.fr.da.cmd_list).gfx_pso;
         if(!ctx.stamps_cached||ctx.cached_stamps_pso!=cur_pso||ctx.cached_srv_gen0!=sd.hk.srv_gen0||
            std::memcmp(ps_gen,ctx.cached_ps_gen,sizeof(ctx.cached_ps_gen))!=0){
+            extern SectionPsStamps PlanPrivateSectionPsSlots(reshade::api::command_list*,uint32_t,const std::vector<uint32_t>&,int,int);
             static const std::vector<uint32_t> kIncludeThisSwaps;
-            ctx.cached_stamps=PlanSectionPsSlots(sd.fr.da.cmd_list,sd.hk.srv_gen0,kIncludeThisSwaps,sd.dm,sd.wc?sd.wc->index:0);
+            ctx.cached_stamps=PlanPrivateSectionPsSlots(sd.fr.da.cmd_list,sd.hk.srv_gen0,kIncludeThisSwaps,sd.dm,sd.wc?sd.wc->index:0);
             ctx.cached_stamps_pso=cur_pso;
             ctx.cached_srv_gen0=sd.hk.srv_gen0;
             std::memcpy(ctx.cached_ps_gen,ps_gen,sizeof(ctx.cached_ps_gen));
@@ -436,6 +453,7 @@ bool RtQueuePrivateSubdraw(SectionDraw& sd,unsigned count,unsigned first,int32_t
            !g_geomods[sd.dm].mod.queries_ps_slots)
             RtAuditClassicTexSlots(sd.fr.da.cmd_list,sd.dm,sd.wc->index,sd.fr.da.draw_rt.rtv_count,part.ps);
         if(sd.fr.da.draw_rt.rtv_count>=2&&sd.wc&&!g_geomods[sd.dm].mod.queries_ps_slots&&g_tex_struct_fallback){
+            rt_phase_cpu::ConditionalScope fb_cpu(rt_phase_cpu::gate_active(),rt_phase_cpu::gate_fallback);
             if(!ctx.struct_fallback_cached||ctx.cached_struct_pso!=cur_pso){
                 ctx.cached_struct_slots.clear();
                 wwmi_struct_tex::g_struct_fallback.Apply(sd.fr.da.cmd_list,sd.dm,sd.wc->index,
@@ -492,7 +510,13 @@ bool RtQueuePrivateSubdraw(SectionDraw& sd,unsigned count,unsigned first,int32_t
 bool RtFinishPrivateSection(uint64_t section,bool complete,InjectFrame& fr){
     if(!active_stream)return false;
     auto &ctx=*active_stream;
-    if(ctx.hybrid)return RtFinishHybridSection(ctx,complete,fr);
+    if(ctx.hybrid){
+        rt_phase_cpu::Scope hybrid_cpu(rt_phase_cpu::hybrid_finish);
+        hybrid_cpu.add(ctx.requested.size());
+        return RtFinishHybridSection(ctx,complete,fr);
+    }
+    rt_phase_cpu::Scope private_cpu(rt_phase_cpu::private_finish);
+    private_cpu.add(ctx.requested.size());
     const auto &world=ctx.surface();
     WWMI_RtAuthorCommit_v1 commit{ctx.query.device,ctx.query.list,ctx.author.source.list_creation,ctx.author.source.recording,
         ctx.author_scope.plan,0,0,ctx.author.draw_ticket,WWMI_RT_AUTHOR_TENTATIVE,0,ctx.identity.native.component,0};
@@ -659,8 +683,26 @@ bool RtFinishPrivateSection(uint64_t section,bool complete,InjectFrame& fr){
         ++ctx.empty_selections;ctx.replaced=true;return true;
     }
     struct Material {RtMaterialTables tables;uint64_t local_cb=0;};
-    std::vector<Material> material;
-    if(ctx.program)material.reserve(ctx.requested.size());
+    std::vector<Material> unique_materials;
+    std::vector<unsigned> unique_rep;
+    std::vector<unsigned> part_mat_index(ctx.requested.size(),0u);
+    if(ctx.program){
+        unique_materials.reserve(ctx.requested.size());
+        unique_rep.reserve(ctx.requested.size());
+    }
+    auto same_ps=[](const std::vector<ShadowSlotOvr>& a,const std::vector<ShadowSlotOvr>& b) noexcept {
+        if(a.size()!=b.size())return false;
+        for(size_t k=0;k<a.size();++k)
+            if(a[k].param!=b[k].param||a[k].offset!=b[k].offset||a[k].src.ptr!=b[k].src.ptr)return false;
+        return true;
+    };
+    auto same_textures=[](const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& a,
+                          const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& b) noexcept {
+        if(a.size()!=b.size())return false;
+        for(size_t k=0;k<a.size();++k)
+            if(a[k].Get()!=b[k].Get())return false;
+        return true;
+    };
     std::vector<WWMI_RtGraphicsGeometry_v1> views;views.reserve(ctx.requested.size());
     WWMI_RtDrawFrame_v1 shared_frame{};
     std::array<WWMI_RtModDraw_v1,4> local_recipe;
@@ -740,25 +782,40 @@ bool RtFinishPrivateSection(uint64_t section,bool complete,InjectFrame& fr){
         }
         previous_order=history.pose_order;previous_resource=history.positions.resource;
         if(ctx.program){
-            material.emplace_back();auto& m=material.back();
-            auto *invalid=no_history?&*no_history:nullptr;
-            bool prepared;
-            if(shared_author){
-                prepared=true;
-                if(!shared_material){
-                    shared_material.emplace();
-                    prepared=RtPrepareWorldMaterialInputs(fr.da.cmd_list,*ctx.program,world,surface,history,invalid!=nullptr,
-                        *shared_material,m.tables,true);
+            unsigned found=UINT32_MAX;
+            if(shared_author&&!no_history){
+                for(unsigned u=0;u<unique_rep.size();++u){
+                    const auto& rep=ctx.requested[unique_rep[u]];
+                    if(same_ps(part.ps,rep.ps)&&same_textures(part.textures,rep.textures)){found=u;break;}
                 }
-                if(prepared)prepared=RtPrepareWorldMaterialPart(fr.da.cmd_list,world,surface,*shared_material,part.ps,
-                    part.textures,ctx.reader.reserve,m.tables,m.local_cb,ctx.reader.reserve2,invalid);
-            }else prepared=RtPrepareWorldMaterial(fr.da.cmd_list,*ctx.program,world,surface,history,part.ps,part.textures,
-                ctx.reader.reserve,m.tables,m.local_cb,ctx.reader.reserve2,invalid);
-            if(!prepared){
-                const unsigned why=m.tables.failure;
-                const unsigned code=why!=8 ? why : (8u | ((m.tables.missing_param+1)<<8) | ((m.tables.missing_offset+1)<<16));
-                if(ctx.cloth){ctx.cloth->reason=18;ctx.cloth->status=code;}
-                if(!ctx.depth_only)RtWorldNote(5,ctx.program->hash,selection.component,code);return reject(RtAuthorFinishReason::material_tables,code);
+            }
+            if(found!=UINT32_MAX){
+                part_mat_index[part_index]=found;
+            }else{
+                const unsigned u_idx=unsigned(unique_materials.size());
+                unique_materials.emplace_back();
+                unique_rep.push_back(part_index);
+                part_mat_index[part_index]=u_idx;
+                auto& m=unique_materials.back();
+                auto *invalid=no_history?&*no_history:nullptr;
+                bool prepared;
+                if(shared_author){
+                    prepared=true;
+                    if(!shared_material){
+                        shared_material.emplace();
+                        prepared=RtPrepareWorldMaterialInputs(fr.da.cmd_list,*ctx.program,world,surface,history,invalid!=nullptr,
+                            *shared_material,m.tables,true);
+                    }
+                    if(prepared)prepared=RtPrepareWorldMaterialPart(fr.da.cmd_list,world,surface,*shared_material,part.ps,
+                        part.textures,ctx.reader.reserve,m.tables,m.local_cb,ctx.reader.reserve2,invalid);
+                }else prepared=RtPrepareWorldMaterial(fr.da.cmd_list,*ctx.program,world,surface,history,part.ps,part.textures,
+                    ctx.reader.reserve,m.tables,m.local_cb,ctx.reader.reserve2,invalid);
+                if(!prepared){
+                    const unsigned why=m.tables.failure;
+                    const unsigned code=why!=8 ? why : (8u | ((m.tables.missing_param+1)<<8) | ((m.tables.missing_offset+1)<<16));
+                    if(ctx.cloth){ctx.cloth->reason=18;ctx.cloth->status=code;}
+                    if(!ctx.depth_only)RtWorldNote(5,ctx.program->hash,selection.component,code);return reject(RtAuthorFinishReason::material_tables,code);
+                }
             }
         }
         if(v.position_bytes>UINT32_MAX || v.index_bytes>UINT32_MAX){if(ctx.cloth)ctx.cloth->reason=20;return reject(RtAuthorFinishReason::invalid_range);}
@@ -805,18 +862,23 @@ bool RtFinishPrivateSection(uint64_t section,bool complete,InjectFrame& fr){
             RfxRestore(list,*original);
         }
     } restore_material{cl,world};
+    unsigned bound_mat=UINT32_MAX;
     for(size_t i=0;i<views.size();++i){
         const auto& v=views[i];
         D3D12_VERTEX_BUFFER_VIEW vb{v.position_gpu_va,(UINT)v.position_bytes,v.position_stride};
         D3D12_INDEX_BUFFER_VIEW ib{v.index_gpu_va,(UINT)v.index_bytes,(DXGI_FORMAT)v.index_format};
         if(!i||!shared_author)cl->IASetVertexBuffers(0,1,&vb);
         cl->IASetIndexBuffer(&ib);
+        const unsigned m_idx=part_mat_index[i];
         if(ctx.program){
-            restore_material.original=&material[i].tables.original;
-            // The native binding scope already suppresses redundant heap
-            // sets. Parts on a new page still bind it and their own tables.
-            RtBindMaterialTables(cl,material[i].tables);
-            cl->SetGraphicsRootConstantBufferView(world.local_param,material[i].local_cb);
+            if(m_idx!=bound_mat){
+                bound_mat=m_idx;
+                restore_material.original=&unique_materials[m_idx].tables.original;
+                // The native binding scope already suppresses redundant heap
+                // sets. Parts on a new page still bind it and their own tables.
+                RtBindMaterialTables(cl,unique_materials[m_idx].tables);
+                cl->SetGraphicsRootConstantBufferView(world.local_param,unique_materials[m_idx].local_cb);
+            }
             if(no_history)for(unsigned j=0;j<WWMI_RT_NH_CB_COUNT;++j)
                 if(no_history->va[j])cl->SetGraphicsRootConstantBufferView(world.history_roots[j].param,no_history->va[j]);
         }
@@ -824,7 +886,7 @@ bool RtFinishPrivateSection(uint64_t section,bool complete,InjectFrame& fr){
         if(v.index_count)RtMaterialDrawNote(fr.da.cmd_list,ctx.mod,selection.component,fr.da.draw_rt.rtv_count,
             ctx.depth_only?graphics.gfx_pso:graphics.gfx_restore(),RtNoteRoute::old_private,
             "submitted",v.first_index,v.index_count,v.base_vertex,&ctx.requested[i].rfx,ctx.requested[i].ps,
-            ctx.program?&material[i].tables:nullptr,ctx.requested[i].issued_uv_pairs);
+            ctx.program?&unique_materials[m_idx].tables:nullptr,ctx.requested[i].issued_uv_pairs);
         if(work_deadline)issued_indices+=v.index_count;
         if(no_history){
             for(unsigned j=0;j<WWMI_RT_NH_CB_COUNT;++j)if(no_history->va[j])
@@ -841,7 +903,7 @@ bool RtFinishPrivateSection(uint64_t section,bool complete,InjectFrame& fr){
             part.draw_pso=ctx.depth_only?graphics.gfx_pso:graphics.gfx_restore();
             const auto regs=PipelineSrvRegs(part.draw_pso,'p');part.ps_declared=regs.lo;part.ps_known=regs.parsed&&!regs.unbounded;part.ps_unbounded=regs.unbounded;
             if(ctx.program)for(auto& t:part.tex)if(t.descriptor){
-                for(const auto& [root,table]:material[i].tables.tables)if(root==t.param){t.bound_table=table.ptr;break;}
+                for(const auto& [root,table]:unique_materials[m_idx].tables.tables)if(root==t.param){t.bound_table=table.ptr;break;}
                 // The mirror validates each override's destination, then copies
                 // in order. VS overrides cannot replace a different PS source.
                 const auto& ps=ctx.requested[i].ps;

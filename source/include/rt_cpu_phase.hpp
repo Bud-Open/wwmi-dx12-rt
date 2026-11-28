@@ -14,11 +14,13 @@ namespace rt_phase_cpu {
 constexpr unsigned bin_ms=2000,bins=30,detail_seconds=12;
 enum Kind : unsigned {
     runtime_wait,runtime_body,history,inbox,fence_poll,skin_dispatch,locate_index,batch_create,skin_record,
-    descriptor_copy,native_copy,material,count
+    descriptor_copy,native_copy,material,hybrid_finish,private_finish,rt_gate_select,
+    gate_identify,gate_world,gate_setup,gate_vm,gate_fallback,count
 };
 inline constexpr const char *labels[]{
     "runtime_wait","runtime_body","history","inbox","fence_poll","skin_dispatch","locate_index","batch_create","skin_record",
-    "descriptor_copy","native_copy","recorded_material"
+    "descriptor_copy","native_copy","recorded_material","hybrid_finish","private_finish","rt_gate_select",
+    "gate_identify","gate_world","gate_setup","gate_vm","gate_fallback"
 };
 struct Row {std::atomic<std::uint64_t> ticks{},calls{},work{};};
 inline std::array<std::array<Row,count>,bins> totals;
@@ -81,6 +83,23 @@ struct Scope {
     void add(std::uint64_t n)noexcept{work+=n;}
     ~Scope(){end(ticket,0,work);}
 };
+struct ConditionalScope {
+    Ticket ticket;
+    std::uint64_t work=0;
+    ConditionalScope(bool active,Kind kind,std::uint64_t start=0)noexcept:ticket(active?begin(kind,start):Ticket{}){}
+    ConditionalScope(const ConditionalScope &)=delete;
+    void add(std::uint64_t n)noexcept{work+=n;}
+    void finish()noexcept{end(ticket,0,work);}
+    ~ConditionalScope(){end(ticket,0,work);}
+};
+inline thread_local bool gate_timing_active=false;
+inline bool gate_active()noexcept{return gate_timing_active;}
+struct GateActiveGuard {
+    bool prev;
+    explicit GateActiveGuard(bool active)noexcept:prev(gate_timing_active){gate_timing_active=active;}
+    GateActiveGuard(const GateActiveGuard &)=delete;
+    ~GateActiveGuard(){gate_timing_active=prev;}
+};
 // Normal close is fixed at the end of the existing draw window, not the
 // next Present. Early stop uses the actual QPC boundary.
 inline void close(bool stopping)noexcept{
@@ -110,7 +129,7 @@ inline void report(const char *owner,std::uint64_t start_ms,Kind first,Kind last
     const auto covered_ms=covered_ticks*1000/frequency;
     const auto first_covered_bin=covered_ticks?int((observed_start-origin)/width):-1;
     const double ms=1000.0/double(frequency);
-    char line[1536];
+    char line[2048];
     std::snprintf(line,sizeof(line),
         "RT-CPU-PHASE begin owner=%s start_ms=%llu window_ms=%llu covered_ms=%llu first_covered_bin=%d origin_qpc=%llu admitted_qpc=%llu frequency=%llu bin_ms=%u pending_scopes=%u timing=wall_qpc_inclusive",
         owner,U(start_ms),U(window_ms),U(covered_ms),first_covered_bin,U(origin),U(admitted),U(frequency),bin_ms,active);

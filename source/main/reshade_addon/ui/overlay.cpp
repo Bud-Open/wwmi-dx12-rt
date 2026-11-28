@@ -532,7 +532,7 @@ void DrawOverlay(effect_runtime*)
         WritePrivateProfileStringW(L"wwmi-dx12", L"hide_outline", g_hide_outline ? L"1" : L"0", g_addon_ini_path.c_str());
 #endif
     {
-        bool lookalike = g_texlod_resemblance;
+        bool lookalike = g_texlod_resemblance.load(std::memory_order_relaxed);
         if (NCheckbox("A13", "Use look-alike texture matches (a game texture that looks like a mod's texture gets it, as if it had the same hash)", &lookalike)) {
             TexLodSetResemblance(lookalike);
             TexLookAlikesSwitched(lookalike);
@@ -541,7 +541,7 @@ void DrawOverlay(effect_runtime*)
         }
     }
     {
-        bool cache = g_texlod_cache;
+        bool cache = g_texlod_cache.load(std::memory_order_relaxed);
         if (NCheckbox("A14", "Use texture match cache (mod textures on the game's distant copies; off: nothing is learned, read or saved)", &cache)) {
             TexLodSetCache(cache);
             if (!g_addon_ini_path.empty())
@@ -864,7 +864,11 @@ void DrawOverlay(effect_runtime*)
         else
             ImGui::TextDisabled("  lineage propagations this frame: 0");
     }
-    NCheckbox("D12", "A/B: IGNORE learned LOD aliases -- still recorded (g_texlod_alias_off)", &g_texlod_alias_off);
+    {
+        bool alias_off = g_texlod_alias_off.load(std::memory_order_relaxed);
+        if (NCheckbox("D12", "A/B: IGNORE learned LOD aliases -- still recorded (g_texlod_alias_off)", &alias_off))
+            TexLodSetAliasOff(alias_off);
+    }
     NCheckbox("D13", "Mip-exact aliases: a target's mips hashed as the residents they would be (g_mip_exact)", &g_mip_exact);
     NCheckbox("D15", "Dump degenerate LOD textures as they load or are found: <hash>.dds in DX12_Dumps\\degenerates, once each", &g_dump_degenerates);
     NCheckbox("D16", "Hash every texture upload from a GPU copy, as with Resizable BAR, and check it against the processor's read (TEXSTREAM same/differ)", &g_tex_upload_gpu);

@@ -145,5 +145,6 @@ struct SkPendingList {
 };
 extern std::vector<SkPendingList> g_sk_pending;
 extern std::mutex                 g_sk_pending_mtx;
+extern std::atomic<uint32_t>      g_sk_pending_count;
 
 void on_execute_command_list(reshade::api::command_queue*, reshade::api::command_list* cl);

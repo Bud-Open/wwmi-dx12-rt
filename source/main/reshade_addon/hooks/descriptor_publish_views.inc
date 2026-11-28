@@ -81,6 +81,82 @@ void OnNativeDescriptorWrite(uint64_t api,const WWMI_DescriptorWrite_v1* packet,
     auto* dev=reinterpret_cast<device*>(api);
     if(!dev||dev!=g_reshade_device||!g_is_dx12||!packet||!packet->destination.cpu)return;
     const auto& r=packet->destination;
+    // Declared before admission so deferred heap retirement drains only after
+    // stripe admission is released (never inverting admission -> copy lanes).
+    struct DeferredHeapDrainGuard {
+        ~DeferredHeapDrainGuard() noexcept { DrainDeferredRetiredHeaps(); }
+    } deferred_drain;
+
+    // Fast path for top-level registered CBV/SRV/UAV writes: use CopyLaneGuard
+    // (asymmetric fast-raw admission) + ThreadFastHeapCache to avoid striped CAS
+    // admission and PreviousGetRange weak_ptr/shared_ptr atomic refcounting.
+    // CopyLaneGuard is strictly destroyed before GlobalTexSwap (RawDescriptorAdmission)
+    // and before any fallback to AppDescriptorAdmission.
+    const bool eligible_fast=r.heap&&r.heap_creation&&r.increment&&r.slot<r.slots&&
+        packet->kind!=WWMI_DESCRIPTOR_RELEASE_CPU_VIEW&&
+        packet->kind!=WWMI_DESCRIPTOR_UNKNOWN&&
+        CurrentCopyLane().copy_depth==0;
+    if(eligible_fast){
+        bool handled_fast=false;
+        bool fast_ok=false;
+        uint64_t fast_native_dev=0;
+        ResInfo written{};
+        {
+            PreviousPair pair;
+            if(PreviousDevice(dev,pair,false)){
+                CopyLaneGuard lane_guard;
+                if(lane_guard.has_copy_depth()&&lane_guard.has_fast_raw()){
+                    auto& fast_cache=ThreadFastHeapCache();
+                    fast_cache.sync(lane_guard.retire_gen);
+                    PreviousHeap* cached=fast_cache.find(r.heap,r.heap_creation,pair.epoch);
+                    if(cached&&!cached->retired.load(std::memory_order_acquire)&&
+                       cached->flat.live()&&CopyRangeMatchesHeap(cached,r)){
+                        handled_fast=true;
+                        fast_native_dev=pair.device;
+                        rt_cpu::Scope cpu(rt_cpu::desc_update);
+                        rt_cpu::Scope measured(rt_cpu::previous_update);
+                        measured.add();
+                        if(measured.kind>=0)g_write_fast_hits.fetch_add(1,std::memory_order_relaxed);
+                        if(SUCCEEDED(native(call))){
+                            fast_ok=true;
+                            try{
+                                ContentId content;
+                                {
+                                    rt_cpu::Scope capture(rt_cpu::previous_r32);
+                                    content=CaptureNativeView(dev,*packet,pair);
+                                    if(content)written=content->definition.info;
+                                }
+                                std::unique_lock lock(cached->page(r.slot).mutex,std::defer_lock);
+                                PreviousLock(lock);
+                                if(PreviousCurrent(pair,*cached)){
+                                    rt_cpu::Scope apply(rt_cpu::previous_aux);
+                                    PublishContentExclusive(*cached,r.slot,cached->write_version(),std::move(content),3);
+                                }
+                            }catch(...){
+                                std::unique_lock lock(cached->page(r.slot).mutex);
+                                if(PreviousCurrent(pair,*cached))PublishUnknownSlotExclusive(*cached,r.slot,3);
+                                fast_ok=false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if(handled_fast){
+            if(!fast_ok)return;
+            try{NotePublishedView(*packet);}catch(...){}
+            try{
+                if(!g_addon_disabled&&packet->kind==WWMI_DESCRIPTOR_SRV&&packet->resource){
+                    if(written.tex_cand&&
+                        !GlobalTexSwap(reinterpret_cast<ID3D12Device*>(fast_native_dev),r.heap,r.slot,written.res)&&
+                        g_texnoswap_arm.load(std::memory_order_relaxed)>0)
+                        TexNoSwapNote(r.heap,r.slot,written.res,"write");
+                }
+            }catch(...){}
+            return;
+        }
+    }
+
     AppDescriptorAdmission admission;
     admission.pages.add(r.cpu,1,0);
     admission.enter();
@@ -102,8 +178,16 @@ void OnNativeDescriptorWrite(uint64_t api,const WWMI_DescriptorWrite_v1* packet,
     rt_cpu::Scope cpu(rt_cpu::desc_update);
     rt_cpu::Scope measured(rt_cpu::previous_update);
     measured.add();
+    if(measured.kind>=0)g_write_generic_hits.fetch_add(1,std::memory_order_relaxed);
+    const uint64_t retire_gen_before=previous_retire_generation.load(std::memory_order_acquire);
     PreviousHeapPtr heap;
     try{heap=PreviousGetRange(r,pair,true);}catch(...){}
+    if(heap&&r.heap&&r.heap_creation&&CurrentCopyLane().copy_depth==0&&
+       previous_retire_generation.load(std::memory_order_acquire)==retire_gen_before){
+        auto& fast_cache=ThreadFastHeapCache();
+        fast_cache.sync(retire_gen_before);
+        fast_cache.put(r.heap,r.heap_creation,pair.epoch,heap.get());
+    }
     if(FAILED(native(call)))return;
     if(r.heap&&!heap)return; // failed allocation on a never-observed heap
     ResInfo written{};
@@ -119,13 +203,13 @@ void OnNativeDescriptorWrite(uint64_t api,const WWMI_DescriptorWrite_v1* packet,
             std::unique_lock lock(heap->page(r.slot).mutex,std::defer_lock);PreviousLock(lock);
             if(!PreviousCurrent(pair,*heap))return;
             rt_cpu::Scope apply(rt_cpu::previous_aux);
-            PublishContent(*heap,r.slot,heap->write_version(),std::move(content),3);
+            PublishContentExclusive(*heap,r.slot,heap->write_version(),std::move(content),3);
         }
     }catch(...){
         if(!r.heap)raw_cpu_views.erase(r.cpu);
         else if(heap){
             std::unique_lock lock(heap->page(r.slot).mutex);
-            if(PreviousCurrent(pair,*heap))PublishUnknownSlot(*heap,r.slot,3);
+            if(PreviousCurrent(pair,*heap))PublishUnknownSlotExclusive(*heap,r.slot,3);
         }
         return;
     }
@@ -164,4 +248,5 @@ void StopDescriptorPublisher() {
         descriptor_control(reinterpret_cast<uint64_t>(&descriptor_owner),nullptr,nullptr);
         descriptor_control=nullptr;
     }
+    ReclaimRetiredContentsBlocking();
 }

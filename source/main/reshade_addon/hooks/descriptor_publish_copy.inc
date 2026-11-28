@@ -83,9 +83,13 @@ struct FastHeapCache {
         uint64_t handle=0,host_gen=0,epoch=0,stamp=0;
         PreviousHeap* heap=nullptr;
     };
+    struct Set {
+        Entry ways[2]{};
+        uint8_t next_victim=0;
+    };
     uint64_t retire_gen=0;
     uint64_t stamp=1;
-    std::array<Entry,512> entries{};
+    std::array<Set,256> sets{};
     void sync(uint64_t cur_retire_gen) noexcept {
         if(retire_gen!=cur_retire_gen){
             retire_gen=cur_retire_gen;
@@ -93,11 +97,36 @@ struct FastHeapCache {
         }
     }
     PreviousHeap* find(uint64_t handle,uint64_t host_gen,uint64_t epoch) const noexcept {
-        const auto& e=entries[PreviousHandleHash{}(handle)&(entries.size()-1)];
-        return (e.stamp==stamp&&e.handle==handle&&e.host_gen==host_gen&&e.epoch==epoch)?e.heap:nullptr;
+        const auto& s=sets[PreviousHandleHash{}(handle)&(sets.size()-1)];
+        for(const auto& e:s.ways)
+            if(e.stamp==stamp&&e.handle==handle&&e.host_gen==host_gen&&e.epoch==epoch)return e.heap;
+        return nullptr;
+    }
+    PreviousHeap* find_any_gen(uint64_t handle,uint64_t epoch) const noexcept {
+        const auto& s=sets[PreviousHandleHash{}(handle)&(sets.size()-1)];
+        for(const auto& e:s.ways)
+            if(e.stamp==stamp&&e.handle==handle&&e.epoch==epoch)return e.heap;
+        return nullptr;
     }
     void put(uint64_t handle,uint64_t host_gen,uint64_t epoch,PreviousHeap* heap) noexcept {
-        entries[PreviousHandleHash{}(handle)&(entries.size()-1)]={handle,host_gen,epoch,stamp,heap};
+        auto& s=sets[PreviousHandleHash{}(handle)&(sets.size()-1)];
+        for(unsigned w=0;w<2;++w){
+            if(s.ways[w].stamp==stamp&&s.ways[w].handle==handle){
+                s.ways[w]={handle,host_gen,epoch,stamp,heap};
+                s.next_victim=uint8_t(w^1u);
+                return;
+            }
+        }
+        for(unsigned w=0;w<2;++w){
+            if(s.ways[w].stamp!=stamp){
+                s.ways[w]={handle,host_gen,epoch,stamp,heap};
+                s.next_victim=uint8_t(w^1u);
+                return;
+            }
+        }
+        const unsigned victim=s.next_victim&1u;
+        s.ways[victim]={handle,host_gen,epoch,stamp,heap};
+        s.next_victim=uint8_t(victim^1u);
     }
 };
 inline FastHeapCache& ThreadFastHeapCache() noexcept {
@@ -154,11 +183,22 @@ PreviousHeap* PinCopyHeap(CopyScratch& w,const WWMI_DescriptorRange_v1& range,
     auto* h=pin->heap.get();
     return CopyRangeMatchesHeap(h,range)?h:nullptr;
 }
-PreviousHeap* PinCpuSourceHeap(CopyScratch& w,HeapKey key,PreviousPair pair,CopyWaits* measured) {
+PreviousHeap* PinCpuSourceHeap(CopyScratch& w,HeapKey key,FlatHeapMap::Entry* entry,
+    PreviousPair pair,CopyWaits* measured,const CopyLaneGuard& lane,FastHeapCache* fast_cache) {
+    if(!entry)return nullptr;
+    if(fast_cache){
+        if(auto* cached=fast_cache->find_any_gen(key.heap,pair.epoch)){
+            if(!cached->retired.load(std::memory_order_acquire)&&cached->flat.entry==entry&&cached->flat.live())
+                return cached;
+        }
+    }
     const auto existing=std::find_if(w.heaps.begin(),w.heaps.end(),[&](const auto& pin){return pin.handle==key.heap&&pin.heap;});
     if(existing!=w.heaps.end())return existing->heap.get();
-    auto h=PreviousGetHeap(PreviousToken(key.heap,g_heap_to_res.entry_of(key.heap)),pair,0,false,0,measured);
-    const auto host=h?h->host_generation.load(std::memory_order_acquire):0;
+    auto h=PreviousGetHeap(PreviousToken(key.heap,entry),pair,0,false,0,measured);
+    if(!h)return nullptr;
+    const auto host=h->host_generation.load(std::memory_order_acquire);
+    if(fast_cache&&previous_retire_generation.load(std::memory_order_acquire)==lane.retire_gen)
+        fast_cache->put(key.heap,host,pair.epoch,h.get());
     w.heaps.push_back({key.heap,host,std::move(h)});return w.heaps.back().heap.get();
 }
 void ResolveCopyTickets(CopyScratch& w,PreviousPair pair,CopyWaits* measured,const CopyLaneGuard& lane,FastHeapCache* fast_cache) {
@@ -195,6 +235,7 @@ void ResolveCopyTickets(CopyScratch& w,PreviousPair pair,CopyWaits* measured,con
             if(t.source){last_src_handle=sr.heap;last_src_gen=sr.heap_creation;last_src_heap=t.source;}
         }
         if(!sr.heap&&sr.cpu&&!sr.increment){
+            if(measured)measured->add(copy_raw_src,span.count);
             const auto increment=span.count>1?RawCopyIncrement(span,w.native_increment):0;
             bool allocator_view=false;
             for(uint32_t i=0;i<span.count;++i){
@@ -205,18 +246,19 @@ void ResolveCopyTickets(CopyScratch& w,PreviousPair pair,CopyWaits* measured,con
                 }
             }
             if(!allocator_view){
+                const uint32_t cpu_inc=w.native_increment?w.native_increment:CurrentDescriptorIncrement();
                 HeapKey key{};
-                if(TrackedSlotOfCpu(sr.cpu,&key)){
+                if(auto* entry=g_heap_to_res.find_cpu_entry(sr.cpu,cpu_inc,&key)){
                     t.span.source.slot=key.offset;
-                    t.source=PinCpuSourceHeap(w,key,pair,measured);
+                    t.source=PinCpuSourceHeap(w,key,entry,pair,measured,lane,fast_cache);
                 }
             }
         }
     }
 }
 bool TryFreezeSpanLockFree(PreviousHeap& s,PreviousPair pair,uint32_t first,uint32_t count,
-    ContentId* dst_cells,bool want_stamp,bool& out_may_stamp) noexcept {
-    if(!PreviousCurrent(pair,s))return false;
+    ContentId* dst_cells,bool want_stamp,bool& out_may_stamp,CopyWaits* measured=nullptr) noexcept {
+    if(s.is_vis||!PreviousCurrent(pair,s))return false;
     const uint32_t p0=PreviousPageIndex(first);
     const uint32_t p1=PreviousPageIndex(first+count-1);
     if(p1-p0>=4)return false;
@@ -228,6 +270,7 @@ bool TryFreezeSpanLockFree(PreviousHeap& s,PreviousPair pair,uint32_t first,uint
         if(want_stamp&&s.pages[p].may_stamp.load(std::memory_order_relaxed))stamp=true;
     }
     uint32_t retained=0;
+    uint32_t frozen_slots=0;
     for(uint32_t i=0;i<count;++i){
         const auto* raw=s.slots[first+i].content.load_raw();
         if(raw){
@@ -235,6 +278,7 @@ bool TryFreezeSpanLockFree(PreviousHeap& s,PreviousPair pair,uint32_t first,uint
                 for(uint32_t j=0;j<retained;++j)dst_cells[j]={};
                 return false;
             }
+            ++frozen_slots;
             dst_cells[i].init_adopted(raw);
         }
         ++retained;
@@ -251,6 +295,7 @@ bool TryFreezeSpanLockFree(PreviousHeap& s,PreviousPair pair,uint32_t first,uint
         for(uint32_t j=0;j<retained;++j)dst_cells[j]={};
         return false;
     }
+    if(measured&&frozen_slots)measured->add(copy_frozen_unpinned,frozen_slots);
     if(stamp)out_may_stamp=true;
     return true;
 }
@@ -263,7 +308,7 @@ void FreezeCopySources(CopyScratch& w,PreviousPair pair,CopyWaits* measured,cons
         if(!t.destination&&!t.raw_destination)continue;
         if(s&&first<s->flat.size&&count<=s->flat.size-first){
             if(allow_seqlock&&TryFreezeSpanLockFree(*s,pair,first,count,w.cells.data()+t.begin,
-                t.destination!=nullptr,t.may_stamp))
+                t.destination!=nullptr,t.may_stamp,measured))
                 continue;
             lock.enter(*s,first,count,measured,copy_source);
             if(PreviousCurrent(pair,*s)){
@@ -292,8 +337,10 @@ void PublishCopySpan(CopyScratch& w,CopyTicket& t,PreviousHeap& h,uint64_t versi
             }
             StampDescriptorWrite(target[i],version,2);
         }
-        for(uint32_t p=p0;p<=p1;++p){
-            h.pages[p].seq.fetch_add(1,std::memory_order_release);
+        if(!h.is_vis){
+            for(uint32_t p=p0;p<=p1;++p){
+                h.pages[p].seq.fetch_add(1,std::memory_order_release);
+            }
         }
         return;
     }
@@ -372,6 +419,257 @@ void InvalidateCopiedSpan(void* context,const WWMI_DescriptorSpan_v1* span) {
     lock.enter(*h,span->destination.slot,span->count,nullptr,copy_destination,false);
     if(PreviousCurrent(c.pair,*h))ForgetCopySpan(*h,*span);
 }
+__forceinline void ReleaseUnpinnedMask(const DescriptorContent* const* ptrs,uint64_t mask) noexcept {
+    while(mask){
+        const unsigned idx=std::countr_zero(mask);
+        mask&=mask-1ull;
+        ReleaseDescriptor(ptrs[idx]);
+    }
+}
+bool TryFreezeSpanRawLockFree(PreviousHeap& s,PreviousPair pair,uint32_t first,uint32_t count,
+    const DescriptorContent** dst_ptrs,uint64_t& out_unpinned_mask,CopyWaits* measured=nullptr) noexcept {
+    out_unpinned_mask=0;
+    if(s.is_vis||!PreviousCurrent(pair,s))return false;
+    const uint32_t p0=PreviousPageIndex(first);
+    const uint32_t p1=PreviousPageIndex(first+count-1);
+    if(p1-p0>=4)return false;
+    uint64_t seqs[4];
+    for(uint32_t p=p0;p<=p1;++p){
+        seqs[p-p0]=s.pages[p].seq.load(std::memory_order_acquire);
+        if(s.pages[p].mutex.has_active_writer())return false;
+        if(s.pages[p].may_stamp.load(std::memory_order_relaxed))return false;
+    }
+    uint64_t retained_mask=0;
+    uint32_t frozen_slots=0;
+    for(uint32_t i=0;i<count;++i){
+        const auto* raw=s.slots[first+i].content.load_raw();
+        dst_ptrs[i]=raw;
+        if(raw){
+            if(!TryRetainDescriptor(raw)){
+                ReleaseUnpinnedMask(dst_ptrs,retained_mask);
+                return false;
+            }
+            retained_mask|=(1ull<<i);
+            ++frozen_slots;
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    for(uint32_t p=p0;p<=p1;++p){
+        if(s.pages[p].mutex.has_active_writer()||
+           s.pages[p].seq.load(std::memory_order_acquire)!=seqs[p-p0]||
+           s.pages[p].may_stamp.load(std::memory_order_relaxed)){
+            ReleaseUnpinnedMask(dst_ptrs,retained_mask);
+            return false;
+        }
+    }
+    if(!PreviousCurrent(pair,s)){
+        ReleaseUnpinnedMask(dst_ptrs,retained_mask);
+        return false;
+    }
+    if(measured&&frozen_slots)measured->add(copy_frozen_unpinned,frozen_slots);
+    out_unpinned_mask=retained_mask;
+    return true;
+}
+constexpr uint32_t kFastCopyMaxSpans=32;
+constexpr uint32_t kFastCopyMaxSlots=64;
+constexpr uint32_t kFastCopyMaxPages=32;
+enum FastCopySpillReason : uint8_t {
+    fast_spill_none=0,
+    fast_spill_spans=1,
+    fast_spill_slots=2,
+    fast_spill_raw=3,
+    fast_spill_miss=4,
+    fast_spill_freeze=5,
+    fast_spill_dup_dst=6,
+    fast_spill_pages=7
+};
+inline void RecordFastCopySpill(FastCopySpillReason reason) noexcept {
+    switch(reason){
+    case fast_spill_spans:  g_copy_spill_spans.fetch_add(1,std::memory_order_relaxed);break;
+    case fast_spill_slots:  g_copy_spill_slots.fetch_add(1,std::memory_order_relaxed);break;
+    case fast_spill_raw:    g_copy_spill_raw.fetch_add(1,std::memory_order_relaxed);break;
+    case fast_spill_miss:   g_copy_spill_miss.fetch_add(1,std::memory_order_relaxed);break;
+    case fast_spill_freeze: g_copy_spill_freeze.fetch_add(1,std::memory_order_relaxed);break;
+    case fast_spill_dup_dst:g_copy_spill_dup_dst.fetch_add(1,std::memory_order_relaxed);break;
+    case fast_spill_pages:  g_copy_spill_pages.fetch_add(1,std::memory_order_relaxed);break;
+    default:break;
+    }
+}
+bool TryFreezeMultiSpanRawLockFree(const WWMI_DescriptorSpan_v1* items,PreviousHeap* const* src_heaps,
+    const uint32_t* span_offsets,uint32_t span_count,PreviousPair pair,bool single_src_heap,
+    const DescriptorContent** dst_ptrs,uint64_t& out_unpinned_mask,CopyWaits* measured=nullptr) noexcept {
+    out_unpinned_mask=0;
+    if(single_src_heap){
+        PreviousHeap* const h=src_heaps[0];
+        if(!h||h->is_vis||!PreviousCurrent(pair,*h))return false;
+        const uint32_t heap_size=h->flat.size;
+        uint32_t uniq_pages[kFastCopyMaxPages];
+        uint64_t saved_seqs[kFastCopyMaxPages];
+        uint32_t uniq_page_count=0;
+        for(uint32_t s=0;s<span_count;++s){
+            const uint32_t first=items[s].source.slot;
+            const uint32_t count=items[s].count;
+            if(!count||first>=heap_size||count>heap_size-first)return false;
+            const uint32_t p0=PreviousPageIndex(first);
+            const uint32_t p1=PreviousPageIndex(first+count-1u);
+            for(uint32_t p=p0;p<=p1;++p){
+                if(uniq_page_count==1&&uniq_pages[0]==p)continue;
+                bool page_seen=false;
+                for(uint32_t k=0;k<uniq_page_count;++k){
+                    if(uniq_pages[k]==p){page_seen=true;break;}
+                }
+                if(!page_seen){
+                    if(uniq_page_count>=kFastCopyMaxPages)return false;
+                    uniq_pages[uniq_page_count++]=p;
+                }
+            }
+        }
+        const PreviousPage* const pages=h->pages.get();
+        if(uniq_page_count==1){
+            const auto& pg=pages[uniq_pages[0]];
+            saved_seqs[0]=pg.seq.load(std::memory_order_acquire);
+            if(pg.mutex.has_active_writer()||pg.may_stamp.load(std::memory_order_relaxed))return false;
+        }else{
+            for(uint32_t k=0;k<uniq_page_count;++k){
+                const auto& pg=pages[uniq_pages[k]];
+                saved_seqs[k]=pg.seq.load(std::memory_order_acquire);
+                if(pg.mutex.has_active_writer()||pg.may_stamp.load(std::memory_order_relaxed))return false;
+            }
+        }
+        const DescriptorSlot* const h_slots=h->slots.get();
+        uint64_t retained_mask=0;
+        uint32_t frozen_slots=0;
+        for(uint32_t s=0;s<span_count;++s){
+            const uint32_t first=items[s].source.slot;
+            const uint32_t count=items[s].count;
+            const uint32_t base_pos=span_offsets[s];
+            for(uint32_t i=0;i<count;++i){
+                const uint32_t pos=base_pos+i;
+                const auto* raw=h_slots[first+i].content.load_raw();
+                dst_ptrs[pos]=raw;
+                if(raw){
+                    if(!TryRetainDescriptor(raw)){
+                        ReleaseUnpinnedMask(dst_ptrs,retained_mask);
+                        return false;
+                    }
+                    retained_mask|=(1ull<<pos);
+                    ++frozen_slots;
+                }
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if(uniq_page_count==1){
+            const auto& pg=pages[uniq_pages[0]];
+            if(pg.mutex.has_active_writer()||
+               pg.seq.load(std::memory_order_acquire)!=saved_seqs[0]||
+               pg.may_stamp.load(std::memory_order_relaxed)){
+                ReleaseUnpinnedMask(dst_ptrs,retained_mask);
+                return false;
+            }
+        }else{
+            for(uint32_t k=0;k<uniq_page_count;++k){
+                const auto& pg=pages[uniq_pages[k]];
+                if(pg.mutex.has_active_writer()||
+                   pg.seq.load(std::memory_order_acquire)!=saved_seqs[k]||
+                   pg.may_stamp.load(std::memory_order_relaxed)){
+                    ReleaseUnpinnedMask(dst_ptrs,retained_mask);
+                    return false;
+                }
+            }
+        }
+        if(!PreviousCurrent(pair,*h)){
+            ReleaseUnpinnedMask(dst_ptrs,retained_mask);
+            return false;
+        }
+        if(measured&&frozen_slots)measured->add(copy_frozen_unpinned,frozen_slots);
+        out_unpinned_mask=retained_mask;
+        return true;
+    }
+    PreviousHeap* uniq_heaps[kFastCopyMaxSpans];
+    uint32_t uniq_heap_count=0;
+    struct SrcPage { PreviousHeap* heap; uint32_t page; uint64_t saved_seq; };
+    SrcPage uniq_pages[kFastCopyMaxPages];
+    uint32_t uniq_page_count=0;
+    for(uint32_t s=0;s<span_count;++s){
+        PreviousHeap* h=src_heaps[s];
+        const uint32_t first=items[s].source.slot;
+        const uint32_t count=items[s].count;
+        if(!h||h->is_vis||!count||first>=h->flat.size||count>h->flat.size-first)return false;
+        bool heap_seen=false;
+        for(uint32_t k=0;k<uniq_heap_count;++k){
+            if(uniq_heaps[k]==h){heap_seen=true;break;}
+        }
+        if(!heap_seen)uniq_heaps[uniq_heap_count++]=h;
+        const uint32_t p0=PreviousPageIndex(first);
+        const uint32_t p1=PreviousPageIndex(first+count-1u);
+        for(uint32_t p=p0;p<=p1;++p){
+            bool page_seen=false;
+            for(uint32_t k=0;k<uniq_page_count;++k){
+                if(uniq_pages[k].heap==h&&uniq_pages[k].page==p){page_seen=true;break;}
+            }
+            if(!page_seen){
+                if(uniq_page_count>=kFastCopyMaxPages)return false;
+                uniq_pages[uniq_page_count++]={h,p,0};
+            }
+        }
+    }
+    for(uint32_t k=0;k<uniq_heap_count;++k){
+        if(!PreviousCurrent(pair,*uniq_heaps[k]))return false;
+    }
+    for(uint32_t k=0;k<uniq_page_count;++k){
+        const auto& pg=uniq_pages[k].heap->pages[uniq_pages[k].page];
+        uniq_pages[k].saved_seq=pg.seq.load(std::memory_order_acquire);
+        if(pg.mutex.has_active_writer())return false;
+        if(pg.may_stamp.load(std::memory_order_relaxed))return false;
+    }
+    uint64_t retained_mask=0;
+    uint32_t frozen_slots=0;
+    for(uint32_t s=0;s<span_count;++s){
+        const PreviousHeap* h=src_heaps[s];
+        const uint32_t first=items[s].source.slot;
+        const uint32_t count=items[s].count;
+        const uint32_t base_pos=span_offsets[s];
+        for(uint32_t i=0;i<count;++i){
+            const uint32_t pos=base_pos+i;
+            const auto* raw=h->slots[first+i].content.load_raw();
+            dst_ptrs[pos]=raw;
+            if(raw){
+                if(!TryRetainDescriptor(raw)){
+                    ReleaseUnpinnedMask(dst_ptrs,retained_mask);
+                    return false;
+                }
+                retained_mask|=(1ull<<pos);
+                ++frozen_slots;
+            }
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    for(uint32_t k=0;k<uniq_page_count;++k){
+        const auto& pg=uniq_pages[k].heap->pages[uniq_pages[k].page];
+        if(pg.mutex.has_active_writer()||
+           pg.seq.load(std::memory_order_acquire)!=uniq_pages[k].saved_seq||
+           pg.may_stamp.load(std::memory_order_relaxed)){
+            ReleaseUnpinnedMask(dst_ptrs,retained_mask);
+            return false;
+        }
+    }
+    for(uint32_t k=0;k<uniq_heap_count;++k){
+        if(!PreviousCurrent(pair,*uniq_heaps[k])){
+            ReleaseUnpinnedMask(dst_ptrs,retained_mask);
+            return false;
+        }
+    }
+    if(measured&&frozen_slots)measured->add(copy_frozen_unpinned,frozen_slots);
+    out_unpinned_mask=retained_mask;
+    return true;
+}
+struct FastSpanCollector {
+    WWMI_DescriptorSpan_v1 items[kFastCopyMaxSpans]{};
+    uint32_t spans=0;
+    uint32_t slots=0;
+    bool spilled=false;
+    FastCopySpillReason spill_reason=fast_spill_none;
+};
 void OnNativeDescriptorCopy(uint64_t api,WWMI_DescriptorSpans_v1 enumerate,void* spans,
     WWMI_DescriptorNative_v1 native,void* call) noexcept {
     auto* dev=reinterpret_cast<device*>(api);
@@ -383,7 +681,10 @@ void OnNativeDescriptorCopy(uint64_t api,WWMI_DescriptorSpans_v1 enumerate,void*
     auto* sampled=measured.kind>=0?&breakdown:nullptr;
     struct ReclaimOnOuterExit {
         bool outermost=false;
-        ~ReclaimOnOuterExit(){if(outermost)TryReclaimRetiredContents();}
+        ~ReclaimOnOuterExit(){
+            if(outermost)TryReclaimRetiredContents();
+            DrainDeferredRetiredHeaps();
+        }
     } reclaim_on_exit;
     CopyLaneGuard lane_guard;
     reclaim_on_exit.outermost=lane_guard.is_outermost();
@@ -391,20 +692,6 @@ void OnNativeDescriptorCopy(uint64_t api,WWMI_DescriptorSpans_v1 enumerate,void*
     if(lane_guard.has_copy_depth()){
         fast_cache=&ThreadFastHeapCache();
         fast_cache->sync(lane_guard.retire_gen);
-    }
-    AppDescriptorAdmission admission;
-    static thread_local CopyScratch reuse;
-    std::optional<CopyScratch> nested;
-    auto& w=reuse.busy?nested.emplace():reuse;
-    w.busy=true;const CopyUse clear{w};
-    CopyIngress ingress{admission.pages,w,*dev,0,true,!lane_guard.has_fast_raw()};
-    enumerate(spans,DescribeCopySpan,&ingress);
-    if(!lane_guard.has_fast_raw()){
-        uint64_t blocked=0;
-        admission.enter([&]() noexcept {
-            if(sampled&&!blocked)blocked=rt_cpu::now();
-        });
-        if(blocked)breakdown.elapsed(copy_raw_admission,blocked);
     }
     const auto forward=[&] {
         auto phase_native=rt_phase_cpu::begin(rt_phase_cpu::native_copy);
@@ -415,17 +702,461 @@ void OnNativeDescriptorCopy(uint64_t api,WWMI_DescriptorSpans_v1 enumerate,void*
         rt_phase_cpu::end(phase_native,stop);
         return hr;
     };
+    AppDescriptorAdmission admission;
+    static thread_local CopyScratch reuse;
+    std::optional<CopyScratch> nested;
+    CopyScratch* w_ptr=nullptr;
+    std::optional<CopyUse> clear_guard;
+    auto ensure_scratch=[&]() noexcept -> CopyScratch& {
+        if(!w_ptr){
+            w_ptr=reuse.busy?&nested.emplace():&reuse;
+            w_ptr->busy=true;
+            clear_guard.emplace(*w_ptr);
+        }
+        return *w_ptr;
+    };
+    const bool allow_fast_copy=lane_guard.has_copy_depth()&&lane_guard.has_fast_raw()&&
+        fast_cache!=nullptr&&!UavObserve::g_probe.enabled.load(std::memory_order_relaxed);
+    if(allow_fast_copy){
+        PreviousPair pair;
+        if(!PreviousDevice(dev,pair,false)){forward();return;}
+        FastSpanCollector collector{};
+        struct LazyIngress {
+            DescriptorPages& pages;
+            device& api;
+            decltype(ensure_scratch)& get_scratch;
+            std::optional<CopyIngress> built;
+            CopyIngress& get() noexcept {
+                if(!built)built.emplace(CopyIngress{pages,get_scratch(),api,0,true,false});
+                return *built;
+            }
+        } lazy_ingress{admission.pages,*dev,ensure_scratch,{}};
+        auto visit_lazy=[](void* context,const WWMI_DescriptorSpan_v1* span) noexcept {
+            auto* ctx=static_cast<std::pair<FastSpanCollector*,LazyIngress*>*>(context);
+            auto& self=*ctx->first;
+            if(!self.spilled){
+                const auto& d=span->destination;
+                const auto& s=span->source;
+                const bool valid_reg=span->count>=1u&&
+                    d.heap&&d.heap_creation&&d.increment&&d.slot<d.slots&&span->count<=d.slots-d.slot&&
+                    s.heap&&s.heap_creation&&s.increment&&s.slot<s.slots&&span->count<=s.slots-s.slot;
+                if(valid_reg&&self.spans<kFastCopyMaxSpans&&span->count<=kFastCopyMaxSlots-self.slots){
+                    self.items[self.spans++]=*span;
+                    self.slots+=span->count;
+                    return;
+                }
+                if(!valid_reg)self.spill_reason=fast_spill_raw;
+                else if(self.spans>=kFastCopyMaxSpans)self.spill_reason=fast_spill_spans;
+                else self.spill_reason=fast_spill_slots;
+                self.spilled=true;
+                auto& ing=ctx->second->get();
+                for(uint32_t i=0;i<self.spans;++i)DescribeCopySpan(&ing,&self.items[i]);
+            }
+            DescribeCopySpan(&ctx->second->get(),span);
+        };
+        std::pair<FastSpanCollector*,LazyIngress*> ctx{&collector,&lazy_ingress};
+        enumerate(spans,visit_lazy,&ctx);
+        if(!collector.spilled){
+            if(collector.spans==0){forward();return;}
+            measured.add(collector.slots);
+            phase_copy.add(collector.slots);
+            if(collector.spans==1){
+                const auto& sp=collector.items[0];
+                const uint32_t count=sp.count;
+                const uint64_t t_resolve=sampled?rt_cpu::now():0;
+                PreviousHeap* dst=fast_cache->find(sp.destination.heap,sp.destination.heap_creation,pair.epoch);
+                if(dst&&(dst->retired.load(std::memory_order_acquire)||!dst->flat.live()||!CopyRangeMatchesHeap(dst,sp.destination)))
+                    dst=nullptr;
+                PreviousHeap* src=nullptr;
+                if(dst){
+                    if(sp.source.heap==sp.destination.heap&&sp.source.heap_creation==sp.destination.heap_creation)
+                        src=CopyRangeMatchesHeap(dst,sp.source)?dst:nullptr;
+                    else{
+                        src=fast_cache->find(sp.source.heap,sp.source.heap_creation,pair.epoch);
+                        if(src&&(src->retired.load(std::memory_order_acquire)||!src->flat.live()||!CopyRangeMatchesHeap(src,sp.source)))
+                            src=nullptr;
+                    }
+                }
+                if(dst&&src){
+                    if(sampled)breakdown.elapsed(copy_phase_resolve,t_resolve);
+                    const uint64_t t_freeze=sampled?rt_cpu::now():0;
+                    const DescriptorContent* frozen_ptrs[kFastCopyMaxSlots];
+                    uint64_t unpinned_mask=0;
+                    if(TryFreezeSpanRawLockFree(*src,pair,sp.source.slot,count,frozen_ptrs,unpinned_mask,sampled)){
+                        if(sampled)breakdown.elapsed(copy_phase_freeze,t_freeze);
+                        if(FAILED(forward())){
+                            if(unpinned_mask)ReleaseUnpinnedMask(frozen_ptrs,unpinned_mask);
+                            return;
+                        }
+                        const uint64_t t_commit=sampled?rt_cpu::now():0;
+                        const uint32_t dst_first=sp.destination.slot;
+                        const uint32_t p0=PreviousPageIndex(dst_first);
+                        const uint32_t p1=PreviousPageIndex(dst_first+count-1u);
+                        const uint64_t version=dst->reserve_write_versions(1);
+                        for(uint32_t p=p0;p<=p1;++p)dst->pages[p].mutex.lock_copy_write();
+                        const DescriptorContent* displaced[kFastCopyMaxSlots];
+                        uint32_t disp_count=0;
+                        bool published=false;
+                        if(PreviousCurrent(pair,*dst)){
+                            auto* target=dst->slots.get()+dst_first;
+                            for(uint32_t i=0;i<count;++i){
+                                const auto* nv=frozen_ptrs[i];
+                                const auto* cur=target[i].content.load_relaxed();
+                                if(cur!=nv){
+                                    target[i].content.store_release(nv);
+                                    unpinned_mask&=~(1ull<<i);
+                                    if(cur)displaced[disp_count++]=cur;
+                                }
+                                StampDescriptorWrite(target[i],version,2);
+                            }
+                            if(!dst->is_vis){
+                                for(uint32_t p=p0;p<=p1;++p)
+                                    dst->pages[p].seq.fetch_add(1,std::memory_order_release);
+                            }
+                            published=true;
+                        }
+                        for(uint32_t p=p1+1u;p>p0;--p)dst->pages[p-1u].mutex.unlock_copy_write();
+                        if(unpinned_mask)ReleaseUnpinnedMask(frozen_ptrs,unpinned_mask);
+                        for(uint32_t k=0;k<disp_count;++k)ReleaseDescriptor(displaced[k]);
+                        if(published&&UavObserve::g_probe.enabled.load(std::memory_order_relaxed)){
+                            try{
+                                for(uint32_t i=0;i<count;++i)
+                                    UavObserve::g_probe.copy({sp.destination.heap,dst_first+i},
+                                        {sp.source.heap,sp.source.slot+i},
+                                        sp.source.cpu+uint64_t(i)*sp.destination.increment,true);
+                            }catch(...){}
+                        }
+                        if(sampled){
+                            breakdown.elapsed(copy_phase_commit,t_commit);
+                            g_copy_fast_hits.fetch_add(1,std::memory_order_relaxed);
+                        }
+                        return;
+                    }
+                    collector.spill_reason=fast_spill_freeze;
+                }else{
+                    collector.spill_reason=fast_spill_miss;
+                }
+                DescribeCopySpan(&lazy_ingress.get(),&sp);
+            }else{
+                // Multi-span fast path (2..32 spans, total slots <= 64): coalesced
+                // heap resolution, coalesced source seqlock validation, and
+                // coalesced destination page locks + single seq bump per written page.
+                const uint64_t t_resolve=sampled?rt_cpu::now():0;
+                PreviousHeap* src_heaps[kFastCopyMaxSpans];
+                uint32_t span_offsets[kFastCopyMaxSpans];
+                uint32_t span_dst_heap_idx[kFastCopyMaxSpans];
+                struct FastDstHeap {
+                    PreviousHeap* heap;
+                    uint32_t span_count;
+                    bool live;
+                    uint64_t next_version;
+                };
+                struct FastDstPage {
+                    PreviousHeap* heap;
+                    uint64_t generation;
+                    uint32_t page;
+                    uint32_t touched_mask;
+                    uint32_t heap_slot_idx;
+                };
+                FastDstHeap dst_uniq_heaps[kFastCopyMaxSpans];
+                uint32_t dst_heap_count=0;
+                FastDstPage dst_pages[kFastCopyMaxPages];
+                uint32_t dst_page_count=0;
+
+                uint64_t last_dst_handle=0,last_dst_gen=0;
+                PreviousHeap* last_dst_heap=nullptr;
+                uint32_t last_dst_idx=0;
+                uint64_t last_src_handle=0,last_src_gen=0;
+                PreviousHeap* last_src_heap=nullptr;
+                PreviousHeap* first_src_heap=nullptr;
+                bool single_src_heap=true;
+
+                bool resolve_ok=true;
+                uint32_t cur_offset=0;
+                for(uint32_t s=0;s<collector.spans;++s){
+                    const auto& sp=collector.items[s];
+                    const auto& dr=sp.destination;
+                    const auto& sr=sp.source;
+                    span_offsets[s]=cur_offset;
+                    cur_offset+=sp.count;
+
+                    PreviousHeap* dh=nullptr;
+                    uint32_t d_idx=0;
+                    if(last_dst_heap&&dr.heap==last_dst_handle&&dr.heap_creation==last_dst_gen){
+                        if(CopyRangeMatchesHeap(last_dst_heap,dr)){
+                            dh=last_dst_heap;
+                            d_idx=last_dst_idx;
+                        }
+                    }else{
+                        dh=fast_cache->find(dr.heap,dr.heap_creation,pair.epoch);
+                        if(dh&&(dh->retired.load(std::memory_order_acquire)||!dh->flat.live()||!CopyRangeMatchesHeap(dh,dr)))
+                            dh=nullptr;
+                        if(dh){
+                            d_idx=dst_heap_count;
+                            for(uint32_t k=0;k<dst_heap_count;++k){
+                                if(dst_uniq_heaps[k].heap==dh){d_idx=k;break;}
+                            }
+                            if(d_idx==dst_heap_count)
+                                dst_uniq_heaps[dst_heap_count++]={dh,0,false,0};
+                            last_dst_handle=dr.heap;last_dst_gen=dr.heap_creation;
+                            last_dst_heap=dh;last_dst_idx=d_idx;
+                        }
+                    }
+                    if(!dh){collector.spill_reason=fast_spill_miss;resolve_ok=false;break;}
+                    span_dst_heap_idx[s]=d_idx;
+                    ++dst_uniq_heaps[d_idx].span_count;
+
+                    const uint32_t dst_first=dr.slot;
+                    const uint32_t p0=PreviousPageIndex(dst_first);
+                    const uint32_t p1=PreviousPageIndex(dst_first+sp.count-1u);
+                    for(uint32_t p=p0;p<=p1;++p){
+                        const uint32_t lo=(p==p0)?(dst_first&(previous_page_slots-1u)):0u;
+                        const uint32_t hi=(p==p1)?((dst_first+sp.count-1u)&(previous_page_slots-1u)):(previous_page_slots-1u);
+                        const uint32_t width=hi-lo+1u;
+                        const uint32_t bits=(width>=32u)?0xFFFFFFFFu:(((1u<<width)-1u)<<lo);
+                        uint32_t found=dst_page_count;
+                        for(uint32_t k=0;k<dst_page_count;++k){
+                            if(dst_pages[k].heap==dh&&dst_pages[k].page==p){found=k;break;}
+                        }
+                        if(found<dst_page_count){
+                            if(dst_pages[found].touched_mask&bits){
+                                collector.spill_reason=fast_spill_dup_dst;
+                                resolve_ok=false;break;
+                            }
+                            dst_pages[found].touched_mask|=bits;
+                        }else{
+                            if(dst_page_count>=kFastCopyMaxPages){
+                                collector.spill_reason=fast_spill_pages;
+                                resolve_ok=false;break;
+                            }
+                            dst_pages[dst_page_count++]={dh,dh->generation,p,bits,d_idx};
+                        }
+                    }
+                    if(!resolve_ok)break;
+
+                    PreviousHeap* sh=nullptr;
+                    if(last_src_heap&&sr.heap==last_src_handle&&sr.heap_creation==last_src_gen){
+                        if(CopyRangeMatchesHeap(last_src_heap,sr))sh=last_src_heap;
+                    }else if(sr.heap==dr.heap&&sr.heap_creation==dr.heap_creation){
+                        if(CopyRangeMatchesHeap(dh,sr)){
+                            sh=dh;
+                            last_src_handle=sr.heap;last_src_gen=sr.heap_creation;last_src_heap=sh;
+                        }
+                    }else{
+                        sh=fast_cache->find(sr.heap,sr.heap_creation,pair.epoch);
+                        if(sh&&(sh->retired.load(std::memory_order_acquire)||!sh->flat.live()||!CopyRangeMatchesHeap(sh,sr)))
+                            sh=nullptr;
+                        if(sh){
+                            last_src_handle=sr.heap;last_src_gen=sr.heap_creation;last_src_heap=sh;
+                        }
+                    }
+                    if(!sh){collector.spill_reason=fast_spill_miss;resolve_ok=false;break;}
+                    src_heaps[s]=sh;
+                    if(!first_src_heap)first_src_heap=sh;
+                    else if(sh!=first_src_heap)single_src_heap=false;
+                }
+                if(resolve_ok){
+                    if(sampled)breakdown.elapsed(copy_phase_resolve,t_resolve);
+                    const uint64_t t_freeze=sampled?rt_cpu::now():0;
+                    const DescriptorContent* frozen_ptrs[kFastCopyMaxSlots];
+                    uint64_t unpinned_mask=0;
+                    if(TryFreezeMultiSpanRawLockFree(collector.items,src_heaps,span_offsets,
+                        collector.spans,pair,single_src_heap,frozen_ptrs,unpinned_mask,sampled)){
+                        if(sampled)breakdown.elapsed(copy_phase_freeze,t_freeze);
+                        if(FAILED(forward())){
+                            if(unpinned_mask)ReleaseUnpinnedMask(frozen_ptrs,unpinned_mask);
+                            return;
+                        }
+                        const uint64_t t_commit=sampled?rt_cpu::now():0;
+                        if(dst_page_count==1&&dst_heap_count==1){
+                            PreviousHeap* const dh=dst_uniq_heaps[0].heap;
+                            PreviousPage& pg=dh->pages[dst_pages[0].page];
+                            pg.mutex.lock_copy_write();
+                            const DescriptorContent* displaced[kFastCopyMaxSlots];
+                            uint32_t disp_count=0;
+                            bool published=false;
+                            if(PreviousCurrent(pair,*dh)){
+                                uint64_t next_version=dh->reserve_write_versions(collector.spans);
+                                DescriptorSlot* const dh_slots=dh->slots.get();
+                                for(uint32_t s=0;s<collector.spans;++s){
+                                    const uint64_t span_version=next_version++;
+                                    const auto& sp=collector.items[s];
+                                    auto* target=dh_slots+sp.destination.slot;
+                                    const uint32_t base_pos=span_offsets[s];
+                                    for(uint32_t i=0;i<sp.count;++i){
+                                        const uint32_t pos=base_pos+i;
+                                        const auto* nv=frozen_ptrs[pos];
+                                        const auto* cur=target[i].content.load_relaxed();
+                                        if(cur!=nv){
+                                            target[i].content.store_release(nv);
+                                            unpinned_mask&=~(1ull<<pos);
+                                            if(cur)displaced[disp_count++]=cur;
+                                        }
+                                        StampDescriptorWrite(target[i],span_version,2);
+                                    }
+                                }
+                                if(!dh->is_vis)pg.seq.fetch_add(1,std::memory_order_release);
+                                published=true;
+                            }
+                            pg.mutex.unlock_copy_write();
+                            if(unpinned_mask)ReleaseUnpinnedMask(frozen_ptrs,unpinned_mask);
+                            for(uint32_t k=0;k<disp_count;++k)ReleaseDescriptor(displaced[k]);
+                            if(published&&UavObserve::g_probe.enabled.load(std::memory_order_relaxed)){
+                                try{
+                                    for(uint32_t s=0;s<collector.spans;++s){
+                                        const auto& sp=collector.items[s];
+                                        for(uint32_t i=0;i<sp.count;++i)
+                                            UavObserve::g_probe.copy({sp.destination.heap,sp.destination.slot+i},
+                                                {sp.source.heap,sp.source.slot+i},
+                                                sp.source.cpu+uint64_t(i)*sp.destination.increment,true);
+                                    }
+                                }catch(...){}
+                            }
+                            if(sampled){
+                                breakdown.elapsed(copy_phase_commit,t_commit);
+                                g_copy_fast_multi_hits.fetch_add(1,std::memory_order_relaxed);
+                                g_copy_fast_multi_spans.fetch_add(collector.spans,std::memory_order_relaxed);
+                                g_copy_fast_multi_dst_pages.fetch_add(1,std::memory_order_relaxed);
+                            }
+                            return;
+                        }
+                        // Sort unique destination pages in global (heap generation, page index)
+                        // order before acquiring locks to prevent AB-BA deadlocks across threads.
+                        for(uint32_t i=1;i<dst_page_count;++i){
+                            const FastDstPage key=dst_pages[i];
+                            uint32_t j=i;
+                            while(j>0&&(dst_pages[j-1u].generation>key.generation||
+                                (dst_pages[j-1u].generation==key.generation&&dst_pages[j-1u].page>key.page))){
+                                dst_pages[j]=dst_pages[j-1u];
+                                --j;
+                            }
+                            dst_pages[j]=key;
+                        }
+                        for(uint32_t k=0;k<dst_page_count;++k)
+                            dst_pages[k].heap->pages[dst_pages[k].page].mutex.lock_copy_write();
+                        for(uint32_t k=0;k<dst_heap_count;++k){
+                            auto& dh=dst_uniq_heaps[k];
+                            if(PreviousCurrent(pair,*dh.heap)){
+                                dh.live=true;
+                                dh.next_version=dh.heap->reserve_write_versions(dh.span_count);
+                            }
+                        }
+                        const DescriptorContent* displaced[kFastCopyMaxSlots];
+                        uint32_t disp_count=0;
+                        bool any_published=false;
+                        for(uint32_t s=0;s<collector.spans;++s){
+                            auto& dh=dst_uniq_heaps[span_dst_heap_idx[s]];
+                            if(!dh.live)continue;
+                            any_published=true;
+                            const uint64_t span_version=dh.next_version++;
+                            const auto& sp=collector.items[s];
+                            auto* target=dh.heap->slots.get()+sp.destination.slot;
+                            const uint32_t base_pos=span_offsets[s];
+                            for(uint32_t i=0;i<sp.count;++i){
+                                const uint32_t pos=base_pos+i;
+                                const auto* nv=frozen_ptrs[pos];
+                                const auto* cur=target[i].content.load_relaxed();
+                                if(cur!=nv){
+                                    target[i].content.store_release(nv);
+                                    unpinned_mask&=~(1ull<<pos);
+                                    if(cur)displaced[disp_count++]=cur;
+                                }
+                                StampDescriptorWrite(target[i],span_version,2);
+                            }
+                        }
+                        for(uint32_t k=0;k<dst_page_count;++k){
+                            if(dst_uniq_heaps[dst_pages[k].heap_slot_idx].live&&!dst_pages[k].heap->is_vis)
+                                dst_pages[k].heap->pages[dst_pages[k].page].seq.fetch_add(1,std::memory_order_release);
+                        }
+                        for(uint32_t k=dst_page_count;k>0;--k)
+                            dst_pages[k-1u].heap->pages[dst_pages[k-1u].page].mutex.unlock_copy_write();
+                        if(unpinned_mask)ReleaseUnpinnedMask(frozen_ptrs,unpinned_mask);
+                        for(uint32_t k=0;k<disp_count;++k)ReleaseDescriptor(displaced[k]);
+                        if(any_published&&UavObserve::g_probe.enabled.load(std::memory_order_relaxed)){
+                            try{
+                                for(uint32_t s=0;s<collector.spans;++s){
+                                    if(!dst_uniq_heaps[span_dst_heap_idx[s]].live)continue;
+                                    const auto& sp=collector.items[s];
+                                    for(uint32_t i=0;i<sp.count;++i)
+                                        UavObserve::g_probe.copy({sp.destination.heap,sp.destination.slot+i},
+                                            {sp.source.heap,sp.source.slot+i},
+                                            sp.source.cpu+uint64_t(i)*sp.destination.increment,true);
+                                }
+                            }catch(...){}
+                        }
+                        if(sampled){
+                            breakdown.elapsed(copy_phase_commit,t_commit);
+                            g_copy_fast_multi_hits.fetch_add(1,std::memory_order_relaxed);
+                            g_copy_fast_multi_spans.fetch_add(collector.spans,std::memory_order_relaxed);
+                            g_copy_fast_multi_dst_pages.fetch_add(dst_page_count,std::memory_order_relaxed);
+                        }
+                        return;
+                    }
+                    collector.spill_reason=fast_spill_freeze;
+                }
+                auto& ing=lazy_ingress.get();
+                for(uint32_t s=0;s<collector.spans;++s)DescribeCopySpan(&ing,&collector.items[s]);
+            }
+        }
+        auto& gen=*lazy_ingress.built;
+        auto& w=gen.work;
+        if(!collector.spilled){
+            // measured/phase_copy slots already added above
+        }else{
+            measured.add(gen.slots);
+            phase_copy.add(gen.slots);
+        }
+        if(sampled){
+            g_copy_generic_hits.fetch_add(1,std::memory_order_relaxed);
+            RecordFastCopySpill(collector.spill_reason);
+        }
+        if(gen.complete)try{
+            const uint64_t t_resolve=sampled?rt_cpu::now():0;
+            ResolveCopyTickets(w,pair,sampled,lane_guard,fast_cache);
+            if(sampled)breakdown.elapsed(copy_phase_resolve,t_resolve);
+            const uint64_t t_freeze=sampled?rt_cpu::now():0;
+            FreezeCopySources(w,pair,sampled,lane_guard);
+            if(sampled)breakdown.elapsed(copy_phase_freeze,t_freeze);
+        }catch(...){gen.complete=false;}
+        if(FAILED(forward()))return;
+        if(gen.complete)try{
+            const uint64_t t_commit=sampled?rt_cpu::now():0;
+            CommitCopyTickets(w,pair,sampled);
+            if(sampled)breakdown.elapsed(copy_phase_commit,t_commit);
+            return;
+        }catch(...){}
+        InvalidateCopy invalidate{pair,sampled,w.native_increment};
+        try{enumerate(spans,InvalidateCopiedSpan,&invalidate);}catch(...){}
+        return;
+    }
+    auto& w=ensure_scratch();
+    CopyIngress ingress{admission.pages,w,*dev,0,true,!lane_guard.has_fast_raw()};
+    enumerate(spans,DescribeCopySpan,&ingress);
+    if(!lane_guard.has_fast_raw()){
+        uint64_t blocked=0;
+        admission.enter([&]() noexcept {
+            if(sampled&&!blocked)blocked=rt_cpu::now();
+        });
+        if(blocked)breakdown.elapsed(copy_raw_admission,blocked);
+    }
     PreviousPair pair;
     if(!PreviousDevice(dev,pair,false)){forward();return;} // reset does not waive CPU admission
     measured.add(ingress.slots);
     phase_copy.add(ingress.slots);
+    if(sampled)g_copy_generic_hits.fetch_add(1,std::memory_order_relaxed);
     if(ingress.complete)try{
+        const uint64_t t_resolve=sampled?rt_cpu::now():0;
         ResolveCopyTickets(w,pair,sampled,lane_guard,fast_cache);
+        if(sampled)breakdown.elapsed(copy_phase_resolve,t_resolve);
+        const uint64_t t_freeze=sampled?rt_cpu::now():0;
         FreezeCopySources(w,pair,sampled,lane_guard);
+        if(sampled)breakdown.elapsed(copy_phase_freeze,t_freeze);
     }catch(...){ingress.complete=false;}
     if(FAILED(forward()))return;
     if(ingress.complete)try{
+        const uint64_t t_commit=sampled?rt_cpu::now():0;
         CommitCopyTickets(w,pair,sampled);
+        if(sampled)breakdown.elapsed(copy_phase_commit,t_commit);
         return;
     }catch(...){}
     InvalidateCopy invalidate{pair,sampled,w.native_increment};

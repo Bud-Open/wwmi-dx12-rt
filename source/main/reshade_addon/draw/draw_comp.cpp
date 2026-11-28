@@ -10,6 +10,7 @@ thread_local uint64_t wwmi_rt_section_token=0;
 // by their engine, with this draw's hooks (RabbitFX latches, the section's drawindexed, the restore
 // callback). See draw_inject.h.
 #include "../addon_common.h"
+#include "rt_cpu_phase.hpp"
 #include "draw_hook.h"
 #include "../mods/claim_state.h"
 #include "../instrumentation/gpu_timer.h"
@@ -627,8 +628,9 @@ static bool DrawComponentImpl(InjectFrame& fr, int dm, const WwmiMod::Component*
     uint32_t did = 0;
     if (g_wcl_draw && wc) {
         // DI:CompSetup: everything before PortSect; ended right before it (a span, not a block).
-        ProfScope           _di_compsetup(PROF_DI_CompSetup);
-        ProfScope           _cs_prep(PROF_CS_Prep);
+        ProfScope                      _di_compsetup(PROF_DI_CompSetup);
+        rt_phase_cpu::ConditionalScope _gate_setup(rt_phase_cpu::gate_active(), rt_phase_cpu::gate_setup);
+        ProfScope                      _cs_prep(PROF_CS_Prep);
         const std::wstring& uns = g_geomods[dm].wcl_ns;
         const std::wstring  fq = PortComponentSection(dm, wc->index, wc->tail, uns);
 
@@ -1151,6 +1153,7 @@ static bool DrawComponentImpl(InjectFrame& fr, int dm, const WwmiMod::Component*
                 hk.cs_enter = [](const std::wstring&, const std::wstring& t) {
                     if (t.find(L"skeletonmerger") != std::wstring::npos) ++t_x23_merges; };
             _cs_secttex.End();
+            _gate_setup.finish();
             _di_compsetup.End();
             bool ran;
             {
@@ -1186,8 +1189,11 @@ static bool DrawComponentImpl(InjectFrame& fr, int dm, const WwmiMod::Component*
                         wwmi_rt_section_token=old;
                     }
                 } capture{previous_token,wwmi_rt_section_token};
-                ran = PortRunSection(fq, hk, index_count, first_index, first_instance,
-                    CmdGfx(cmd_list).gfx_pso, skip_orig);
+                {
+                    rt_phase_cpu::ConditionalScope _gate_vm(rt_phase_cpu::gate_active(), rt_phase_cpu::gate_vm);
+                    ran = PortRunSection(fq, hk, index_count, first_index, first_instance,
+                        CmdGfx(cmd_list).gfx_pso, skip_orig);
+                }
                 const bool private_pass=RtHasPrivateSection();
                 // The VM can run GPU commands after its last queued draw,
                 // including in post. Pay before recording the private draw.

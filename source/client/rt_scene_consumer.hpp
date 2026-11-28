@@ -147,13 +147,8 @@ class RaySceneConsumer {
 public:
     RaygenIdentity raygens;
     bool enabled=false;
-    void init_pipeline(uint64_t device,api::pipeline state,unsigned count,const api::pipeline_subobject *subobjects,
-                       WWMI_RtCurrentNativeStateObjectFn_v1 read_native){
-        raygens.init(state,count,subobjects);
-        if(!read_native)return;
-        WWMI_RtNativeStateObject_v1 view{};
-        if(read_native(state.handle,&view,sizeof(view))||view.state!=state.handle||view.device!=device)return;
-        raygens.init_native(view,count,subobjects,[&](uint64_t root){
+    RaygenIdentity::NativeInitSnapshot snapshot_native_pipeline(const WWMI_RtNativeStateObject_v1 &view)const{
+        return raygens.snapshot_native(view,[&](uint64_t root){
             const auto found=table_layouts_.find(root);
             return found==table_layouts_.end()?uint64_t{}:found->second.generation;
         },[&](uint64_t root)->std::optional<unsigned>{
@@ -161,6 +156,19 @@ public:
             if(found==local_argument_bytes_.end())return {};
             return found->second;
         });
+    }
+    void commit_native_pipeline(RaygenIdentity::PreparedNative &&built){
+        raygens.commit_native(std::move(built));
+    }
+    void init_pipeline(uint64_t device,api::pipeline state,unsigned count,const api::pipeline_subobject *subobjects,
+                       WWMI_RtCurrentNativeStateObjectFn_v1 read_native){
+        raygens.init(state,count,subobjects);
+        if(!read_native)return;
+        WWMI_RtNativeStateObject_v1 view{};
+        if(read_native(state.handle,&view,sizeof(view))||view.state!=state.handle||view.device!=device)return;
+        const auto snap=snapshot_native_pipeline(view);
+        if(auto built=RaygenIdentity::build_native_unlocked(view,count,subobjects,snap))
+            commit_native_pipeline(std::move(*built));
     }
     void layout(api::pipeline_layout key,unsigned count,const api::pipeline_layout_param *params){
         table_layouts_.erase(key.handle);

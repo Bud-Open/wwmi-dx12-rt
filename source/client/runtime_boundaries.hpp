@@ -1,4 +1,5 @@
 #pragma once
+#include "client_lock_stats.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -86,9 +87,26 @@ public:
 class RuntimeMutex {
     std::mutex mutex_;
     std::atomic<DWORD> owner_{0};
+    std::atomic<std::uint64_t> owner_sample_{0};
 public:
-    void lock(){mutex_.lock();owner_.store(GetCurrentThreadId(),std::memory_order_release);}
-    void unlock(){owner_.store(0,std::memory_order_release);mutex_.unlock();}
+    void lock(){
+        mutex_.lock();
+        owner_.store(GetCurrentThreadId(),std::memory_order_release);
+    }
+    void unlock(){
+        if(owner_sample_.load(std::memory_order_relaxed)!=0)owner_sample_.store(0,std::memory_order_release);
+        owner_.store(0,std::memory_order_release);
+        mutex_.unlock();
+    }
+    void publish_owner_sample(std::uint64_t packed)noexcept{
+        owner_sample_.store(packed,std::memory_order_release);
+    }
+    void clear_owner_sample()noexcept{
+        owner_sample_.store(0,std::memory_order_release);
+    }
+    std::uint64_t owner_sample()const noexcept{
+        return owner_sample_.load(std::memory_order_acquire);
+    }
     DWORD owner()const{return owner_.load(std::memory_order_acquire);}
 };
 // Bounded ReShade log boundaries, armed only by an actually recorded private

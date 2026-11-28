@@ -230,7 +230,8 @@ void on_destroy_resource(device*, resource res)
     }
     if (tex_known) {
         std::lock_guard l(g_tex_mutex);
-        if (g_res_texhash.erase(res.handle)) g_res_texhash_gen.fetch_add(1, std::memory_order_acq_rel);
+        extern bool     TexResHashEraseLocked(uint64_t key);
+        TexResHashEraseLocked(res.handle);
         g_modtex_res.erase(res.handle);
         g_res_inherited.erase(res.handle);
         g_tex_dims.erase(res.handle);
@@ -317,18 +318,7 @@ static void TexNoSwapNote(uint64_t heap, uint32_t off, ID3D12Resource* res, cons
 
 bool TrackedSlotOfCpu(uint64_t cpu, HeapKey* out)
 {
-    static uint32_t s_inc = 0;
-    if (!cpu || !g_d3d12_device) return false;
-    if (!s_inc) s_inc = g_d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const uint32_t inc = s_inc;
-    bool           hit = false;
-    g_heap_to_res.for_each_heap([&](uint64_t heap, uint64_t lo, uint32_t n, bool, FlatHeapMap::Slot*) {
-        if (!lo || !inc || cpu < lo || cpu >= lo + (uint64_t)n * inc || (cpu-lo)%inc) return false;
-        *out = HeapKey{ heap, (uint32_t)((cpu - lo) / inc) };
-        hit = true;
-        return true;
-    });
-    return hit;
+    return g_heap_to_res.find_cpu_entry(cpu, CurrentDescriptorIncrement(), out) != nullptr;
 }
 
 void ResetDescriptorTracking()

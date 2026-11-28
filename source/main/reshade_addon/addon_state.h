@@ -56,6 +56,8 @@ struct GeoMod {
     uint32_t     last_char_frame = 0; // g_frame_id of the last claimed draw of this unit's character; 0 = never
     float        det_at_keys = 0.f;   // $object_detected sampled at key-poll time, before [Present]'s post pass clears it
     bool         geom_enabled = true; // $mod_enabled sampled after [Present]'s post pass; what ModGeomEnabled answers
+    bool         has_merged_skeleton = false; // static catalog flag: mod declares ResourceMergedSkeleton
+    bool         any_remapped = false;        // static catalog flag: any component uses remapped skeleton
     bool         aux_skip_only = false; // auxiliary skip-only mesh on a non-primary IB hash under the same namespace
     int          aux_parent_mod = -1;
     // this unit's share of the heartbeat's sect= / skip= / replaced=

@@ -46,6 +46,23 @@ class InputCollector {
     std::vector<NativeMeshIntent> intents_;
     NativeDiscovery discovery_;
     bool native_receipts_=false;
+    bool discovery_interested_cached_=true;
+    static constexpr std::uint8_t kCopyBeforeActive=1u<<0;
+    static constexpr std::uint8_t kCopyRecActive=1u<<1;
+    std::atomic<std::uint8_t> native_copy_mask_{kCopyBeforeActive|kCopyRecActive};
+    void arm_native_copy_mask(std::uint8_t bits)noexcept{
+        native_copy_mask_.fetch_or(bits,std::memory_order_seq_cst);
+    }
+    void refresh_discovery_interest_locked()noexcept{
+        discovery_interested_cached_=native_receipts_&&discovery_.interested();
+    }
+    void refresh_native_copy_mask_locked()noexcept{
+        if(!native_receipts_){native_copy_mask_.store(0,std::memory_order_release);return;}
+        std::uint8_t mask=0;
+        if(discovery_interested_cached_||discovery_.has_active_before_work())mask|=kCopyBeforeActive;
+        if(discovery_.has_unforwarded_upload_copy()||std::any_of(content_.begin(),content_.end(),[](const Content &c){return !c.forwarded;}))mask|=kCopyRecActive;
+        native_copy_mask_.store(mask,std::memory_order_release);
+    }
     std::shared_ptr<const std::vector<NativeMeshIntent>> discovery_interests_=std::make_shared<const std::vector<NativeMeshIntent>>();
     std::vector<std::shared_ptr<const ModPack>> packs_;
     std::mutex mutex_;
@@ -93,7 +110,44 @@ class InputCollector {
         std::uint64_t native_queue=0; // actual native post-Execute, never an observed completion
         std::shared_ptr<const PoseInputs> submitted_poses;
     };
+    struct PositionStampKey {
+        ResourceKey resource;
+        std::uint64_t offset=0,bytes=0;
+        bool operator==(const PositionStampKey &)const=default;
+    };
+    struct PositionStampKeyHash {
+        std::size_t operator()(const PositionStampKey &k)const noexcept{
+            std::uint64_t h=k.resource.object*0x9e3779b97f4a7c15ull;
+            h^=k.resource.creation+0x9e3779b97f4a7c15ull+(h<<6)+(h>>2);
+            h^=k.offset+0x9e3779b97f4a7c15ull+(h<<6)+(h>>2);
+            h^=k.bytes+0x9e3779b97f4a7c15ull+(h<<6)+(h>>2);
+            return static_cast<std::size_t>(h);
+        }
+    };
     std::vector<PositionStamp> position_stamps_;
+    std::unordered_map<PositionStampKey,std::size_t,PositionStampKeyHash> position_stamp_index_;
+    void rebuild_position_stamp_index_locked(){
+        position_stamp_index_.clear();
+        position_stamp_index_.reserve(position_stamps_.size());
+        for(std::size_t i=0;i<position_stamps_.size();++i){
+            const auto &s=position_stamps_[i];
+            position_stamp_index_.emplace(PositionStampKey{s.resource,s.offset,s.bytes},i);
+        }
+    }
+    void add_position_stamp_locked(const PositionStamp &stamp){
+        const std::size_t idx=position_stamps_.size();
+        position_stamps_.push_back(stamp);
+        position_stamp_index_.insert_or_assign(PositionStampKey{stamp.resource,stamp.offset,stamp.bytes},idx);
+    }
+    template<class Pred> bool erase_position_stamps_if_locked(Pred &&pred){
+        const bool changed=std::erase_if(position_stamps_,std::forward<Pred>(pred))!=0;
+        if(changed)rebuild_position_stamp_index_locked();
+        return changed;
+    }
+    const PositionStamp *find_position_stamp_locked(ResourceKey key,std::uint64_t offset,std::uint64_t bytes)const noexcept{
+        const auto it=position_stamp_index_.find(PositionStampKey{key,offset,bytes});
+        return it==position_stamp_index_.end()?nullptr:&position_stamps_[it->second];
+    }
     struct SubmittedSkinFence {Recording recording;NativeIdentityFence signal;bool invalidated=false;};
     std::deque<SubmittedSkinFence> submitted_skin_fences_;
     struct ProvedComponentIb {
@@ -165,8 +219,12 @@ public:
         WWMI_RtModAcquirePositionFn_v1 position,WWMI_RtModStampRecordingFn_v1 stamp,NativeDrawIdentityCache *identity_cache=nullptr,std::function<bool(ResourceKey)> resource_live={},std::function<bool(ResourceKey,std::uint64_t,std::uint64_t)> resource_unique={})
         :device_(device),source_(source),position_(position),stamp_(stamp),identity_cache_(identity_cache),resource_live_(std::move(resource_live)),resource_unique_(std::move(resource_unique)),registry_(std::move(registry)),discovery_(registry_){}
     ~InputCollector(){if(stamp_)for(const auto &[_,list]:lists_)stamp_(list.epoch.list,0,0);}
-    void enable_native_discovery(){native_receipts_=true;} // before Runtime publication; legacy constructors retain their contract
+    void enable_native_discovery(){native_receipts_=true;native_copy_mask_.store(kCopyBeforeActive|kCopyRecActive,std::memory_order_release);} // before Runtime publication; legacy constructors retain their contract
     bool discovery_interested()const noexcept;
+    bool may_need_native_copy(bool recorded)const noexcept{
+        const std::uint8_t bit=recorded?kCopyRecActive:kCopyBeforeActive;
+        return (native_copy_mask_.load(std::memory_order_acquire)&bit)!=0;
+    }
     void native_copy(api::command_list *,api::resource,std::uint64_t,api::resource,std::uint64_t,std::uint64_t,bool recorded);
     void native_written(api::resource,std::uint64_t,std::uint64_t);
     void native_unknown();
@@ -186,9 +244,15 @@ public:
     void set_packs(const std::vector<std::shared_ptr<const ModPack>> &packs){std::lock_guard lock(mutex_);packs_=packs;}
     void set_catalog(const PackCatalog &catalog){
         std::lock_guard lock(mutex_);packs_=catalog.packs;intents_=catalog.intents;
-        has_skip_intents_=std::any_of(intents_.begin(),intents_.end(),[](const NativeMeshIntent &i){return i.skip_only;});
+        std::vector<NativeMeshIntent> enabled_intents;
+        enabled_intents.reserve(intents_.size());
+        for(const auto &i:intents_)if(i.enabled)enabled_intents.push_back(i);
+        has_skip_intents_=std::any_of(enabled_intents.begin(),enabled_intents.end(),[](const NativeMeshIntent &i){return i.skip_only;});
         if(!has_skip_intents_){aux_skin_writers_.clear();aux_probe_targets_.clear();aux_rest_hashes_.clear();}
-        discovery_.set_intents(intents_);std::atomic_store(&discovery_interests_,std::make_shared<const std::vector<NativeMeshIntent>>(intents_));
+        arm_native_copy_mask(kCopyBeforeActive|kCopyRecActive);
+        discovery_.set_intents(enabled_intents);std::atomic_store(&discovery_interests_,std::make_shared<const std::vector<NativeMeshIntent>>(std::move(enabled_intents)));
+        refresh_discovery_interest_locked();
+        refresh_native_copy_mask_locked();
     }
     // Ledger application consumes the live creation callback's VA snapshot;
     // it never queries the native object while holding collector/Runtime locks.
@@ -196,11 +260,16 @@ public:
     ResourceKey destroy_resource(api::resource,std::uint64_t creation=0);
     ResourceKey key_of(api::resource); // metadata only, including a pending old generation
     void init_list(api::command_list *);
+    Recording init_list_deferred_stamp(api::command_list *);
     void reset_list(api::command_list *);
+    Recording reset_list_deferred_stamp(api::command_list *);
     void destroy_list(api::command_list *);
+    void destroy_list_deferred_stamp(api::command_list *);
     void init_layout(api::pipeline_layout,unsigned,const api::pipeline_layout_param *);
     void destroy_layout(api::pipeline_layout);
+    static skin::Kind classify_compute_shader(const void *code,std::size_t bytes);
     void init_pipeline(api::pipeline,api::pipeline_layout,unsigned,const api::pipeline_subobject *);
+    void init_pipeline_classified(api::pipeline,api::pipeline_layout,skin::Kind,bool compute,const void *capture_code,std::size_t capture_bytes);
     void destroy_pipeline(api::pipeline);
     // Negative-only preflight. Positive callbacks still drain resets and
     // recheck the binding under the ordinary Runtime/collector locks.

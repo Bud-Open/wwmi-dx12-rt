@@ -523,3 +523,4 @@ EXPORTS
 	WWMI_ModUiSetShieldRects_v1 @610
 	WWMI_ModUiSetInputBypass_v1 @611
 	WWMI_CurrentUploadFootprint_v1 @612
+	WWMI_RegisterPostExecute_v1 @613

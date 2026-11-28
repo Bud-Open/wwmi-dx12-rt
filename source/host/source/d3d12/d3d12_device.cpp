@@ -299,7 +299,10 @@ ULONG   STDMETHODCALLTYPE D3D12Device::Release()
 	if (ref_orig != 0) // Verify internal reference count
 		reshade::log::message(reshade::log::level::warning, "Reference count for ID3D12Device%hu object %p (%p) is inconsistent (%lu).", interface_version, this, orig, ref_orig);
 	else
+	{
+		static_assert(alignof(D3D12Device) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__, "D3D12Device must not be over-aligned for unaligned sized delete");
 		operator delete(this, sizeof(D3D12Device));
+	}
 	return 0;
 }
 
@@ -868,19 +871,69 @@ void    STDMETHODCALLTYPE D3D12Device::CopyDescriptors(UINT NumDestDescriptorRan
 		}
 
 		const bool track_as = DescriptorHeapsType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		bool touches_as = false;
-		const size_t range_count=size_t(NumDestDescriptorRanges)+NumSrcDescriptorRanges;
-		temp_mem<wwmi::rt_as::Range,32> decoded(track_as?range_count:0);
-		const auto decode = [&](D3D12_CPU_DESCRIPTOR_HANDLE tagged,size_t index) {
-			const auto native = convert_to_original_cpu_descriptor_handle(tagged,track_as?&decoded[index]:nullptr);
-			if(track_as)touches_as |= decoded[index].tracked();
-			return native;
-		};
+		if (NumDestDescriptorRanges == 1 && NumSrcDescriptorRanges == 1)
+		{
+			const UINT dst_count = pDestDescriptorRangeSizes != nullptr ? pDestDescriptorRangeSizes[0] : 1;
+			const UINT src_count = pSrcDescriptorRangeSizes != nullptr ? pSrcDescriptorRangeSizes[0] : 1;
+			if (dst_count == src_count && dst_count > 0)
+			{
+				wwmi::rt_as::Range dest_as, src_as;
+				const auto native_dest = convert_to_original_cpu_descriptor_handle(pDestDescriptorRangeStarts[0], track_as ? &dest_as : nullptr);
+				const auto native_src = convert_to_original_cpu_descriptor_handle(pSrcDescriptorRangeStarts[0], track_as ? &src_as : nullptr);
+				const auto forward_single = [&](WWMI_CopyOrigQpc_v1 *orig) -> HRESULT {
+					const bool src_occ = track_as && src_as.has_any_occupied(dst_count);
+					const bool dst_occ = track_as && dest_as.has_any_occupied(dst_count);
+					if (!src_occ && !dst_occ)
+					{
+						wwmi::descriptor_publish::copy_orig(orig, [&] {
+							_orig->CopyDescriptors(1, &native_dest, pDestDescriptorRangeSizes, 1, &native_src, pSrcDescriptorRangeSizes, DescriptorHeapsType);
+						});
+						return S_OK;
+					}
+					wwmi::rt_as::Copy captured { dest_as, dst_count, {} };
+					bool as_failed = false;
+					if (src_occ) try { captured = wwmi::rt_as::snapshot_copy(dest_as, src_as, dst_count); }
+					catch (...) { as_failed = true; }
+					wwmi::descriptor_publish::copy_orig(orig, [&] {
+						_orig->CopyDescriptors(1, &native_dest, pDestDescriptorRangeSizes, 1, &native_src, pSrcDescriptorRangeSizes, DescriptorHeapsType);
+					});
+					if (!as_failed && (!captured.known.empty() || dst_occ)) try { wwmi::rt_as::copy_merge::commit_copy(captured); } catch (...) { as_failed = true; }
+					if (as_failed) wwmi::rt_as::clear(dest_as, dst_count);
+					return S_OK;
+				};
+				if (track_as && wwmi::descriptor_publish::enabled())
+				{
+					const WWMI_DescriptorSpan_v1 span { wwmi::descriptor_publish::copy_range(dest_as, native_dest),
+						wwmi::descriptor_publish::copy_range(src_as, native_src), dst_count, 0 };
+					auto enumerate = [&](auto visit, void *user) { visit(user, &span); };
+					wwmi::descriptor_publish::copy(this, enumerate, forward_single);
+				}
+				else forward_single(nullptr);
+				return;
+			}
+		}
+
+		bool any_dst_tracked = false;
+		bool any_src_tracked = false;
+		const size_t range_count = size_t(NumDestDescriptorRanges) + NumSrcDescriptorRanges;
+		temp_mem<wwmi::rt_as::Range, 32> decoded(track_as ? range_count : 0);
 		temp_mem<D3D12_CPU_DESCRIPTOR_HANDLE, 32> descriptor_range_starts(range_count);
 		for (UINT i = 0; i < NumDestDescriptorRanges; ++i)
-			descriptor_range_starts[i] = decode(pDestDescriptorRangeStarts[i],i);
+		{
+			descriptor_range_starts[i] = convert_to_original_cpu_descriptor_handle(
+				pDestDescriptorRangeStarts[i], track_as ? &decoded[i] : nullptr);
+			if (track_as)
+				any_dst_tracked |= decoded[i].tracked();
+		}
 		for (UINT i = 0; i < NumSrcDescriptorRanges; ++i)
-			descriptor_range_starts[size_t(NumDestDescriptorRanges)+i] = decode(pSrcDescriptorRangeStarts[i],size_t(NumDestDescriptorRanges)+i);
+		{
+			const size_t idx = size_t(NumDestDescriptorRanges) + i;
+			descriptor_range_starts[idx] = convert_to_original_cpu_descriptor_handle(
+				pSrcDescriptorRangeStarts[i], track_as ? &decoded[idx] : nullptr);
+			if (track_as)
+				any_src_tracked |= decoded[idx].tracked();
+		}
+		const bool touches_as = any_dst_tracked || any_src_tracked;
 
 		const auto forward = [&](WWMI_CopyOrigQpc_v1 *orig) {
 			wwmi::descriptor_publish::copy_orig(orig, [&] {
@@ -894,7 +947,22 @@ void    STDMETHODCALLTYPE D3D12Device::CopyDescriptors(UINT NumDestDescriptorRan
 			return;
 		}
 
+		const UINT single_dst_total = (NumDestDescriptorRanges == 1) ? (pDestDescriptorRangeSizes != nullptr ? pDestDescriptorRangeSizes[0] : 1u) : 0u;
+		const bool single_dst_unit_srcs = (NumDestDescriptorRanges == 1) && (pSrcDescriptorRangeSizes == nullptr) && (single_dst_total == NumSrcDescriptorRanges);
+
 		const auto visit_spans = [&](auto visit) {
+			if (single_dst_unit_srcs)
+			{
+				const auto dest_base = decoded[0];
+				const auto dest_cpu_base = descriptor_range_starts[0];
+				for (UINT i = 0; i < NumSrcDescriptorRanges; ++i)
+				{
+					visit(dest_base.offset(i), decoded[size_t(1) + i],
+						offset_descriptor_handle(dest_cpu_base, i, DescriptorHeapsType),
+						descriptor_range_starts[size_t(1) + i], 1u);
+				}
+				return;
+			}
 			visit_descriptor_copy_spans(NumDestDescriptorRanges, pDestDescriptorRangeSizes, NumSrcDescriptorRanges, pSrcDescriptorRangeSizes,
 				[&](UINT dst, UINT dst_offset, UINT src, UINT src_offset, UINT count) {
 					const auto dest_as=decoded[dst],src_as=decoded[size_t(NumDestDescriptorRanges)+src];
@@ -904,6 +972,52 @@ void    STDMETHODCALLTYPE D3D12Device::CopyDescriptors(UINT NumDestDescriptorRan
 				});
 		};
 		const auto native_copy=[&](WWMI_CopyOrigQpc_v1* orig) -> HRESULT {
+			if (track_as && NumDestDescriptorRanges == 1 && single_dst_total > 0 && decoded[0].contains(single_dst_total))
+			{
+				bool fast_empty_src = true;
+				uint64_t src_total = 0;
+				if (pSrcDescriptorRangeSizes == nullptr)
+				{
+					src_total = NumSrcDescriptorRanges;
+					for (UINT i = 0; i < NumSrcDescriptorRanges; ++i)
+					{
+						const auto &sr = decoded[size_t(1) + i];
+						if (!sr.tracked())
+							continue;
+						if (!sr.contains(1u) || sr.has_any_occupied(1u))
+						{
+							fast_empty_src = false;
+							break;
+						}
+					}
+				}
+				else
+				{
+					for (UINT i = 0; i < NumSrcDescriptorRanges; ++i)
+					{
+						const UINT sc = pSrcDescriptorRangeSizes[i];
+						src_total += sc;
+						if (sc == 0)
+							continue;
+						const auto &sr = decoded[size_t(1) + i];
+						if (!sr.tracked())
+							continue;
+						if (!sr.contains(sc) || sr.has_any_occupied(sc))
+						{
+							fast_empty_src = false;
+							break;
+						}
+					}
+				}
+				if (fast_empty_src && src_total == single_dst_total)
+				{
+					const bool dst_occ = decoded[0].has_any_occupied(single_dst_total);
+					forward(orig);
+					if (dst_occ)
+						wwmi::rt_as::clear(decoded[0], single_dst_total);
+					return S_OK;
+				}
+			}
 			std::vector<wwmi::rt_as::Copy> captured;
 			bool as_failed=false;
 			if(touches_as)try

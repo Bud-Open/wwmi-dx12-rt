@@ -22,6 +22,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace PortApi {
@@ -716,10 +717,40 @@ void SetPixelShaderTextures(uint64_t ini_hash, uint64_t lo, uint64_t hi, bool kn
         lo |= (1ull << 9) - 1;
     }
     CriticalSectionGuard(&G->mShaderBindingsLock);
-    ShaderBindings& bindings = G->mShaderBindingsCache[ini_hash];
+    static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> s_ps_masks;
+    static unsigned s_ps_masks_gen = ~0u;
+    const unsigned cur_gen = LoadGeneration();
+    if (cur_gen != s_ps_masks_gen) {
+        s_ps_masks.clear();
+        s_ps_masks_gen = cur_gen;
+    }
+    auto [it, inserted] = G->mShaderBindingsCache.try_emplace(ini_hash);
+    ShaderBindings& bindings = it->second;
+    const uint64_t halves[] = {lo, hi};
+    if (!inserted) {
+        const auto mit = s_ps_masks.find(ini_hash);
+        if (mit != s_ps_masks.end() && mit->second.first == lo && mit->second.second == hi) {
+            bool same = true;
+            for (unsigned half = 0; half < 2 && same; ++half) {
+                for (uint64_t bits = halves[half]; bits; bits &= bits - 1) {
+                    unsigned long bit;
+                    _BitScanForward64(&bit, bits);
+                    const unsigned slot = half * 64 + bit;
+                    ShaderResource expected{};
+                    const bool fallback_2d = !known && slot < 9 && !(orig_lo & (1ull << slot));
+                    FillShaderResourceFromDxilKind(kinds ? kinds[slot] : 0u, fallback_2d, expected);
+                    const ShaderResource& cur = bindings.resources[slot];
+                    if (cur.type != expected.type || cur.dimension != expected.dimension || cur.stride != expected.stride) {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+            if (same) return;
+        }
+    }
     bindings.resources.fill(ShaderResource{});
     bindings.resource_slots = ShaderSlotRange{};
-    const uint64_t halves[] = {lo, hi};
     for (unsigned half = 0; half < 2; ++half) {
         for (uint64_t bits = halves[half]; bits; bits &= bits - 1) {
             unsigned long bit;
@@ -731,6 +762,7 @@ void SetPixelShaderTextures(uint64_t ini_hash, uint64_t lo, uint64_t hi, bool kn
             bindings.resource_slots.include(slot);
         }
     }
+    s_ps_masks[ini_hash] = {lo, hi};
 }
 
 void NextDrawCall()

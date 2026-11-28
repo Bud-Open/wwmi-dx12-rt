@@ -4,6 +4,7 @@
 #include <span>
 #include <array>
 #include <cstring>
+#include <optional>
 extern "C" std::uint32_t crc32c_append(std::uint32_t,const unsigned char *,std::size_t);
 namespace hsin_rt {
 inline std::uint32_t native_mesh_content_hash(std::span<const unsigned char> bytes){
@@ -197,11 +198,11 @@ public:
         if(forced_)return !intents_.empty();const auto state=registry_->snapshot();
         return std::any_of(intents_.begin(),intents_.end(),[&](const auto &i){return NativeProfileRegistry::resolve(state,i).match==NativeProfileRegistry::Match::missing;});
     }
-    void written(NativeRange);
+    bool written(NativeRange);
     void destroyed(ResourceKey);
-    void reset(Recording);
+    bool reset(Recording);
     std::uint64_t skin(Writer);
-    void request_known_rest(const Writer &fact_template,std::uint64_t existing_writer_id,std::span<const std::uint64_t> candidate_bytes);
+    bool request_known_rest(const Writer &fact_template,std::uint64_t existing_writer_id,std::span<const std::uint64_t> candidate_bytes);
     void skin_forwarded(Recording,bool);
     void copy(NativeRange,Recording,std::span<const unsigned char>);
     bool needs_copy_bytes(NativeRange range)const{
@@ -224,6 +225,21 @@ public:
     void publish();
     struct Pending {std::size_t builds=0,bytes=0,writers=0,rest_candidates=0;};
     Pending pending_counts()const{return {builds_.size(),bytes_.size(),writers_.size(),rest_candidates_.size()};}
+    bool has_active_before_work()const noexcept{
+        if(!builds_.empty()||!writers_.empty()||!rest_candidates_.empty())return true;
+        for(const auto &p:bytes_){
+            if(!p->valid||p->retired)continue;
+            // Settled GPU rest proofs stay retained in bytes_ for request_known_rest
+            // deduplication and later revision matching, not as active BEFORE work.
+            if(p->gpu&&p->point==ReadPoint::rest_consumer&&p->forwarded&&p->submissions==1&&p->completed)continue;
+            return true;
+        }
+        return false;
+    }
+    bool has_unforwarded_upload_copy()const noexcept{
+        for(const auto &p:bytes_)if(p->point==ReadPoint::upload_copy&&!p->forwarded)return true;
+        return false;
+    }
     struct Diagnostics {Counters total;Pending pending;std::size_t missing_intents=0,enabled_missing_intents=0,unsubmitted_builds=0,unforwarded_builds=0;};
     Diagnostics diagnostics()const{
         Diagnostics d{counters_,pending_counts()};const auto state=registry_->snapshot();
@@ -243,10 +259,14 @@ inline std::shared_ptr<NativeDiscovery::Bytes> NativeDiscovery::request(NativeRa
     }
     auto p=std::make_shared<Bytes>();p->id=++serial_;p->order=order;p->scope=scope;p->write_version=order_;p->range=range;p->recording=rec;p->point=point;p->gpu=true;bytes_.push_back(p);if(point==ReadPoint::rest_consumer)++counters_.rest_requests;else if(point==ReadPoint::index_consumer)++counters_.index_requests;return p;
 }
-inline void NativeDiscovery::written(NativeRange range){
+inline bool NativeDiscovery::written(NativeRange range){
     ++order_;
-    for(auto &p:bytes_)if(p->valid&&native_overlap(p->range,range))p->valid=false;
-    std::erase_if(writers_,[&](const auto &w){return native_overlap(w.output,range);});
+    if(bytes_.empty()&&writers_.empty())return false;
+    bool changed=false;
+    for(auto &p:bytes_)if(p->valid&&native_overlap(p->range,range)){p->valid=false;changed=true;}
+    if(!writers_.empty())
+        changed|=std::erase_if(writers_,[&](const auto &w){return native_overlap(w.output,range);})!=0;
+    return changed;
 }
 inline void NativeDiscovery::destroyed(ResourceKey key){
     for(auto &p:bytes_)if(p->range.resource==key)p->valid=false;
@@ -254,14 +274,23 @@ inline void NativeDiscovery::destroyed(ResourceKey key){
     std::erase_if(rest_candidates_,[&](const auto &r){return r.range.resource==key;});
     std::erase_if(builds_,[&](const auto &b){return std::any_of(b->geometries.begin(),b->geometries.end(),[&](const auto &g){return g.vertices.resource==key||g.indices.resource==key;});});
 }
-inline void NativeDiscovery::reset(Recording rec){
-    std::erase_if(writers_,[&](const auto &w){return w.recording==rec&&w.submissions!=1;});
-    if(writers_.size()>2048){
-        std::size_t excess=writers_.size()-1024;
-        std::erase_if(writers_,[&](const auto &w){if(!excess||w.submissions!=1)return false;--excess;return true;});
+inline bool NativeDiscovery::reset(Recording rec){
+    if(writers_.empty()&&bytes_.empty()&&builds_.empty())return false;
+    bool changed=false;
+    if(!writers_.empty()){
+        changed|=std::erase_if(writers_,[&](const auto &w){return w.recording==rec&&w.submissions!=1;})!=0;
+        if(writers_.size()>2048){
+            std::size_t excess=writers_.size()-1024;
+            changed|=std::erase_if(writers_,[&](const auto &w){if(!excess||w.submissions!=1)return false;--excess;return true;})!=0;
+        }
     }
-    for(auto &p:bytes_)if(p->recording==rec&&!p->submissions)p->valid=false;
-    counters_.reset_builds+=std::erase_if(builds_,[&](const auto &b){return b->recording==rec&&!b->submissions;});
+    for(auto &p:bytes_)if(p->recording==rec&&!p->submissions){p->valid=false;changed=true;}
+    if(!builds_.empty()){
+        const auto n=std::erase_if(builds_,[&](const auto &b){return b->recording==rec&&!b->submissions;});
+        counters_.reset_builds+=n;
+        changed|=n!=0;
+    }
+    return changed;
 }
 inline std::uint64_t NativeDiscovery::skin(Writer writer){
     if(!interested())return 0;
@@ -282,15 +311,17 @@ inline std::uint64_t NativeDiscovery::skin(Writer writer){
         ((p->recording==writer.recording&&p->order<=writer.order)||(p->gpu&&p->completed&&p->submissions==1&&p->forwarded)))writer.rest_proofs.push_back(p);
     const auto id=writer.id;writers_.push_back(std::move(writer));return id;
 }
-inline void NativeDiscovery::request_known_rest(const Writer &fact_template,std::uint64_t existing_writer_id,std::span<const std::uint64_t> candidate_bytes){
+inline bool NativeDiscovery::request_known_rest(const Writer &fact_template,std::uint64_t existing_writer_id,std::span<const std::uint64_t> candidate_bytes){
+    if(!fact_template.rest.resource||(fact_template.rest.offset%4)!=0)return false;
     bool need_request=false;
     for(const auto n:candidate_bytes){
-        if(!n||n>fact_template.rest.bytes)continue;
+        if(!n||n>fact_template.rest.bytes||n>max_probe_bytes||(n%4)!=0)continue;
         bool reusable=false;
         for(const auto &p:bytes_)if(p->valid&&!p->retired&&p->point==ReadPoint::rest_consumer&&p->range.resource==fact_template.rest.resource&&p->range.offset==fact_template.rest.offset&&p->range.bytes==n&&p->gpu){reusable=true;break;}
         if(!reusable){need_request=true;break;}
     }
-    if(!need_request)return;
+    if(!need_request)return false;
+    const std::size_t bytes_before=bytes_.size();
     std::uint64_t scope=existing_writer_id;
     std::uint64_t ord=order_;
     if(!scope){
@@ -299,10 +330,11 @@ inline void NativeDiscovery::request_known_rest(const Writer &fact_template,std:
         writers_.push_back(std::move(w));
     }
     for(const auto n:candidate_bytes){
-        if(!n||n>fact_template.rest.bytes)continue;
+        if(!n||n>fact_template.rest.bytes||n>max_probe_bytes||(n%4)!=0)continue;
         auto range=fact_template.rest;range.bytes=n;
         request(range,fact_template.recording,ReadPoint::rest_consumer,scope,ord);
     }
+    return bytes_.size()>bytes_before;
 }
 inline void NativeDiscovery::skin_forwarded(Recording rec,bool forwarded){
     const auto w=std::find_if(writers_.rbegin(),writers_.rend(),[&](const auto &v){return v.recording==rec&&!v.forwarded;});

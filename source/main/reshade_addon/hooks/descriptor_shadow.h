@@ -2,6 +2,7 @@
 #include <d3d12.h>
 #include <intrin.h>
 #include <atomic>
+#include <array>
 #include <mutex>
 #include <cstdint>
 #include <algorithm>
@@ -90,10 +91,11 @@ struct FlatHeapMap {
         };
         thread_local Hit t_hit[256] = {};
         const uint32_t   now = published.load(std::memory_order_acquire);
+        const bool       publishing = (now & 1u) != 0;
         Hit&             h = t_hit[((heap >> 6) ^ (heap >> 14)) & 255];
-        if (h.heap == heap && (h.e ? h.e->id.load(std::memory_order_acquire) == heap : h.added == now)) return h.e;
+        if (h.heap == heap && (h.e ? h.e->id.load(std::memory_order_acquire) == heap : (!publishing && h.added == now))) return h.e;
         Entry* e = scan([heap](Entry& x) { return x.id.load(std::memory_order_acquire) == heap; });
-        h = { heap, e, now };
+        if (e || !publishing) h = { heap, e, now };
         return e;
     }
     void bury_due(uint64_t now)
@@ -120,7 +122,7 @@ struct FlatHeapMap {
             if (!e) return;
             retired = { e, e->arr.load(std::memory_order_relaxed), e->marks.load(std::memory_order_relaxed), 0 };
             e->id.store(kDead, std::memory_order_release); // new lookups miss immediately
-            destroyed.fetch_add(1, std::memory_order_relaxed);
+            destroyed.fetch_add(1, std::memory_order_acq_rel);
         }
         // The publisher drains this heap's one data lock here. Do not put
         // its arrays on the freeable grave list until that drain is complete.
@@ -171,8 +173,9 @@ struct FlatHeapMap {
                     std::memory_order_relaxed);
                 f->arr.store(arr, std::memory_order_relaxed);
                 f->marks.store(marks, std::memory_order_relaxed);
-                f->id.store(heap, std::memory_order_release); // publish LAST
-                published.fetch_add(1, std::memory_order_acq_rel);
+                published.fetch_add(1, std::memory_order_acq_rel); // odd: publication in progress before exposing id
+                f->id.store(heap, std::memory_order_release);      // publish LAST
+                published.fetch_add(1, std::memory_order_acq_rel); // even: quiescent
                 e = f;
                 added = true;
             }
@@ -193,6 +196,74 @@ struct FlatHeapMap {
     {
         const Entry* e = entry_of(heap);
         return e && e->vis.load(std::memory_order_relaxed) != 0;
+    }
+    uint64_t layout_version() const noexcept
+    {
+        const uint32_t p = published.load(std::memory_order_acquire);
+        const uint32_t d = destroyed.load(std::memory_order_acquire);
+        return (uint64_t(p) << 32) | d;
+    }
+    Entry* find_cpu_entry(uint64_t cpu, uint32_t inc, HeapKey* out) noexcept
+    {
+        if (!cpu || !inc) return nullptr;
+        struct RangeHit {
+            uint64_t heap = 0, lo = 0, hi = 0;
+            Entry*   e = nullptr;
+            uint32_t inc = 0;
+        };
+        struct NegHit {
+            uint64_t cpu = 0, ver = UINT64_MAX;
+            uint32_t inc = 0;
+        };
+        thread_local uint64_t                 t_ver = UINT64_MAX;
+        thread_local uint32_t                 t_count = 0;
+        thread_local uint32_t                 t_cursor = 0;
+        thread_local std::array<RangeHit, 32> t_ranges{};
+        thread_local std::array<NegHit, 256>  t_neg{};
+        const uint64_t                        ver = layout_version();
+        if (ver != t_ver) {
+            t_ver = ver;
+            t_count = 0;
+            t_cursor = 0;
+        }
+        for (uint32_t i = 0; i < t_count; ++i) {
+            const RangeHit& r = t_ranges[i];
+            if (r.inc == inc && cpu >= r.lo && cpu < r.hi) {
+                if ((cpu - r.lo) % inc == 0 && r.e->id.load(std::memory_order_acquire) == r.heap) {
+                    if (out) *out = HeapKey{ r.heap, (uint32_t)((cpu - r.lo) / inc) };
+                    return r.e;
+                }
+            }
+        }
+        const bool publishing = ((ver >> 32) & 1u) != 0;
+        NegHit&    neg = t_neg[((cpu >> 5) ^ (cpu >> 13)) & 255];
+        if (!publishing && neg.ver == ver && neg.cpu == cpu && neg.inc == inc) return nullptr;
+        Entry*   found = nullptr;
+        uint64_t found_heap = 0, found_lo = 0, found_hi = 0;
+        scan([&](Entry& e) {
+            const uint64_t h = e.id.load(std::memory_order_acquire);
+            if (h <= kDead) return false;
+            const uint64_t lo = e.lo.load(std::memory_order_relaxed);
+            const uint32_t n = e.sz.load(std::memory_order_relaxed);
+            if (!lo || !n) return false;
+            const uint64_t bytes = uint64_t(n) * inc;
+            if (bytes > UINT64_MAX - lo) return false;
+            const uint64_t hi = lo + bytes;
+            if (cpu < lo || cpu >= hi || (cpu - lo) % inc) return false;
+            found = &e;
+            found_heap = h;
+            found_lo = lo;
+            found_hi = hi;
+            return true;
+        });
+        if (found) {
+            if (out) *out = HeapKey{ found_heap, (uint32_t)((cpu - found_lo) / inc) };
+            const uint32_t slot = t_count < t_ranges.size() ? t_count++ : (t_cursor++ & uint32_t(t_ranges.size() - 1));
+            t_ranges[slot] = { found_heap, found_lo, found_hi, found, inc };
+            return found;
+        }
+        if (!publishing) neg = { cpu, ver, inc };
+        return nullptr;
     }
     // f(heap, cpu_start, count, shader_visible, slots) for every live heap; true from f stops the walk.
     template <class F>

@@ -57,70 +57,91 @@ std::int32_t record_native(std::uint64_t native_list,void *context) {
     auto &b=*static_cast<GeometryBatch *>(context);
     auto *list=reinterpret_cast<ID3D12GraphicsCommandList4 *>(native_list);
     b.recording_started=true;
-    if(!copy_completed_author_pairs(b,list)){
-        D3D12_RESOURCE_BARRIER begin{};begin.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        begin.Transition={b.positions.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,position_read_state,D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
-        list->ResourceBarrier(1,&begin);
-        if(b.tangents){auto barrier=begin;barrier.Transition.pResource=b.tangents.Get();list->ResourceBarrier(1,&barrier);}
+    const auto copied=copy_completed_author_pairs(b,list);
+    if(copied==CompletedAuthorCopy::none){
+        D3D12_RESOURCE_BARRIER begin[2]{};
+        UINT begin_count=0;
+        begin[begin_count].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        begin[begin_count++].Transition={b.positions.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,position_read_state,D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+        if(b.tangents){
+            begin[begin_count].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            begin[begin_count++].Transition={b.tangents.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,position_read_state,D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+        }
+        list->ResourceBarrier(begin_count,begin);
     }
     if(b.blas){uav_barrier(list,b.blas.Get());uav_barrier(list,b.scratch.Get());}
-    const auto &pack=*b.assets->pack;
-    const bool raster=b.assets->raster_only;
-    for(unsigned c=0;c<(raster?1u:pack.components.size());++c){const auto &component=pack.components[c];
-        if(!raster&&(!component.index_count||(b.single_component!=UINT32_MAX&&c!=b.single_component)))continue;
-        const auto first=raster?0:component.vertex_first,vertices=raster?pack.vertices:component.vertex_count;
-        const auto &final=b.final_positions[c];
-        if(final.mode==WWMI_RT_POSITION_FINAL&&final.completed_author){
-            // This component's positions and vectors were copied together.
-        }else if(final.mode==WWMI_RT_POSITION_FINAL){
-            list->SetComputeRootSignature(b.assets->copy_root.Get());list->SetPipelineState(b.assets->copy_pipeline.Get());
-            list->SetComputeRootShaderResourceView(0,final.address);list->SetComputeRootUnorderedAccessView(1,b.positions->GetGPUVirtualAddress());
-            UINT constants[]{vertices,first-final.first_vertex,first};
-            list->SetComputeRoot32BitConstants(2,3,constants,0);list->Dispatch((constants[0]+63)/64,1,1);
-        }else if(final.mode==position_author_shape_delta_float6){
-            list->SetComputeRootSignature(b.assets->shape_root.Get());list->SetPipelineState(b.assets->shape_pipeline.Get());
-            list->SetComputeRootShaderResourceView(0,b.assets->positions->GetGPUVirtualAddress());
-            list->SetComputeRootShaderResourceView(1,b.assets->blends->GetGPUVirtualAddress());
-            list->SetComputeRootShaderResourceView(2,b.palettes->GetGPUVirtualAddress()+c*std::uint64_t(pack.canonical_bones)*sizeof(Matrix));
-            // Align the raw root SRV without changing the snapshot's byte view.
-            const auto address=final.address&~15ull;const auto bias=UINT(final.address-address);
-            list->SetComputeRootShaderResourceView(3,address);
-            list->SetComputeRootUnorderedAccessView(4,b.positions->GetGPUVirtualAddress());
-            UINT constants[]{vertices,first,first,std::bit_cast<UINT>(b.scales[c]),final.first_vertex,bias};
-            list->SetComputeRoot32BitConstants(5,6,constants,0);list->Dispatch((constants[0]+63)/64,1,1);
-        }else{
-            list->SetComputeRootSignature(b.assets->root.Get());list->SetPipelineState(b.assets->pipeline.Get());
-            list->SetComputeRootShaderResourceView(0,b.assets->positions->GetGPUVirtualAddress());
-            list->SetComputeRootShaderResourceView(1,b.assets->blends->GetGPUVirtualAddress());
-            list->SetComputeRootShaderResourceView(2,b.palettes->GetGPUVirtualAddress()+c*std::uint64_t(pack.canonical_bones)*sizeof(Matrix));
-            list->SetComputeRootUnorderedAccessView(3,b.positions->GetGPUVirtualAddress());
-            UINT constants[]{vertices,first,first,std::bit_cast<UINT>(b.scales[c])};
-            list->SetComputeRoot32BitConstants(4,4,constants,0);list->Dispatch((constants[0]+63)/64,1,1);
+    if(copied!=CompletedAuthorCopy::all){
+        const auto &pack=*b.assets->pack;
+        const bool raster=b.assets->raster_only;
+        ID3D12RootSignature *bound_root=nullptr;
+        ID3D12PipelineState *bound_pso=nullptr;
+        const auto bind_compute=[&](ID3D12RootSignature *root,ID3D12PipelineState *pso){
+            if(bound_root!=root){list->SetComputeRootSignature(root);bound_root=root;}
+            if(bound_pso!=pso){list->SetPipelineState(pso);bound_pso=pso;}
+        };
+        for(unsigned c=0;c<(raster?1u:pack.components.size());++c){const auto &component=pack.components[c];
+            if(!raster&&(!component.index_count||(b.single_component!=UINT32_MAX&&c!=b.single_component)))continue;
+            const auto first=raster?0:component.vertex_first,vertices=raster?pack.vertices:component.vertex_count;
+            const auto &final=b.final_positions[c];
+            if(final.mode==WWMI_RT_POSITION_FINAL&&final.completed_author){
+                // This component's positions and vectors were copied together.
+            }else if(final.mode==WWMI_RT_POSITION_FINAL){
+                bind_compute(b.assets->copy_root.Get(),b.assets->copy_pipeline.Get());
+                list->SetComputeRootShaderResourceView(0,final.address);list->SetComputeRootUnorderedAccessView(1,b.positions->GetGPUVirtualAddress());
+                UINT constants[]{vertices,first-final.first_vertex,first};
+                list->SetComputeRoot32BitConstants(2,3,constants,0);list->Dispatch((constants[0]+63)/64,1,1);
+            }else if(final.mode==position_author_shape_delta_float6){
+                bind_compute(b.assets->shape_root.Get(),b.assets->shape_pipeline.Get());
+                list->SetComputeRootShaderResourceView(0,b.assets->positions->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(1,b.assets->blends->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(2,b.palettes->GetGPUVirtualAddress()+c*std::uint64_t(pack.canonical_bones)*sizeof(Matrix));
+                // Align the raw root SRV without changing the snapshot's byte view.
+                const auto address=final.address&~15ull;const auto bias=UINT(final.address-address);
+                list->SetComputeRootShaderResourceView(3,address);
+                list->SetComputeRootUnorderedAccessView(4,b.positions->GetGPUVirtualAddress());
+                UINT constants[]{vertices,first,first,std::bit_cast<UINT>(b.scales[c]),final.first_vertex,bias};
+                list->SetComputeRoot32BitConstants(5,6,constants,0);list->Dispatch((constants[0]+63)/64,1,1);
+            }else{
+                bind_compute(b.assets->root.Get(),b.assets->pipeline.Get());
+                list->SetComputeRootShaderResourceView(0,b.assets->positions->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(1,b.assets->blends->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(2,b.palettes->GetGPUVirtualAddress()+c*std::uint64_t(pack.canonical_bones)*sizeof(Matrix));
+                list->SetComputeRootUnorderedAccessView(3,b.positions->GetGPUVirtualAddress());
+                UINT constants[]{vertices,first,first,std::bit_cast<UINT>(b.scales[c])};
+                list->SetComputeRoot32BitConstants(4,4,constants,0);list->Dispatch((constants[0]+63)/64,1,1);
+            }
+            if(b.tangents&&final.mode==position_author_shape_delta_float6&&b.assets->shape_tangent_pipeline){
+                bind_compute(b.assets->shape_tangent_root.Get(),b.assets->shape_tangent_pipeline.Get());
+                list->SetComputeRootShaderResourceView(0,b.assets->vectors->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(1,b.assets->blends->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(2,b.palettes->GetGPUVirtualAddress()+c*std::uint64_t(pack.canonical_bones)*sizeof(Matrix));
+                const auto address=final.address&~15ull;const auto bias=UINT(final.address-address);
+                list->SetComputeRootShaderResourceView(3,address);list->SetComputeRootUnorderedAccessView(4,b.tangents->GetGPUVirtualAddress());
+                UINT constants[]{vertices,first,first,std::bit_cast<UINT>(b.scales[c]),final.first_vertex,bias};
+                list->SetComputeRoot32BitConstants(5,6,constants,0);list->Dispatch((constants[0]+63)/64,1,1);b.tangent_ready[c]=true;
+            }else if(b.tangents&&final.mode!=WWMI_RT_POSITION_FINAL&&final.mode!=position_author_shape_delta_float6){
+                bind_compute(b.assets->tangent_root.Get(),b.assets->tangent_pipeline.Get());
+                list->SetComputeRootShaderResourceView(0,b.assets->vectors->GetGPUVirtualAddress());list->SetComputeRootShaderResourceView(1,b.assets->blends->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(2,b.palettes->GetGPUVirtualAddress()+c*std::uint64_t(pack.canonical_bones)*sizeof(Matrix));
+                list->SetComputeRootUnorderedAccessView(3,b.tangents->GetGPUVirtualAddress());
+                UINT constants[]{vertices,first,first,std::bit_cast<UINT>(b.scales[c])};
+                list->SetComputeRoot32BitConstants(4,4,constants,0);list->Dispatch((vertices+63)/64,1,1);b.tangent_ready[c]=true;
+            }
         }
-        if(b.tangents&&final.mode==position_author_shape_delta_float6&&b.assets->shape_tangent_pipeline){
-            list->SetComputeRootSignature(b.assets->shape_tangent_root.Get());list->SetPipelineState(b.assets->shape_tangent_pipeline.Get());
-            list->SetComputeRootShaderResourceView(0,b.assets->vectors->GetGPUVirtualAddress());
-            list->SetComputeRootShaderResourceView(1,b.assets->blends->GetGPUVirtualAddress());
-            list->SetComputeRootShaderResourceView(2,b.palettes->GetGPUVirtualAddress()+c*std::uint64_t(pack.canonical_bones)*sizeof(Matrix));
-            const auto address=final.address&~15ull;const auto bias=UINT(final.address-address);
-            list->SetComputeRootShaderResourceView(3,address);list->SetComputeRootUnorderedAccessView(4,b.tangents->GetGPUVirtualAddress());
-            UINT constants[]{vertices,first,first,std::bit_cast<UINT>(b.scales[c]),final.first_vertex,bias};
-            list->SetComputeRoot32BitConstants(5,6,constants,0);list->Dispatch((constants[0]+63)/64,1,1);b.tangent_ready[c]=true;
-        }else if(b.tangents&&final.mode!=WWMI_RT_POSITION_FINAL&&final.mode!=position_author_shape_delta_float6){
-            list->SetComputeRootSignature(b.assets->tangent_root.Get());list->SetPipelineState(b.assets->tangent_pipeline.Get());
-            list->SetComputeRootShaderResourceView(0,b.assets->vectors->GetGPUVirtualAddress());list->SetComputeRootShaderResourceView(1,b.assets->blends->GetGPUVirtualAddress());
-            list->SetComputeRootShaderResourceView(2,b.palettes->GetGPUVirtualAddress()+c*std::uint64_t(pack.canonical_bones)*sizeof(Matrix));
-            list->SetComputeRootUnorderedAccessView(3,b.tangents->GetGPUVirtualAddress());
-            UINT constants[]{vertices,first,first,std::bit_cast<UINT>(b.scales[c])};
-            list->SetComputeRoot32BitConstants(4,4,constants,0);list->Dispatch((vertices+63)/64,1,1);b.tangent_ready[c]=true;
+        // UNORDERED_ACCESS -> position_read_state performs a full UAV write flush
+        // and read-state transition for both raster SRV/VB and BLAS vertex inputs.
+        D3D12_RESOURCE_BARRIER read[2]{};
+        UINT read_count=0;
+        read[read_count].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        read[read_count++].Transition={b.positions.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,position_read_state};
+        if(b.tangents){
+            read[read_count].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            read[read_count++].Transition={b.tangents.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,position_read_state};
         }
+        list->ResourceBarrier(read_count,read);
     }
-    uav_barrier(list,b.positions.Get());
-    D3D12_RESOURCE_BARRIER read{};read.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    read.Transition={b.positions.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,position_read_state};
-    list->ResourceBarrier(1,&read);
-    if(b.tangents){uav_barrier(list,b.tangents.Get());auto barrier=read;barrier.Transition.pResource=b.tangents.Get();list->ResourceBarrier(1,&barrier);}
     if(!b.blas){b.recorded=true;return 0;}
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc{};desc.Inputs=build_input(b);
     desc.DestAccelerationStructureData=b.blas->GetGPUVirtualAddress();
@@ -134,7 +155,7 @@ using namespace gpu;
 
 std::shared_ptr<GeometryAssets> GeometryAssets::create(ID3D12Device5 *device,std::shared_ptr<const ModPack> pack,
     std::span<const unsigned char> dxil,std::span<const unsigned char> copy_dxil,std::span<const unsigned char> tangent_dxil,
-    bool raster_only){
+    bool raster_only,ComPtr<ID3D12Resource> external_indices){
     if(!device||!pack||pack->positions.size()!=12ull*pack->vertices||pack->blends.size()!=32ull*pack->vertices||
        (raster_only?!pack->indices.empty():(pack->indices.empty()||pack->indices.size()%4))||dxil.empty()||copy_dxil.empty())throw std::runtime_error("RT Mod asset layout");
     for(std::size_t offset=0;offset<pack->indices.size();offset+=4){UINT index;std::memcpy(&index,pack->indices.data()+offset,4);if(index>=pack->vertices)throw std::runtime_error("Mod index outside owned vertex range");}
@@ -147,6 +168,7 @@ std::shared_ptr<GeometryAssets> GeometryAssets::create(ID3D12Device5 *device,std
     result->raster_only=raster_only;
     result->positions=input_buffer(device,result->pack->positions);result->blends=input_buffer(device,result->pack->blends);
     if(!raster_only)result->indices=input_buffer(device,result->pack->indices);
+    else if(external_indices)result->indices=std::move(external_indices);
     D3D12_ROOT_PARAMETER params[5]{};
     for(UINT i=0;i<3;++i){params[i].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;params[i].Descriptor.ShaderRegister=i;}
     params[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_UAV;params[3].Descriptor.ShaderRegister=0;
@@ -222,23 +244,55 @@ std::shared_ptr<AuthorStreamPool::Storage> AuthorStreamPool::acquire(ID3D12Devic
     storage.push_back(allocation);
     return allocation;
 }
+std::shared_ptr<AuthorStreamPool::PaletteStorage> AuthorStreamPool::acquire_palette(ID3D12Device5 *device,std::uint64_t bytes){
+    const auto aligned=(std::max<std::uint64_t>)(256ull,(bytes+255ull)&~255ull);
+    std::shared_ptr<PaletteStorage> best;
+    for(const auto &candidate:palettes){
+        if(candidate.use_count()!=1||candidate->capacity<aligned)continue;
+        if(!best||candidate->capacity<best->capacity)best=candidate;
+    }
+    if(best)return best;
+    auto allocation=std::make_shared<PaletteStorage>();
+    allocation->resource=buffer(device,aligned,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    D3D12_RANGE no_read{0,0};
+    check(allocation->resource->Map(0,&no_read,&allocation->mapped),"Hsin palette pool Map");
+    allocation->capacity=aligned;
+    palettes.push_back(allocation);
+    return allocation;
+}
 void AuthorStreamPool::release_idle()noexcept{
     std::erase_if(storage,[](const auto &entry){return entry.use_count()==1;});
+    std::erase_if(palettes,[](const auto &entry){return entry.use_count()==1;});
 }
 static std::shared_ptr<GeometryBatch> prepare_streams_impl(std::shared_ptr<GeometryAssets> assets,const Pose &pose,
     unsigned single_component,ID3D12Resource *owned_palette,AuthorStreamPool *pool=nullptr,bool *reused=nullptr,
-    std::uint64_t generation=0,bool default_static=false) {
+    std::uint64_t generation=0,bool default_static=false,bool want_tangents=true,bool allow_pool_palette=false) {
     if(!assets||assets->pack!=pose.pack)throw std::runtime_error("RT Mod assets/pose mismatch");
     if(single_component!=UINT32_MAX&&single_component>=pose.pack->components.size())throw std::runtime_error("RT previous component out of range");
     const auto positions=std::uint64_t(assets->pack->vertices)*12;
-    const auto tangents=assets->vectors&&single_component==UINT32_MAX?std::uint64_t(assets->pack->vertices)*32:0;
+    const auto tangents=(want_tangents&&assets->vectors&&single_component==UINT32_MAX)?std::uint64_t(assets->pack->vertices)*32:0;
     auto *device=assets->device.Get();
+    const auto palette_bytes=std::max<std::size_t>(sizeof(Matrix),pose.rows.size()*sizeof(Matrix));
     std::shared_ptr<GeometryBatch> b;
+    bool palette_filled=false;
     if(pool){
-        struct Lease {std::shared_ptr<AuthorStreamPool::Storage> storage;GeometryBatch batch;};
+        struct Lease {
+            std::shared_ptr<AuthorStreamPool::Storage> storage;
+            std::shared_ptr<AuthorStreamPool::PaletteStorage> palette;
+            GeometryBatch batch;
+        };
         auto lease=std::make_shared<Lease>();
         lease->storage=pool->acquire(device,positions,tangents,*reused);
         lease->batch.positions=lease->storage->positions;lease->batch.tangents=lease->storage->tangents;
+        // Pool only non-escaping palettes owned strictly by this batch lease;
+        // owned_previous_palette escapes as a bare ComPtr into previous_prepared.
+        if(!owned_palette&&allow_pool_palette){
+            lease->palette=pool->acquire_palette(device,palette_bytes);
+            if(!pose.rows.empty())std::memcpy(lease->palette->mapped,pose.rows.data(),pose.rows.size()*sizeof(Matrix));
+            else std::memset(lease->palette->mapped,0,sizeof(Matrix));
+            lease->batch.palettes=lease->palette->resource;
+            palette_filled=true;
+        }
         b=std::shared_ptr<GeometryBatch>(lease,&lease->batch);
         lease->storage->resident=b;
         lease->storage->generation=generation;lease->storage->default_static=default_static;
@@ -247,11 +301,12 @@ static std::shared_ptr<GeometryBatch> prepare_streams_impl(std::shared_ptr<Geome
     b->assets=std::move(assets);
     b->single_component=single_component;
     b->producer={pose.recording,pose.source_vertices};b->source_orders=pose.source_orders;b->scales=pose.scales;b->native_extra_input=pose.native_extra_input;b->native_delta_flags=pose.native_delta_flags;b->final_positions=pose.final_positions;
-    if(owned_palette)b->palettes=owned_palette;
-    else{
-        b->palettes=buffer(device,std::max<std::size_t>(sizeof(Matrix),pose.rows.size()*sizeof(Matrix)),
-            D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
-        if(!pose.rows.empty())upload(b->palettes.Get(),pose.rows.data(),pose.rows.size()*sizeof(Matrix));
+    if(!palette_filled){
+        if(owned_palette)b->palettes=owned_palette;
+        else{
+            b->palettes=buffer(device,palette_bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+            if(!pose.rows.empty())upload(b->palettes.Get(),pose.rows.data(),pose.rows.size()*sizeof(Matrix));
+        }
     }
     // Generation-owned output: a retained graphics recording must not observe
     // a later pose overwriting the same allocation on an unknown future queue.
@@ -266,8 +321,9 @@ static std::shared_ptr<GeometryBatch> prepare_streams_impl(std::shared_ptr<Geome
 }
 std::shared_ptr<GeometryBatch> prepare_pooled_author_streams(std::shared_ptr<GeometryAssets> assets,const Pose &pose,
     unsigned component,ComPtr<ID3D12Resource> *palette,AuthorStreamPool &pool,bool &reused,
-    std::uint64_t generation,bool default_static){
-    auto b=prepare_streams_impl(std::move(assets),pose,component,palette?palette->Get():nullptr,&pool,&reused,generation,default_static);
+    std::uint64_t generation,bool default_static,bool want_tangents){
+    auto b=prepare_streams_impl(std::move(assets),pose,component,palette?palette->Get():nullptr,&pool,&reused,
+        generation,default_static,want_tangents,palette==nullptr);
     if(palette&&!*palette)*palette=b->palettes;
     return b;
 }

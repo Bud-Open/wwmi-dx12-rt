@@ -131,6 +131,7 @@ uint32_t PreviousPageEnd(uint32_t slot,uint32_t end) noexcept {
 struct PreviousHeap {
     const PreviousHeapToken flat;
     const uint64_t epoch,generation;
+    const bool is_vis;
     std::atomic<uint64_t> host_generation;
     std::atomic<uint32_t> host_index;
     std::atomic<bool> retired{false};
@@ -141,6 +142,7 @@ struct PreviousHeap {
     std::atomic<uint64_t> next_write{0};
     PreviousHeap(PreviousHeapToken token,PreviousPair pair,uint64_t host_gen,uint32_t index)
         :flat(token),epoch(pair.epoch),generation(previous_creation_serial.fetch_add(1,std::memory_order_relaxed)+1),
+         is_vis(token.entry&&token.entry->vis.load(std::memory_order_relaxed)),
          host_generation(host_gen),host_index(index),
          slots(new DescriptorSlot[token.size]),
          pages(new PreviousPage[PreviousPageIndex(token.size-1)+1]) {}
@@ -174,20 +176,59 @@ using PreviousHeapPtr=std::shared_ptr<PreviousHeap>;
 struct alignas(64) PreviousHeapShard {
     std::shared_mutex mutex;
     std::unordered_map<uint64_t,PreviousHeapPtr> heaps;
+    std::atomic<uint64_t> revision{1};
 };
 std::array<PreviousHeapShard,64> previous_heaps;
 PreviousHeapShard& PreviousDirectory(uint64_t h) {
     return previous_heaps[PreviousHandleHash{}(h)&(previous_heaps.size()-1)];
+}
+std::mutex deferred_retired_heaps_mutex;
+std::vector<PreviousHeapPtr> deferred_retired_heaps;
+std::atomic<uint32_t> deferred_retired_heap_count{0};
+void DrainPreviousHeap(const PreviousHeap& h);
+uint32_t CurrentDescriptorIncrement() noexcept {
+    static std::atomic<ID3D12Device*> s_dev{nullptr};
+    static std::atomic<uint32_t> s_inc{0};
+    ID3D12Device* dev=g_d3d12_device;
+    if(!dev)return 0;
+    if(s_dev.load(std::memory_order_acquire)==dev){
+        const uint32_t inc=s_inc.load(std::memory_order_relaxed);
+        if(inc)return inc;
+    }
+    const uint32_t inc=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if(inc){
+        s_inc.store(inc,std::memory_order_relaxed);
+        s_dev.store(dev,std::memory_order_release);
+    }
+    return inc;
 }
 
 std::mutex previous_reset;
 std::atomic<uint64_t> previous_epoch{1};
 uint64_t previous_epoch_serial=1; // under previous_reset
 
-enum CopyWaitPart { copy_directory,copy_source,copy_destination,copy_raw_admission,copy_native,copy_wait_count };
+enum CopyWaitPart {
+    copy_directory,copy_source,copy_destination,copy_raw_admission,copy_native,
+    copy_phase_resolve,copy_phase_freeze,copy_phase_commit,copy_dir_neg_hit,
+    copy_frozen_unpinned,copy_raw_src,copy_wait_count
+};
 struct CopyWaitRow {std::atomic<uint64_t> calls{},ticks{};};
 struct alignas(64) CopyWaitLane {std::array<CopyWaitRow,copy_wait_count> rows;};
 std::array<CopyWaitLane,std::tuple_size_v<decltype(rt_cpu::lanes)>> descriptor_copy_waits;
+std::atomic<uint64_t> g_copy_fast_hits{0};
+std::atomic<uint64_t> g_copy_fast_multi_hits{0};
+std::atomic<uint64_t> g_copy_fast_multi_spans{0};
+std::atomic<uint64_t> g_copy_fast_multi_dst_pages{0};
+std::atomic<uint64_t> g_copy_generic_hits{0};
+std::atomic<uint64_t> g_copy_spill_spans{0};
+std::atomic<uint64_t> g_copy_spill_slots{0};
+std::atomic<uint64_t> g_copy_spill_raw{0};
+std::atomic<uint64_t> g_copy_spill_miss{0};
+std::atomic<uint64_t> g_copy_spill_freeze{0};
+std::atomic<uint64_t> g_copy_spill_dup_dst{0};
+std::atomic<uint64_t> g_copy_spill_pages{0};
+std::atomic<uint64_t> g_write_fast_hits{0};
+std::atomic<uint64_t> g_write_generic_hits{0};
 struct CopyWaits {
     struct Total {uint64_t calls,ticks;};
     rt_cpu::Scope& scope;
@@ -258,6 +299,7 @@ FlatHeapMap::Entry* EnterPreviousHeapIdentity(uint64_t heap) {
         added->vis.store((desc.Flags&D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)!=0,std::memory_order_relaxed);
         added->arr.store(nullptr,std::memory_order_relaxed);
         added->marks.store(nullptr,std::memory_order_relaxed);
+        book.published.fetch_add(1,std::memory_order_acq_rel);
         added->id.store(heap,std::memory_order_release);
         book.published.fetch_add(1,std::memory_order_acq_rel);
     }
@@ -275,17 +317,29 @@ PreviousHeapPtr PreviousGetHeap(PreviousHeapToken token,PreviousPair pair,uint64
         return same_heap(h)&&(!host_gen||h->host_generation.load(std::memory_order_acquire)==host_gen);
     };
     struct Memo { uint64_t handle=0; std::weak_ptr<PreviousHeap> heap; };
+    struct NegMemo { uint64_t handle=0,host_gen=0,epoch=0,shard_rev=0; };
     static thread_local std::array<Memo,512> recent{};
-    auto& memo=recent[PreviousHandleHash{}(token.handle)&(recent.size()-1)];
+    static thread_local std::array<NegMemo,256> neg_recent{};
+    const size_t h_idx=PreviousHandleHash{}(token.handle);
+    auto& memo=recent[h_idx&(recent.size()-1)];
     if(memo.handle==token.handle){
         auto h=memo.heap.lock();if(matches(h))return h;
     }
     auto& dir=PreviousDirectory(token.handle);
+    auto& neg=neg_recent[h_idx&(neg_recent.size()-1)];
+    if(!create){
+        const uint64_t rev=dir.revision.load(std::memory_order_acquire);
+        if(neg.handle==token.handle&&neg.host_gen==host_gen&&neg.epoch==pair.epoch&&neg.shard_rev==rev){
+            if(measured)measured->add(copy_dir_neg_hit,0);
+            return {};
+        }
+    }
     auto existing=[&]() -> PreviousHeapPtr {
         const auto it=dir.heaps.find(token.handle);
         return it!=dir.heaps.end()&&matches(it->second)?it->second:nullptr;
     };
     bool attach_native_identity=false;
+    uint64_t neg_rev=0;
     {
         std::shared_lock lock(dir.mutex,std::defer_lock);PreviousLock(lock,measured);
         if(auto h=existing()){memo={token.handle,h};return h;}
@@ -294,22 +348,43 @@ PreviousHeapPtr PreviousGetHeap(PreviousHeapToken token,PreviousPair pair,uint64
             attach_native_identity=i!=dir.heaps.end()&&same_heap(i->second)&&
                 !i->second->host_generation.load(std::memory_order_relaxed);
         }
+        if(!create&&!attach_native_identity)neg_rev=dir.revision.load(std::memory_order_relaxed);
     }
-    if(!create&&!attach_native_identity)return {};
-    std::unique_lock lock(dir.mutex,std::defer_lock);PreviousLock(lock,measured);
-    if(!token.live()||previous_epoch.load(std::memory_order_acquire)!=pair.epoch)return {};
-    if(auto h=existing()){memo={token.handle,h};return h;}
-    if(const auto it=dir.heaps.find(token.handle);it!=dir.heaps.end()&&same_heap(it->second)&&
-        !it->second->host_generation.load(std::memory_order_relaxed)){
-        const auto& h=it->second;h->host_index.store(host_index,std::memory_order_relaxed);
-        h->host_generation.store(host_gen,std::memory_order_release);
-        memo={token.handle,h};return h;
+    if(!create&&!attach_native_identity){
+        neg={token.handle,host_gen,pair.epoch,neg_rev};
+        return {};
     }
-    if(!create)return {};
-    auto h=std::make_shared<PreviousHeap>(token,pair,host_gen,host_index);
-    auto [it,added]=dir.heaps.try_emplace(token.handle,h);
-    if(!added){it->second->retired.store(true,std::memory_order_release);it->second=h;}
-    memo={token.handle,h};return h;
+    PreviousHeapPtr replaced;
+    PreviousHeapPtr result;
+    {
+        std::unique_lock lock(dir.mutex,std::defer_lock);PreviousLock(lock,measured);
+        if(!token.live()||previous_epoch.load(std::memory_order_acquire)!=pair.epoch)return {};
+        if(auto h=existing()){memo={token.handle,h};return h;}
+        if(const auto it=dir.heaps.find(token.handle);it!=dir.heaps.end()&&same_heap(it->second)&&
+            !it->second->host_generation.load(std::memory_order_relaxed)){
+            const auto& h=it->second;h->host_index.store(host_index,std::memory_order_relaxed);
+            h->host_generation.store(host_gen,std::memory_order_release);
+            dir.revision.fetch_add(1,std::memory_order_release);
+            memo={token.handle,h};return h;
+        }
+        if(!create)return {};
+        result=std::make_shared<PreviousHeap>(token,pair,host_gen,host_index);
+        auto [it,added]=dir.heaps.try_emplace(token.handle,result);
+        if(!added){
+            replaced=std::move(it->second);
+            replaced->retired.store(true,std::memory_order_release);
+            it->second=result;
+        }
+        dir.revision.fetch_add(1,std::memory_order_release);
+        memo={token.handle,result};
+    }
+    if(replaced){
+        previous_retire_generation.fetch_add(1,std::memory_order_seq_cst);
+        std::lock_guard dl(deferred_retired_heaps_mutex);
+        deferred_retired_heaps.push_back(std::move(replaced));
+        deferred_retired_heap_count.fetch_add(1,std::memory_order_release);
+    }
+    return result;
 }
 PreviousHeapPtr PreviousGetRange(const WWMI_DescriptorRange_v1& r,PreviousPair pair,bool create,CopyWaits* measured=nullptr) {
     if(!r.heap||!r.heap_creation||!r.slots||r.slot>=r.slots)return {};
@@ -325,6 +400,19 @@ void DrainPreviousHeap(const PreviousHeap& h) {
         std::unique_lock drained(h.pages[i].mutex);
     }
 }
+void DrainDeferredRetiredHeaps() noexcept {
+    if(deferred_retired_heap_count.load(std::memory_order_acquire)==0)return;
+    if(CurrentCopyLane().copy_depth!=0)return;
+    std::vector<PreviousHeapPtr> deferred;
+    {
+        std::lock_guard dl(deferred_retired_heaps_mutex);
+        if(deferred_retired_heaps.empty())return;
+        deferred.swap(deferred_retired_heaps);
+        deferred_retired_heap_count.store(0,std::memory_order_release);
+    }
+    DrainCopyLanes(kCopyDepthMask);
+    for(auto& old:deferred)DrainPreviousHeap(*old);
+}
 void PreviousHeapRetired(uint64_t heap) {
     PreviousHeapPtr h;
     {
@@ -334,12 +422,20 @@ void PreviousHeapRetired(uint64_t heap) {
         if(it!=dir.heaps.end()&&!it->second->flat.live()){
             it->second->retired.store(true,std::memory_order_release);
             h=std::move(it->second);dir.heaps.erase(it);
+            dir.revision.fetch_add(1,std::memory_order_release);
         }
     }
-    if(h){
+    std::vector<PreviousHeapPtr> deferred;
+    if(CurrentCopyLane().copy_depth==0&&deferred_retired_heap_count.load(std::memory_order_acquire)!=0){
+        std::lock_guard dl(deferred_retired_heaps_mutex);
+        deferred.swap(deferred_retired_heaps);
+        deferred_retired_heap_count.store(0,std::memory_order_release);
+    }
+    if(h||!deferred.empty()){
         previous_retire_generation.fetch_add(1,std::memory_order_seq_cst);
         DrainCopyLanes(kCopyDepthMask);
-        DrainPreviousHeap(*h);
+        if(h)DrainPreviousHeap(*h);
+        for(auto& old:deferred)DrainPreviousHeap(*old);
     }
 }
 void PreviousReset() {
@@ -355,6 +451,13 @@ void PreviousReset() {
             retired.push_back(std::move(heap));
         }
         dir.heaps.clear();
+        dir.revision.fetch_add(1,std::memory_order_release);
+    }
+    {
+        std::lock_guard dl(deferred_retired_heaps_mutex);
+        for(auto& heap:deferred_retired_heaps)retired.push_back(std::move(heap));
+        deferred_retired_heaps.clear();
+        deferred_retired_heap_count.store(0,std::memory_order_release);
     }
     previous_retire_generation.fetch_add(1,std::memory_order_seq_cst);
     DrainCopyLanes(kCopyDepthMask);
@@ -502,8 +605,22 @@ void PublishContent(PreviousHeap& h,uint32_t slot,uint64_t version,ContentId con
     StampDescriptorWrite(target,version,kind);
     page.seq.fetch_add(1,std::memory_order_release);
 }
-void PublishUnknownSlot(PreviousHeap& h,uint32_t slot,uint8_t kind) noexcept {
-    PublishContent(h,slot,h.write_version(),{},kind);
+// Exclusive-lock-only publisher: caller holds std::unique_lock<FastPageMutex>
+// (kModeExcl), so no concurrent writer can modify page.seq. target.content.swap()
+// publishes with release and pairs with seqlock readers' acquire load_raw() and
+// subsequent acquire writer-state/seq validation; a single release store on seq
+// eliminates two LOCK INC bus locks per descriptor write.
+void PublishContentExclusive(PreviousHeap& h,uint32_t slot,uint64_t version,ContentId content,uint8_t kind) noexcept {
+    auto& page=h.page(slot);
+    auto& target=h.slots[slot];
+    if(content&&content->definition.replacement)page.may_stamp.store(true,std::memory_order_release);
+    target.content.swap(content);
+    StampDescriptorWrite(target,version,kind);
+    const uint64_t s=page.seq.load(std::memory_order_relaxed);
+    page.seq.store(s+1u,std::memory_order_release);
+}
+void PublishUnknownSlotExclusive(PreviousHeap& h,uint32_t slot,uint8_t kind) noexcept {
+    PublishContentExclusive(h,slot,h.write_version(),{},kind);
 }
 
 PreviousHeapPtr ReadHeap(uint64_t heap,PreviousPair pair) {
@@ -526,6 +643,9 @@ bool ProjectDescriptorInfo(PreviousPair pair,const DescriptorSlot& slot,ResInfo&
 
 }
 
+std::atomic<uint64_t> g_struct_fb_cache_hits{0};
+std::atomic<uint64_t> g_struct_fb_cache_misses{0};
+
 void RtDescriptorCopyWaitReport() {
     if(rt_cpu::phase.load(std::memory_order_acquire)!=3)return;
     static std::atomic_flag reported{};
@@ -533,6 +653,7 @@ void RtDescriptorCopyWaitReport() {
     const auto deadline=rt_cpu::deadline.load(std::memory_order_acquire);
     const auto frequency=rt_cpu::frequency.load(std::memory_order_relaxed);
     unsigned rows=0;
+    uint64_t total_frozen_unpinned=0,total_raw_src_calls=0,total_raw_src_slots=0;
     for(unsigned i=0;i<descriptor_copy_waits.size();++i){
         const auto& lane=rt_cpu::lanes[i];
         const auto tid=lane.tid.load(std::memory_order_acquire);
@@ -545,17 +666,46 @@ void RtDescriptorCopyWaitReport() {
         }
         if(!pending&&std::none_of(v.begin(),v.end(),[](const auto& t){return t.calls!=0;}))continue;
         ++rows;
-        char msg[430];
+        total_frozen_unpinned+=v[copy_frozen_unpinned].ticks;
+        total_raw_src_calls+=v[copy_raw_src].calls;
+        total_raw_src_slots+=v[copy_raw_src].ticks;
+        char msg[704];
         std::snprintf(msg,sizeof(msg),
             "RT-DESC-COPY-WAIT row tid=%lu directory=%llu/%llu source_page=%llu/%llu destination_page=%llu/%llu "
-            "raw_admission=%llu/%llu native_continuation=%llu/%llu frequency=%llu deadline_qpc=%llu pending_thread=%u",
+            "raw_admission=%llu/%llu native_continuation=%llu/%llu resolve=%llu/%llu freeze=%llu/%llu "
+            "commit=%llu/%llu dir_neg_hit=%llu frequency=%llu deadline_qpc=%llu pending_thread=%u",
             tid,v[0].calls,v[0].ticks,v[1].calls,v[1].ticks,v[2].calls,v[2].ticks,v[3].calls,v[3].ticks,
-            v[4].calls,v[4].ticks,frequency,deadline,unsigned(pending!=0));
+            v[4].calls,v[4].ticks,v[5].calls,v[5].ticks,v[6].calls,v[6].ticks,v[7].calls,v[7].ticks,
+            v[8].calls,frequency,deadline,unsigned(pending!=0));
         reshade::log::message(reshade::log::level::info,msg);
     }
-    char msg[180];
-    std::snprintf(msg,sizeof(msg),"RT-DESC-COPY-WAIT end rows=%u frequency=%llu deadline_qpc=%llu overflow_threads=%u",
-        rows,frequency,deadline,rt_cpu::overflow.load(std::memory_order_relaxed));
+    char msg[704];
+    std::snprintf(msg,sizeof(msg),
+        "RT-DESC-COPY-WAIT end rows=%u frozen_unpinned=%llu "
+        "raw_src=%llu/%llu copy_fast=%llu copy_fast_multi=%llu multi_spans=%llu multi_dst_pages=%llu "
+        "copy_generic=%llu spill=spans:%llu/slots:%llu/raw:%llu/miss:%llu/freeze:%llu/dup:%llu/pages:%llu "
+        "write_fast=%llu write_generic=%llu struct_fb=%llu/%llu reclaim=%llu/%llu frequency=%llu deadline_qpc=%llu overflow_threads=%u",
+        rows,(unsigned long long)total_frozen_unpinned,
+        (unsigned long long)total_raw_src_calls,(unsigned long long)total_raw_src_slots,
+        (unsigned long long)g_copy_fast_hits.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_fast_multi_hits.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_fast_multi_spans.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_fast_multi_dst_pages.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_generic_hits.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_spill_spans.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_spill_slots.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_spill_raw.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_spill_miss.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_spill_freeze.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_spill_dup_dst.load(std::memory_order_relaxed),
+        (unsigned long long)g_copy_spill_pages.load(std::memory_order_relaxed),
+        (unsigned long long)g_write_fast_hits.load(std::memory_order_relaxed),
+        (unsigned long long)g_write_generic_hits.load(std::memory_order_relaxed),
+        (unsigned long long)g_struct_fb_cache_hits.load(std::memory_order_relaxed),
+        (unsigned long long)g_struct_fb_cache_misses.load(std::memory_order_relaxed),
+        (unsigned long long)reclaimed_content_batches.load(std::memory_order_relaxed),
+        (unsigned long long)reclaimed_content_ticks.load(std::memory_order_relaxed),
+        frequency,deadline,rt_cpu::overflow.load(std::memory_order_relaxed));
     reshade::log::message(reshade::log::level::info,msg);
 }
 

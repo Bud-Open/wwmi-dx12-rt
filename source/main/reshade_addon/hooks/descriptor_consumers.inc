@@ -44,6 +44,32 @@ bool ReadPublishedDescriptor(const FlatHeapMap::Entry* entry,uint32_t index,ResI
 bool ReadPublishedDescriptor(const HeapKey& key,ResInfo& out) noexcept {
     return ReadPublishedDescriptor(g_heap_to_res.entry_of(key.heap),key.offset,out);
 }
+bool ReadPublishedDescriptorAndFormat(const HeapKey& key,ResInfo& out,DXGI_FORMAT& out_fmt,uint64_t* out_res_gen=nullptr) noexcept {
+    out={};
+    out_fmt=DXGI_FORMAT_UNKNOWN;
+    if(out_res_gen)*out_res_gen=0;
+    try{
+        PreviousPair pair;
+        if(!PreviousDevice(g_reshade_device,pair,false))return false;
+        const auto h=ReadHeap(key.heap,pair);
+        if(!h||key.offset>=h->flat.size)return false;
+        std::shared_lock lock(h->page(key.offset).mutex);
+        if(!PreviousCurrent(pair,*h))return false;
+        const auto& s=h->slots[key.offset];
+        if(!ProjectDescriptorInfo(pair,s,out))return false;
+        const auto* d=OriginalDefinition(s.content->definition);
+        if(d){
+            if(out_res_gen)*out_res_gen=d->resource_generation;
+            if(const auto* v=std::get_if<D3D12_SHADER_RESOURCE_VIEW_DESC>(&d->description))
+                out_fmt=v->Format;
+            else if(const auto* v=std::get_if<D3D12_UNORDERED_ACCESS_VIEW_DESC>(&d->description))
+                out_fmt=v->Format;
+            else
+                out_fmt=d->default_format;
+        }
+        return true;
+    }catch(...){return false;}
+}
 
 RtPublishedTexture ReadPublishedTextureShape(const HeapKey& key,RtPublishedTextureShape& out) noexcept {
     out={};

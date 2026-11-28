@@ -184,6 +184,67 @@ SectionPsStamps PlanSectionPsSlots(command_list* cmd_list, uint32_t gen0, const 
     return out;
 }
 
+// Fast path for private/hybrid draws: their SRVs are always copied into
+// recording-owned private tables, never stamped in-place onto the game's live
+// heap, and they never consume `out.shared`.
+SectionPsStamps PlanPrivateSectionPsSlots(command_list* cmd_list, uint32_t gen0, const std::vector<uint32_t>& this_gen,
+    int dm, int comp)
+{
+    SectionPsStamps out;
+    out.dm = dm;
+    out.comp = comp;
+    if (!g_ps_slot_stamp || g_disable_tex || !g_d3d12_device || !cmd_list) return out;
+    const MigotoPort::PipeState& st = MigotoPort::State();
+    const int                    si = MigotoPort::StageIndex('p');
+    bool                         any = false;
+    for (unsigned r = 0; r < MigotoPort::kMaxSRV && !any; ++r) any = (int32_t)(st.srv_gen[si][r] - gen0) > 0;
+    if (!any) return out;
+    device*        dev = cmd_list->get_device();
+    const uint64_t layh = CmdGfxLayout(cmd_list);
+    RegBind        t_ps[MigotoPort::kMaxSRV];
+    {
+        std::lock_guard l(g_layout_regmap_mtx);
+        auto            it = g_layout_regmap.find(layh);
+        if (it == g_layout_regmap.end() || !it->second.built) return out;
+        memcpy(t_ps, it->second.t_ps, sizeof t_ps);
+    }
+    const CmdState& gs = CmdGfx(cmd_list);
+    PlanStamps(out, dev, gs.root, t_ps, gs.gfx_pso, layh, gen0, this_gen);
+    return out;
+}
+
+// Preserves shared-table read registration if a private/hybrid attempt refuses
+// and falls back to the native draw while a later in-place draw shares the table.
+void RecordNativeReadAsBound(command_list* cmd_list)
+{
+    if (!g_ps_slot_stamp || g_disable_tex || !g_d3d12_device || !cmd_list) return;
+    const uint64_t layh = CmdGfxLayout(cmd_list);
+    RegBind        t_ps[64];
+    {
+        std::lock_guard l(g_layout_regmap_mtx);
+        auto            it = g_layout_regmap.find(layh);
+        if (it == g_layout_regmap.end() || !it->second.built) return;
+        memcpy(t_ps, it->second.t_ps, sizeof t_ps);
+    }
+    device*         dev = cmd_list->get_device();
+    const CmdState& gs = CmdGfx(cmd_list);
+    const uint64_t  reads = PipelinePsReadMask(gs.gfx_pso);
+    if (!reads) return;
+    HeapKey  keys[64];
+    unsigned nkeys = 0;
+    for (unsigned r = 0; r < 64; ++r) {
+        if (!((reads >> r) & 1u)) continue;
+        const RegBind& b = t_ps[r];
+        if (b.param == 0xFF || b.param >= 64 || !b.is_table) continue;
+        const TableStart ts = TableStartOf(dev, gs.root[b.param].table);
+        if (ts) keys[nkeys++] = HeapKey{ ts.heap, ts.base + b.offset };
+    }
+    if (!nkeys) return;
+    std::lock_guard l(g_stamped_mtx);
+    StampedForThisFrame();
+    for (unsigned i = 0; i < nkeys; ++i) g_stamped.emplace(keys[i], StampedSlot{ kReadAsBound, g_frame_id });
+}
+
 void SectionPsStamps::StampInPlace() const
 {
     if (slots.empty()) return;

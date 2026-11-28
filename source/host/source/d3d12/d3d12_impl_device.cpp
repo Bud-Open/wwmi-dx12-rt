@@ -140,21 +140,26 @@ reshade::d3d12::device_impl::device_impl(ID3D12Device *device) :
 		descriptor_heap_cpu(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
 		descriptor_heap_cpu(device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV) },
 	_gpu_view_heap(device),
-	_gpu_sampler_heap(device)
+	_gpu_sampler_heap(device),
+#if RESHADE_ADDON >= 2
+	_fast_descriptor_heaps(std::make_unique<std::atomic<wwmi::rt_as::Heap *>[]>(kFastDescriptorHeapCount)),
+#endif
+	_view_shards(std::make_unique<ViewShard[]>(kViewShardCount))
 {
+	static_assert(alignof(device_impl) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__, "device_impl must remain default-aligned for D3D12Device::Release");
 	for (UINT type = 0; type < D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES; ++type)
 		_descriptor_handle_size[type] = device->GetDescriptorHandleIncrementSize(static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(type));
 
 #if RESHADE_ADDON >= 2
-	// Make some space in the descriptor heap array, so that it is unlikely to need reallocation
-	_descriptor_heaps.reserve(4096);
+	for (size_t i = 0; i < kFastDescriptorHeapCount; ++i)
+		_fast_descriptor_heaps[i].store(nullptr, std::memory_order_relaxed);
 
 	const auto gpu_view_heap = new D3D12DescriptorHeap(device, _gpu_view_heap.get());
 	register_descriptor_heap(gpu_view_heap);
 	const auto gpu_sampler_heap = new D3D12DescriptorHeap(device, _gpu_sampler_heap.get());
 	register_descriptor_heap(gpu_sampler_heap);
 
-	assert(_descriptor_heaps.size() == 2);
+	assert(_descriptor_heap_count.load(std::memory_order_relaxed) == 2);
 #endif
 
 	// Create mipmap generation states used in 'command_list::generate_mipmaps' implementation
@@ -186,12 +191,20 @@ reshade::d3d12::device_impl::~device_impl()
 #if RESHADE_ADDON >= 2
 	for (size_t index : { size_t(0), size_t(1) })
 	{
-		const auto registration = _descriptor_heaps[index];
+		const auto registration = _fast_descriptor_heaps[index].load(std::memory_order_acquire);
 		const auto proxy = registration->proxy;
 		unregister_descriptor_heap(registration);
 		delete proxy;
 	}
-	assert(std::all_of(_descriptor_heaps.begin(), _descriptor_heaps.end(), [](auto heap) { return heap == nullptr; }));
+#ifndef NDEBUG
+	{
+		const size_t total = _descriptor_heap_count.load(std::memory_order_acquire);
+		const size_t fast_end = (std::min)(total, kFastDescriptorHeapCount);
+		for (size_t i = 0; i < fast_end; ++i)
+			assert(_fast_descriptor_heaps[i].load(std::memory_order_acquire) == nullptr);
+		assert(std::all_of(_overflow_descriptor_heaps.begin(), _overflow_descriptor_heaps.end(), [](auto heap) { return heap == nullptr; }));
+	}
+#endif
 #endif
 }
 
@@ -651,8 +664,11 @@ void reshade::d3d12::device_impl::destroy_resource_view(api::resource_view view)
 
 	D3D12_CPU_DESCRIPTOR_HANDLE descriptor_handle = { static_cast<SIZE_T>(view.handle) };
 
-	const std::unique_lock<std::shared_mutex> lock(_resource_mutex);
-	_views.erase(descriptor_handle.ptr);
+	{
+		auto &shard = _view_shards[view_shard_index(descriptor_handle.ptr)];
+		const std::unique_lock<std::shared_mutex> lock(shard.mutex);
+		shard.views.erase(descriptor_handle.ptr);
+	}
 
 #if RESHADE_ADDON >= 2
 	// Retire this CPU-view origin before the SDK allocator can hand the
@@ -675,10 +691,11 @@ reshade::api::resource reshade::d3d12::device_impl::get_resource_from_view(api::
 
 	D3D12_CPU_DESCRIPTOR_HANDLE descriptor_handle = { static_cast<SIZE_T>(view.handle) };
 
-	const std::shared_lock<std::shared_mutex> lock(_resource_mutex);
+	const auto &shard = _view_shards[view_shard_index(descriptor_handle.ptr)];
+	const std::shared_lock<std::shared_mutex> lock(shard.mutex);
 
-	if (const auto it = _views.find(descriptor_handle.ptr); it != _views.end())
-		return to_handle(it->second.first);
+	if (const auto *entry = shard.views.find(descriptor_handle.ptr); entry != nullptr)
+		return to_handle(entry->first);
 	else
 		return assert(false), api::resource { 0 };
 }
@@ -688,10 +705,11 @@ reshade::api::resource_view_desc reshade::d3d12::device_impl::get_resource_view_
 
 	D3D12_CPU_DESCRIPTOR_HANDLE descriptor_handle = { static_cast<SIZE_T>(view.handle) };
 
-	const std::shared_lock<std::shared_mutex> lock(_resource_mutex);
+	const auto &shard = _view_shards[view_shard_index(descriptor_handle.ptr)];
+	const std::shared_lock<std::shared_mutex> lock(shard.mutex);
 
-	if (const auto it = _views.find(descriptor_handle.ptr); it != _views.end())
-		return it->second.second;
+	if (const auto *entry = shard.views.find(descriptor_handle.ptr); entry != nullptr)
+		return entry->second;
 	else
 		return assert(false), api::resource_view_desc();
 }
@@ -707,14 +725,15 @@ uint64_t reshade::d3d12::device_impl::get_resource_view_gpu_address(api::resourc
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE descriptor_handle = { static_cast<SIZE_T>(view.handle) };
 
-	const std::shared_lock<std::shared_mutex> lock(_resource_mutex);
+	const auto &shard = _view_shards[view_shard_index(descriptor_handle.ptr)];
+	const std::shared_lock<std::shared_mutex> lock(shard.mutex);
 
-	if (const auto it = _views.find(descriptor_handle.ptr); it != _views.end())
+	if (const auto *entry = shard.views.find(descriptor_handle.ptr); entry != nullptr)
 	{
-		switch (it->second.second.type)
+		switch (entry->second.type)
 		{
 		case api::resource_view_type::buffer:
-			return it->second.first->GetGPUVirtualAddress() + it->second.second.buffer.offset;
+			return entry->first->GetGPUVirtualAddress() + entry->second.buffer.offset;
 		case api::resource_view_type::acceleration_structure:
 			return view.handle;
 		default:
@@ -1738,9 +1757,8 @@ void reshade::d3d12::device_impl::get_descriptor_heap_offset(api::descriptor_tab
 	if ((table.handle & 0xF000000000000000ull) == 0xF000000000000000ull)
 	{
 		const size_t heap_index = (table.handle >> heap_index_start) & 0xFFFFFFF;
-		assert(heap_index < _descriptor_heaps.size() && _descriptor_heaps[heap_index] != nullptr);
-
-		const auto registration = _descriptor_heaps[heap_index];
+		const auto registration = descriptor_heap_at(heap_index);
+		assert(registration != nullptr);
 		*heap = to_handle(registration->native);
 
 		if (offset != nullptr)
@@ -2360,17 +2378,49 @@ void reshade::d3d12::device_impl::register_resource_view(D3D12_CPU_DESCRIPTOR_HA
 	if (resource != nullptr && desc.type == api::resource_view_type::unknown)
 		desc = convert_resource_view_desc(resource->GetDesc());
 
-	const std::unique_lock<std::shared_mutex> lock(_resource_mutex);
-	_views.insert_or_assign(handle.ptr, std::make_pair(resource, std::move(desc)));
+	auto &shard = _view_shards[view_shard_index(handle.ptr)];
+	const std::unique_lock<std::shared_mutex> lock(shard.mutex);
+	shard.views.insert_or_assign(handle.ptr, std::make_pair(resource, std::move(desc)));
 }
 void reshade::d3d12::device_impl::register_resource_view(D3D12_CPU_DESCRIPTOR_HANDLE handle, D3D12_CPU_DESCRIPTOR_HANDLE source_handle)
 {
-	const std::unique_lock<std::shared_mutex> lock(_resource_mutex);
-
-	if (const auto it = _views.find(source_handle.ptr); it != _views.end())
-		_views.insert_or_assign(handle.ptr, it->second);
+	const size_t dst_idx = view_shard_index(handle.ptr);
+	const size_t src_idx = view_shard_index(source_handle.ptr);
+	if (dst_idx == src_idx)
+	{
+		auto &shard = _view_shards[dst_idx];
+		const std::unique_lock<std::shared_mutex> lock(shard.mutex);
+		if (const auto *entry = shard.views.find(source_handle.ptr); entry != nullptr)
+		{
+			// Copy before insert: growing the flat table invalidates entry pointers.
+			const auto copied = *entry;
+			shard.views.insert_or_assign(handle.ptr, copied);
+		}
+		else
+			assert(false);
+		return;
+	}
+	auto &dst_shard = _view_shards[dst_idx];
+	auto &src_shard = _view_shards[src_idx];
+	// Always acquire distinct shards in ascending shard index order to prevent AB-BA deadlock.
+	if (dst_idx < src_idx)
+	{
+		const std::unique_lock<std::shared_mutex> dst_lock(dst_shard.mutex);
+		const std::shared_lock<std::shared_mutex> src_lock(src_shard.mutex);
+		if (const auto *entry = src_shard.views.find(source_handle.ptr); entry != nullptr)
+			dst_shard.views.insert_or_assign(handle.ptr, *entry);
+		else
+			assert(false);
+	}
 	else
-		assert(false);
+	{
+		const std::shared_lock<std::shared_mutex> src_lock(src_shard.mutex);
+		const std::unique_lock<std::shared_mutex> dst_lock(dst_shard.mutex);
+		if (const auto *entry = src_shard.views.find(source_handle.ptr); entry != nullptr)
+			dst_shard.views.insert_or_assign(handle.ptr, *entry);
+		else
+			assert(false);
+	}
 }
 
 reshade::d3d12::command_list_immediate_impl *reshade::d3d12::device_impl::get_immediate_command_list()
@@ -2473,14 +2523,17 @@ wwmi::rt_as::Heap *reshade::d3d12::device_impl::register_descriptor_heap(D3D12De
 	static std::atomic<uint64_t> creation { 0 };
 	const D3D12_DESCRIPTOR_HEAP_DESC desc = heap->_orig->GetDesc();
 	const std::unique_lock<std::shared_mutex> lock(_heap_gpu_ranges_mutex);
-	const auto it = _descriptor_heaps.push_back(nullptr);
-	const size_t index = std::distance(_descriptor_heaps.begin(), it);
+	const size_t index = _descriptor_heap_count.load(std::memory_order_relaxed);
 	heap->initialize_descriptor_base_handle(index);
 	const auto registration = new wwmi::rt_as::Heap {
 		heap, heap->_orig, index, creation.fetch_add(1, std::memory_order_relaxed) + 1, desc,
 		heap->_orig_base_cpu_handle.ptr, heap->_orig_base_gpu_handle.ptr, _descriptor_handle_size[desc.Type]
 	};
-	*it = registration;
+	if (index < kFastDescriptorHeapCount)
+		_fast_descriptor_heaps[index].store(registration, std::memory_order_release);
+	else
+		_overflow_descriptor_heaps.push_back(registration);
+	_descriptor_heap_count.store(index + 1, std::memory_order_release);
 	if (registration->gpu_start != 0)
 		_heap_gpu_ranges[registration->gpu_start] = {
 			registration->gpu_start + static_cast<uint64_t>(desc.NumDescriptors) * registration->increment,
@@ -2492,10 +2545,13 @@ void reshade::d3d12::device_impl::unregister_descriptor_heap(wwmi::rt_as::Heap *
 {
 	{
 		const std::unique_lock<std::shared_mutex> lock(_heap_gpu_ranges_mutex);
-		assert(_descriptor_heaps[heap->index] == heap);
+		assert(descriptor_heap_at_locked(heap->index) == heap);
 		// Do not recycle a CPU tag into a different heap generation or resize
 		// the table under unrelated heap readers.
-		_descriptor_heaps[heap->index] = nullptr;
+		if (heap->index < kFastDescriptorHeapCount)
+			_fast_descriptor_heaps[heap->index].store(nullptr, std::memory_order_release);
+		else
+			_overflow_descriptor_heaps[heap->index - kFastDescriptorHeapCount] = nullptr;
 		if (heap->gpu_start != 0)
 			if (const auto range = _heap_gpu_ranges.find(heap->gpu_start);
 				range != _heap_gpu_ranges.end() && range->second.second == heap)
@@ -2527,7 +2583,7 @@ static wwmi::rt_as::Range as_gpu_range(wwmi::rt_as::Heap *heap, uint64_t handle)
 uint64_t reshade::d3d12::device_impl::wwmi_heap_generation(D3D12_CPU_DESCRIPTOR_HANDLE tagged) const
 {
 	const size_t index = (tagged.ptr >> heap_index_start) & 0xFFFFFFF;
-	const auto heap = index < _descriptor_heaps.size() ? _descriptor_heaps[index] : nullptr;
+	const auto heap = descriptor_heap_at(index);
 	return heap != nullptr && static_cast<unsigned>(heap->desc.Type) == (tagged.ptr & 0x3) ?
 		heap->generation : 0;
 }
@@ -2547,7 +2603,7 @@ bool reshade::d3d12::device_impl::wwmi_resolve_restore_heaps(
 		if (generations[type] == 0)
 			continue; // This heap category was explicitly unbound.
 		const size_t index = (tags[type] >> heap_index_start) & 0xFFFFFFF;
-		const auto heap = index < _descriptor_heaps.size() ? _descriptor_heaps[index] : nullptr;
+		const auto heap = descriptor_heap_at_locked(index);
 		if (heap == nullptr || heap->generation != generations[type] ||
 			static_cast<unsigned>(heap->desc.Type) != type || heap->gpu_start == 0)
 			return false;
@@ -2561,7 +2617,7 @@ bool reshade::d3d12::device_impl::wwmi_resolve_restore_heaps(
 wwmi::rt_as::Range reshade::d3d12::device_impl::wwmi_internal_as_range(D3D12_GPU_DESCRIPTOR_HANDLE handle) const
 {
 	// The private GPU view heap is registration 0 for the device's lifetime.
-	return as_gpu_range(_descriptor_heaps[0], handle.ptr);
+	return as_gpu_range(_fast_descriptor_heaps[0].load(std::memory_order_acquire), handle.ptr);
 }
 
 template <typename Visit>
@@ -2696,8 +2752,8 @@ void D3D12DescriptorHeap::initialize_descriptor_base_handle(size_t heap_index)
 D3D12_CPU_DESCRIPTOR_HANDLE reshade::d3d12::device_impl::convert_to_original_cpu_descriptor_handle(D3D12_CPU_DESCRIPTOR_HANDLE handle, wwmi::rt_as::Range *as) const
 {
 	const size_t heap_index = (handle.ptr >> heap_index_start) & 0xFFFFFFF;
-	assert(heap_index < _descriptor_heaps.size() && _descriptor_heaps[heap_index] != nullptr);
-	const auto heap = _descriptor_heaps[heap_index];
+	const auto heap = descriptor_heap_at(heap_index);
+	assert(heap != nullptr);
 	const SIZE_T offset = handle.ptr & (((1ull << heap_index_start) - 1) ^ 0x7);
 	if (as != nullptr)
 	{
@@ -2767,9 +2823,10 @@ D3D12_GPU_DESCRIPTOR_HANDLE reshade::d3d12::device_impl::convert_to_original_gpu
 	if ((table.handle & 0xF000000000000000ull) == 0xF000000000000000ull)
 	{
 		const size_t heap_index = (table.handle >> heap_index_start) & 0xFFFFFFF;
-		assert(heap_index < _descriptor_heaps.size() && _descriptor_heaps[heap_index] != nullptr);
+		const auto heap = descriptor_heap_at(heap_index);
+		assert(heap != nullptr);
 
-		return { _descriptor_heaps[heap_index]->gpu_start + (table.handle & (((1ull << heap_index_start) - 1) ^ 0x7)) };
+		return { heap->gpu_start + (table.handle & (((1ull << heap_index_start) - 1) ^ 0x7)) };
 	}
 #endif
 

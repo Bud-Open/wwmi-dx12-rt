@@ -11,6 +11,7 @@ class MaterialIdentity {
 public:
     MaterialIdentity()=default;
     explicit MaterialIdentity(std::span<const unsigned char> code):code_(code.begin(),code.end()){}
+    bool has_code() const noexcept { return !code_.empty(); }
     void init(api::pipeline pipeline,unsigned count,const api::pipeline_subobject *subobjects){
         bool chs=false,ahs=false,inherited=false;
         for(unsigned i=0;i<count;++i){const auto &s=subobjects[i];

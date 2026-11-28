@@ -136,6 +136,8 @@ void LoadGeometryMods()
                 }
                 if (gm.mod.dir.empty()) gm.mod.dir = dm.dir; // only if their SectionFolder had none
                 WwmiMod::LoadResources(gm.mod, g_d3d12_device);
+                gm.has_merged_skeleton = WwmiMod::Find(gm.mod, L"ResourceMergedSkeleton") != nullptr;
+                gm.any_remapped = std::any_of(gm.mod.comps.begin(), gm.mod.comps.end(), [](const auto& c) { return c.remapped; });
                 if (gm.mod.queries_ps_slots) g_ps_slot_queries.store(true, std::memory_order_relaxed);
                 if (!gm.mod.forward_map_file.empty()) {
                     std::wstring rel = gm.mod.forward_map_file;

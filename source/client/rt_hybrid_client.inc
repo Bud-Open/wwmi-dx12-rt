@@ -5,10 +5,9 @@
     std::uint64_t hybrid_probe_load=0,hybrid_probe_native_rev=0;
     std::map<std::uint64_t,std::uint64_t> hybrid_probe_checked;
 
-    bool hybrid_probe(const WWMI_RtPackDrawQuery_v2 &q,std::uint64_t ticket,std::uint64_t load,std::uint64_t mod){
-        const auto *cap=captured_author(q,ticket);
-        if(!cap||!load||!mod)return false;
-        const auto &id=cap->match.identity;
+    bool hybrid_probe_captured(const AuthorCapture &cap,std::uint64_t load,std::uint64_t mod){
+        if(!load||!mod)return false;
+        const auto &id=cap.match.identity;
         // Positive ownership of the existing route takes priority. This check
         // does not run the VM or alter the author selection / target cache.
         const auto target=targets.find(id->native_blas);
@@ -53,6 +52,10 @@
             }
         }
         return true;
+    }
+    bool hybrid_probe(const WWMI_RtPackDrawQuery_v2 &q,std::uint64_t ticket,std::uint64_t load,std::uint64_t mod){
+        const auto *cap=captured_author(q,ticket);
+        return cap&&hybrid_probe_captured(*cap,load,mod);
     }
     void hybrid_previous(const WWMI_RtPackDrawQuery_v2 &q,std::uint64_t ticket,const wwmi::hybrid::HistoryRead &previous){
         auto *cap=captured_author(q,ticket);
@@ -187,9 +190,9 @@
     }
     wwmi::hybrid::Result acquire_hybrid(const wwmi::hybrid::Request &q,wwmi::hybrid::Frame &out){
         namespace h=wwmi::hybrid;
-        if(!q.asset||!q.asset->version||q.count>4096||(q.count&&!q.parts)||
-           !hybrid_probe(q.native,q.ticket,q.asset->load,q.asset->mod))return h::unavailable;
+        if(!q.asset||!q.asset->version||q.count>4096||(q.count&&!q.parts))return h::unavailable;
         auto *cap=captured_author(q.native,q.ticket);
+        if(!cap||!hybrid_probe_captured(*cap,q.asset->load,q.asset->mod))return h::unavailable;
         const auto match=cap->match;
         const auto &id=match.identity;
         auto *list=reinterpret_cast<api::command_list *>(q.native.list);
@@ -257,7 +260,7 @@
         if(q.need_material&&(!pack.surface_supported||(q.need_color&&pack.color.empty())))return h::unavailable;
         // Recovering the linked previous snapshot may grow hybrid_poses.
         const auto current_pose=current.pose;
-        auto batch=prepare_author_streams(current.pose,consumer,list,UINT32_MAX,current.outputs,id,nullptr,{},true);
+        auto batch=prepare_author_streams(current.pose,consumer,list,UINT32_MAX,current.outputs,id,nullptr,{},true,pack.surface_supported,asset->index);
         if(!batch)return h::unavailable;
         auto &surface=out.current;
         surface.struct_size=sizeof(surface);surface.abi_version=1;surface.vertex_count=pack.vertices;surface.uv_pairs=pack.uv_pairs;
@@ -269,8 +272,9 @@
         g.position_resource=reinterpret_cast<std::uint64_t>(batch->positions.Get());
         g.position_gpu_va=batch->positions->GetGPUVirtualAddress();g.position_bytes=12ull*pack.vertices;g.position_stride=12;
         g.position_format=DXGI_FORMAT_R32G32B32_FLOAT;g.position_state=position_read_state;
-        g.index_resource=reinterpret_cast<std::uint64_t>(asset->index.Get());
-        g.index_gpu_va=asset->index->GetGPUVirtualAddress();g.index_bytes=asset->proof.source_indices.size();g.index_format=DXGI_FORMAT_R32_UINT;
+        auto *ib_res=batch->assets->indices?batch->assets->indices.Get():asset->index.Get();
+        g.index_resource=reinterpret_cast<std::uint64_t>(ib_res);
+        g.index_gpu_va=ib_res->GetGPUVirtualAddress();g.index_bytes=asset->proof.source_indices.size();g.index_format=DXGI_FORMAT_R32_UINT;
         if(q.need_material){
             if(!batch->tangents||!batch->tangent_ready[0])return h::unavailable;
             surface.uv=surface_view(batch->assets->uv.Get(),pack.uv.size(),DXGI_FORMAT_R16G16_FLOAT,4,4*pack.uv_pairs,D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -280,7 +284,7 @@
         std::shared_ptr<GeometryBatch> previous;
         if(q.need_previous){
             if(auto *which=hybrid_previous_pose(cap->raster_previous,asset,id,match.component,primitive,q.instance.byte_origin))
-                previous=prepare_author_streams(which->pose,consumer,list,UINT32_MAX,which->outputs,which->identity,nullptr,{},true);
+                previous=prepare_author_streams(which->pose,consumer,list,UINT32_MAX,which->outputs,which->identity,nullptr,{},true,false,asset->index);
             if(previous)out.previous.positions=surface_view(previous->positions.Get(),12ull*pack.vertices,DXGI_FORMAT_R32_FLOAT,4,12,position_read_state);
         }
         auto &holds=records[consumer.list];

@@ -393,14 +393,19 @@ RtRasterEffects RtReadRasterEffects(uint64_t pipeline,uint8_t attached,bool om_k
 bool RtOnlyVertexPixelStages(uint64_t pipeline){
     std::lock_guard lock(g_pso_clone_mtx);auto i=g_pso_clone.find(pipeline);
     if(i==g_pso_clone.end())return false;
+    auto& cached=i->second.private_only_vs_ps;
+    if(cached>=0)return cached!=0;
+    bool ok=true;
     for(auto &sub:i->second.subs)
         if((sub.type==pipeline_subobject_type::geometry_shader || sub.type==pipeline_subobject_type::hull_shader ||
             sub.type==pipeline_subobject_type::domain_shader || sub.type==pipeline_subobject_type::amplification_shader ||
             sub.type==pipeline_subobject_type::mesh_shader) && sub.data && sub.count){
             const auto *d=static_cast<const shader_desc*>(sub.data);
-            for(unsigned j=0;j<sub.count;++j)if(d[j].code_size)return false;
+            for(unsigned j=0;j<sub.count;++j)if(d[j].code_size){ok=false;break;}
+            if(!ok)break;
         }
-    return true;
+    cached=int(ok);
+    return ok;
 }
 
 // A recorded, fully cloned graphics PSO with no PS has no pixel-stage reads.
@@ -408,12 +413,17 @@ bool RtOnlyVertexPixelStages(uint64_t pipeline){
 bool RtKnownNoPixelShader(uint64_t pipeline){
     std::lock_guard lock(g_pso_clone_mtx);auto i=g_pso_clone.find(pipeline);
     if(i==g_pso_clone.end() || i->second.subs.empty())return false;
+    auto& cached=i->second.private_known_no_ps;
+    if(cached>=0)return cached!=0;
+    bool ok=true;
     for(auto& sub:i->second.subs)if(sub.type==pipeline_subobject_type::pixel_shader){
-        if(!sub.data && sub.count)return false;
+        if(!sub.data && sub.count){ok=false;break;}
         auto* shaders=static_cast<const shader_desc*>(sub.data);
-        for(unsigned j=0;j<sub.count;++j)if(shaders[j].code_size)return false;
+        for(unsigned j=0;j<sub.count;++j)if(shaders[j].code_size){ok=false;break;}
+        if(!ok)break;
     }
-    return true;
+    cached=int(ok);
+    return ok;
 }
 
 bool RtShaderUavRegs(const void*,size_t,DxilSrvRegs&);
@@ -435,6 +445,9 @@ DxilSrvRegs RtPipelineUavRegs(uint64_t pipeline,bool pixel){
 bool RtOpaqueDepthPass(uint64_t pipeline){
     std::lock_guard lock(g_pso_clone_mtx);
     const auto i=g_pso_clone.find(pipeline);if(i==g_pso_clone.end())return false;
+    auto& cached=i->second.private_opaque_depth;
+    if(cached>=0)return cached!=0;
+    const bool accepted=[&]() {
     bool vertex=false,depth=false;
     for(const auto& sub:i->second.subs){
         const auto type=sub.type;
@@ -459,6 +472,9 @@ bool RtOpaqueDepthPass(uint64_t pipeline){
         }
     }
     return vertex&&depth;
+    }();
+    cached=int(accepted);
+    return accepted;
 }
 
 // Address reuse replaces the owning clone and therefore this creation stamp.

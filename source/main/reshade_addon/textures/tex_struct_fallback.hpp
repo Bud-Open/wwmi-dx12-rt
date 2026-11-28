@@ -41,8 +41,13 @@
 #include <vector>
 
 #include "tex_struct_solver.hpp"
+#include "tex_struct_recipe_cache.hpp"
 
-extern bool g_tex_struct_fallback;
+extern bool                  g_tex_struct_fallback;
+extern std::atomic<uint64_t> g_layout_regmap_epoch;
+extern std::atomic<uint64_t> g_struct_fb_cache_hits;
+extern std::atomic<uint64_t> g_struct_fb_cache_misses;
+bool ReadPublishedDescriptorAndFormat(const HeapKey& key, ResInfo& out, DXGI_FORMAT& out_fmt, uint64_t* out_res_gen = nullptr) noexcept;
 
 // Implemented in source/main/tex_look.cpp (no ABI change to tex_look.h).
 bool TexLookHasRef(uint32_t target);
@@ -110,6 +115,7 @@ struct VisualResolvedEntry {
     std::wstring name;
     float        score = 0.f;
     std::string  tier;
+    uint32_t     source_lod = 0;
 };
 
 inline bool ReadDdsHeaderMeta(const std::wstring& path, uint32_t& width, uint32_t& height, uint32_t& dxgi_fmt, uint64_t* out_size = nullptr)
@@ -431,11 +437,115 @@ public:
         const uint64_t    layh = CmdGfxLayout(list);
         RegBind           t_ps[8]{};
         {
-            std::lock_guard l(g_layout_regmap_mtx);
-            auto            it = g_layout_regmap.find(layh);
-            if (it == g_layout_regmap.end() || !it->second.built) return;
-            std::memcpy(t_ps, it->second.t_ps, sizeof(t_ps));
+            static thread_local ThreadLayoutPsCache<RegBind> t_layout_cache;
+            const uint64_t cur_epoch = g_layout_regmap_epoch.load(std::memory_order_acquire);
+            bool           built = false;
+            if (!t_layout_cache.find(layh, cur_epoch, built, t_ps)) {
+                uint64_t locked_epoch = 0;
+                {
+                    std::lock_guard l(g_layout_regmap_mtx);
+                    locked_epoch = g_layout_regmap_epoch.load(std::memory_order_relaxed);
+                    auto it = g_layout_regmap.find(layh);
+                    if (it != g_layout_regmap.end() && it->second.built) {
+                        built = true;
+                        std::memcpy(t_ps, it->second.t_ps, sizeof(t_ps));
+                    }
+                }
+                t_layout_cache.put(layh, locked_epoch, built, t_ps);
+            }
+            if (!built) return;
         }
+
+        const uint64_t pre_state = state_seq_.snapshot();
+        const uint64_t pre_meta = TexStructMetaSeq().snapshot();
+        const bool     ps_decl_known = ps_regs.parsed && !ps_regs.unbounded;
+
+        auto read_lod_flags = []() noexcept -> uint8_t {
+            return (g_texlod_alias_off.load(std::memory_order_acquire) ? 1u : 0u) |
+                   (g_texlod_resemblance.load(std::memory_order_acquire) ? 2u : 0u) |
+                   (g_texlod_cache.load(std::memory_order_acquire) ? 4u : 0u);
+        };
+
+        RecipeKey rkey{};
+        rkey.load = load;
+        rkey.dm = dm;
+        rkey.comp = comp;
+        rkey.ps_hash = ps_hash;
+        rkey.ps_regs_lo = ps_regs.lo;
+        rkey.layh = layh;
+        rkey.ps_decl_known = ps_decl_known ? 1u : 0u;
+        rkey.lod_flags = read_lod_flags();
+
+        auto* dev = list->get_device();
+        for (unsigned r = 0; r < 8; ++r) {
+            if (ps_decl_known && !ps_regs.reads(r)) continue;
+            const RegBind& b = t_ps[r];
+            if (b.param == 0xFF || b.param >= 64 || !b.is_table) continue;
+            const TableStart ts = TableStartOf(dev, gs.root[b.param].table);
+            if (!ts) continue;
+            const HeapKey key{ ts.heap, ts.base + b.offset };
+            ResInfo       ri{};
+            DXGI_FORMAT   dfmt = DXGI_FORMAT_UNKNOWN;
+            uint64_t      res_gen = 0;
+            if (!ReadPublishedDescriptorAndFormat(key, ri, dfmt, &res_gen) || !ri.res) continue;
+
+            const uint64_t res_h = reinterpret_cast<uint64_t>(ri.res);
+            const uint32_t hash = TexHashOf(res_h);
+            const bool     pre_ovr = ri.swapped != nullptr ||
+                std::any_of(out_ps.begin(), out_ps.end(), [&](const ShadowSlotOvr& o) {
+                    return o.param == b.param && o.offset == b.offset;
+                });
+
+            RecipeSlotSnap& sn = rkey.slots[rkey.active_count++];
+            sn.reg = static_cast<uint8_t>(r);
+            sn.param = b.param;
+            sn.pre_ovr = pre_ovr ? 1u : 0u;
+            sn.pad = 0u;
+            sn.offset = b.offset;
+            sn.vfmt = static_cast<uint32_t>(dfmt);
+            sn.hash = hash;
+            sn.res_h = res_h;
+            sn.res_gen = res_gen;
+        }
+        if (!rkey.active_count) return;
+
+        static thread_local ThreadRecipeCache t_recipe_cache;
+        if (const RecipeEntry* hit = t_recipe_cache.lookup(rkey, pre_state, pre_meta)) {
+            RtRfxTextureSource live_srcs[8]{};
+            bool               all_ok = true;
+            const wchar_t*     wcl_ns = g_geomods[dm].wcl_ns.c_str();
+            for (uint8_t i = 0; i < hit->bind_count; ++i) {
+                live_srcs[i] = RtResolveRfxTexture(hit->binds[i].fq, wcl_ns);
+                if (!live_srcs[i].srv.ptr || !live_srcs[i].resource) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (all_ok && state_seq_.snapshot() == pre_state && TexStructMetaSeq().snapshot() == pre_meta) {
+                for (uint8_t i = 0; i < hit->bind_count; ++i) {
+                    const auto& b = hit->binds[i];
+                    const auto& src = live_srcs[i];
+                    out_ps.push_back(ShadowSlotOvr{ b.param, b.offset, src.srv });
+                    if (hybrid && out_owners.size() + 1 == out_ps.size())
+                        out_owners.push_back(reinterpret_cast<uint64_t>(src.resource.Get()));
+                    out_textures.emplace_back(src.resource);
+                    if (out_cache) {
+                        FallbackResolvedSlot cached{};
+                        cached.reg = b.reg;
+                        cached.param = b.param;
+                        cached.offset = b.offset;
+                        cached.vfmt = b.vfmt;
+                        cached.srv = src.srv;
+                        cached.res = src.resource;
+                        out_cache->push_back(std::move(cached));
+                    }
+                }
+                g_struct_fb_cache_hits.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            t_recipe_cache.invalidate(rkey);
+        }
+        g_struct_fb_cache_misses.fetch_add(1, std::memory_order_relaxed);
 
         struct DrawSlot {
             unsigned reg = 0;
@@ -456,35 +566,21 @@ public:
         unsigned nslots = 0;
         uint32_t exact_rules_local[8]{};
         unsigned nexact_local = 0;
-        auto*    dev = list->get_device();
 
-        for (unsigned r = 0; r < 8; ++r) {
-            if (ps_regs.parsed && !ps_regs.unbounded && !ps_regs.reads(r)) continue;
-            const RegBind& b = t_ps[r];
-            if (b.param == 0xFF || b.param >= 64 || !b.is_table) continue;
-            const TableStart ts = TableStartOf(dev, gs.root[b.param].table);
-            if (!ts) continue;
-            const HeapKey key{ ts.heap, ts.base + b.offset };
-            ResInfo       ri{};
-            if (!ReadPublishedDescriptor(key, ri) || !ri.res) continue;
-
-            const uint64_t res_h = reinterpret_cast<uint64_t>(ri.res);
-            const uint32_t hash = TexHashOf(res_h);
-            const uint32_t rule = TexRuleHashFor(hash);
+        for (uint8_t si = 0; si < rkey.active_count; ++si) {
+            const RecipeSlotSnap& sn = rkey.slots[si];
+            const uint32_t        hash = sn.hash;
+            const uint32_t        rule = TexRuleHashFor(hash);
             if (rule) {
                 if (nexact_local < 8) exact_rules_local[nexact_local++] = rule;
                 NoteExactHitRule(load, dm, comp, rule);
                 continue;
             }
-            const bool already_ovr = ri.swapped != nullptr ||
-                std::any_of(out_ps.begin(), out_ps.end(), [&](const ShadowSlotOvr& o) {
-                    return o.param == b.param && o.offset == b.offset;
-                });
-            if (already_ovr) continue;
-
+            if (sn.pre_ovr) continue;
             TexInfo ti{};
-            if (!TexDimsOf(res_h, &ti)) continue;
-            const uint32_t vfmt = static_cast<uint32_t>(PublishedViewFormat(key));
+            if (!TexDimsOf(sn.res_h, &ti)) continue;
+
+            const uint32_t vfmt = sn.vfmt;
             const uint32_t mip_parent = hash ? TexVisualParentOf(hash) : 0;
             const uint32_t canon_hash = mip_parent ? mip_parent : hash;
             const bool     is_cutout = (hash && TexLookIsCutoutMask(hash)) ||
@@ -511,16 +607,31 @@ public:
                 }
             }
 
-            slots[nslots++] = DrawSlot{ r, b.param, b.offset, vfmt, ti.width, ti.height, hash, canon_hash, lod, vis_key,
+            slots[nslots++] = DrawSlot{ sn.reg, sn.param, sn.offset, vfmt, ti.width, ti.height, hash, canon_hash, lod, vis_key,
                 vis_is_live, is_cutout, false };
         }
-        if (!nslots) return;
+        if (!nslots) {
+            const uint8_t post_lod_flags = read_lod_flags();
+            if (post_lod_flags == rkey.lod_flags &&
+                PublishSeq::is_stable(pre_state) && PublishSeq::is_stable(pre_meta) &&
+                state_seq_.snapshot() == pre_state && TexStructMetaSeq().snapshot() == pre_meta) {
+                t_recipe_cache.store(rkey, pre_state, pre_meta, nullptr, 0);
+            }
+            return;
+        }
 
         std::shared_ptr<const ModStructIndex> idx = GetOrBuildIndex(load, dm);
-        if (!idx || (idx->all_dds.empty() && idx->extra_override_dds.empty())) return;
+        if (!idx || (idx->all_dds.empty() && idx->extra_override_dds.empty())) {
+            const uint8_t post_lod_flags = read_lod_flags();
+            if (post_lod_flags == rkey.lod_flags &&
+                PublishSeq::is_stable(pre_state) && PublishSeq::is_stable(pre_meta) &&
+                state_seq_.snapshot() == pre_state && TexStructMetaSeq().snapshot() == pre_meta) {
+                t_recipe_cache.store(rkey, pre_state, pre_meta, nullptr, 0);
+            }
+            return;
+        }
 
         const uint32_t guid = idx->object_guid;
-        const bool     ps_decl_known = ps_regs.parsed && !ps_regs.unbounded;
         const uint64_t slot_shader_key = ComputeSlotShaderKey(ps_hash, ps_regs.lo, ps_decl_known);
 
         std::vector<std::wstring> used_fqs;
@@ -531,10 +642,17 @@ public:
             return false;
         };
 
+        RecipeBind emitted_binds[8]{};
+        uint8_t    emitted_count = 0;
+        bool       any_bind_failed = false;
+
         auto bind_resource = [&](const DrawSlot& ds, const std::wstring& fq, const std::wstring& res_name,
                                  const char* action) -> bool {
             const RtRfxTextureSource src = RtResolveRfxTexture(fq, g_geomods[dm].wcl_ns.c_str());
-            if (!src.srv.ptr || !src.resource) return false; // still deferred-loading; next frame retries
+            if (!src.srv.ptr || !src.resource) {
+                any_bind_failed = true;
+                return false; // still deferred-loading; next frame retries
+            }
             out_ps.push_back(ShadowSlotOvr{ ds.param, ds.offset, src.srv });
             if (hybrid && out_owners.size() + 1 == out_ps.size())
                 out_owners.push_back(reinterpret_cast<uint64_t>(src.resource.Get()));
@@ -548,6 +666,9 @@ public:
                 cached.srv = src.srv;
                 cached.res = src.resource;
                 out_cache->push_back(std::move(cached));
+            }
+            if (emitted_count < 8) {
+                emitted_binds[emitted_count++] = RecipeBind{ static_cast<uint8_t>(ds.reg), ds.param, ds.offset, ds.vfmt, fq };
             }
             used_fqs.push_back(fq);
             LogDecisionOnce(load, dm, comp, ds.reg, ds.vfmt, action, 1, 1, res_name,
@@ -663,7 +784,7 @@ public:
                 // Keep cutout neutralizers strictly in the content-hash cache (never in generic proven-slot
                 // replay, so Pass 1.5 cannot whiten a different non-cutout texture on the same slot).
                 if (slot_shader_key && !is_cutout_bind)
-                    NoteProvenSlot(load, idx->fingerprint, dm, comp, slot_shader_key, ds.reg, ds.vfmt, vr);
+                    NoteProvenSlot(load, idx->fingerprint, dm, comp, slot_shader_key, ds.reg, ds.vfmt, matched_key, vr);
                 // Re-enqueue a cached hit only if a higher-res mip arrived during live solving (not F10/restart cache reload).
                 if (obs_changed && vr.tier != "cached") need_enqueue = true;
                 // Mark resolved even while deferred DDS upload is in flight so structural fallback won't collide.
@@ -682,6 +803,7 @@ public:
         // visibility/alpha masks at upload time — including 64x64/128x128 resident mip tails —
         // and neutralizes them with the mod's own verified pure-white [TextureOverride] DDS
         // when its HD hash shifted on DX12/UHD).
+        bool any_pending_neut = false;
         for (unsigned i = 0; i < nslots; ++i) {
             DrawSlot& ds = slots[i];
             if (ds.resolved || !ds.hash || ds.w < 64 || ds.h < 64 || !IsBcRgbaFormat(ds.vfmt)) continue;
@@ -723,6 +845,7 @@ public:
                 }
             }
             if (need_probe) {
+                any_pending_neut = true;
                 EnqueueNeutralizerProbe(load, dm, idx);
                 continue;
             }
@@ -799,14 +922,19 @@ public:
 
             bind_resource(ds, unique_cand->fq, unique_cand->name, "bind_unique");
         }
+
+        const uint8_t post_lod_flags = read_lod_flags();
+        const bool    vis_ready = !any_unresolved_vis || (!need_enqueue && IsCompEvidenceSettled(load, dm, comp));
+        if (!need_enqueue && vis_ready && !any_pending_neut && !any_bind_failed &&
+            post_lod_flags == rkey.lod_flags &&
+            PublishSeq::is_stable(pre_state) && PublishSeq::is_stable(pre_meta) &&
+            state_seq_.snapshot() == pre_state && TexStructMetaSeq().snapshot() == pre_meta) {
+            t_recipe_cache.store(rkey, pre_state, pre_meta, emitted_binds, emitted_count);
+        }
     }
 
 private:
-    struct ObsLod {
-        uint32_t lod = 0;
-        uint32_t vfmt = 0;
-        uint32_t max_dim = 0;
-    };
+    using ObsLod = ObsLodRecord;
     struct AdaptJob {
         unsigned                              load = 0;
         int                                   dm = 0;
@@ -898,19 +1026,27 @@ private:
     };
 
     std::mutex                                               mtx_;
+    PublishSeq                                               state_seq_;
     unsigned                                                 gen_ = 0;
     std::unordered_map<int, std::shared_ptr<ModStructIndex>> indices_;
     std::unordered_map<int, NeutralizerState>                neutralizers_;
     std::unordered_map<int, std::unordered_set<uint32_t>>    exact_hits_;
     std::unordered_map<uint64_t, uint64_t>                   small_hash_comps_;
+    std::unordered_map<uint64_t, uint64_t>                   comp_evidence_seq_;
+    std::unordered_map<uint64_t, uint64_t>                   comp_evaluated_seq_;
     std::unordered_map<int, std::unordered_set<uint32_t>>    shared_engine_hashes_; // dm -> hashes seen on >=3 comps
     std::unordered_map<uint64_t, std::vector<ObsLod>>        observed_lods_; // (dm, comp) -> observed (vis_key, vfmt)
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> cooccur_pairs_; // (dm, comp) -> unordered pairs of same-draw vis_keys
     std::unordered_map<ProvenSlotKey, VisualResolvedEntry, ProvenSlotKeyHash> proven_slots_; // anti-flicker proven (shader_key,comp,slot,vfmt) memory
     std::unordered_map<int, std::unordered_map<std::wstring, StrongFqOwner>> strong_fq_owners_; // dm -> lower(fq) -> high-SSIM owner
     std::unordered_map<DiskKey, VisualResolvedEntry, DiskKeyHash> visual_resolved_;
+    struct DiskSlotValue {
+        std::string fq;
+        uint32_t    source_lod = 0;
+    };
+
     std::unordered_map<DiskKey, std::string, DiskKeyHash>    disk_cache_; // persisted across runs: key -> fq (utf8)
-    std::unordered_map<DiskSlotKey, std::string, DiskSlotKeyHash> disk_slot_cache_; // persisted unambiguous (fp,comp,shader_key,reg,vfmt) -> fq
+    std::unordered_map<DiskSlotKey, DiskSlotValue, DiskSlotKeyHash> disk_slot_cache_; // persisted unambiguous (fp,comp,shader_key,reg,vfmt) -> (fq, source_lod)
     std::unordered_set<DiskSlotKey, DiskSlotKeyHash>         ambiguous_disk_slots_; // slots observed with >1 distinct fq
     std::unordered_set<uint64_t>                             persisted_mip_aliases_; // (child<<32)|parent persisted in disk cache
     bool                                                     disk_loaded_ = false;
@@ -960,6 +1096,7 @@ private:
     void EnsureDiskCacheLoadedLocked()
     {
         if (disk_loaded_) return;
+        PublishSeq::Guard pub(state_seq_);
         disk_loaded_ = true;
         const std::wstring p = DiskCachePath();
         if (p.empty()) return;
@@ -1020,9 +1157,13 @@ private:
                     const uint64_t ps = strtoull(line.substr(t3 + 1, t4 - t3 - 1).c_str(), nullptr, 16);
                     const unsigned reg = static_cast<unsigned>(strtoul(line.substr(t4 + 1, t5 - t4 - 1).c_str(), nullptr, 10));
                     const uint32_t vfmt = static_cast<uint32_t>(strtoul(line.substr(t5 + 1, t6 - t5 - 1).c_str(), nullptr, 10));
-                    const std::string fq = line.substr(t6 + 1);
+                    const size_t   t7 = line.find('\t', t6 + 1);
+                    const std::string fq = (t7 == std::string::npos) ? line.substr(t6 + 1) : line.substr(t6 + 1, t7 - t6 - 1);
+                    const uint32_t src_lod = (t7 == std::string::npos)
+                        ? 0u
+                        : static_cast<uint32_t>(strtoul(line.substr(t7 + 1).c_str(), nullptr, 16));
                     if (fp && ps && vfmt && !fq.empty()) {
-                        disk_slot_cache_[DiskSlotKey{ fp, comp, ps, reg, vfmt }] = fq;
+                        disk_slot_cache_[DiskSlotKey{ fp, comp, ps, reg, vfmt }] = DiskSlotValue{ fq, src_lod };
                         ++loaded_slots;
                     }
                 }
@@ -1054,7 +1195,7 @@ private:
     void FlushDiskCache()
     {
         std::vector<std::tuple<uint64_t, int, uint32_t, std::string>> rows;
-        std::vector<std::tuple<uint64_t, int, uint64_t, unsigned, uint32_t, std::string>> slot_rows;
+        std::vector<std::tuple<uint64_t, int, uint64_t, unsigned, uint32_t, std::string, uint32_t>> slot_rows;
         std::unordered_set<uint32_t> parent_hashes;
         std::vector<std::pair<uint32_t, uint32_t>> mip_rows;
         {
@@ -1067,7 +1208,8 @@ private:
             }
             slot_rows.reserve(disk_slot_cache_.size());
             for (const auto& kv : disk_slot_cache_)
-                slot_rows.emplace_back(kv.first.fp, kv.first.comp, kv.first.ps_hash, kv.first.reg, kv.first.vfmt, kv.second);
+                slot_rows.emplace_back(kv.first.fp, kv.first.comp, kv.first.ps_hash, kv.first.reg, kv.first.vfmt,
+                    kv.second.fq, kv.second.source_lod);
             for (uint64_t packed : persisted_mip_aliases_) {
                 const uint32_t child = static_cast<uint32_t>(packed >> 32);
                 const uint32_t parent = static_cast<uint32_t>(packed & 0xffffffffu);
@@ -1106,13 +1248,24 @@ private:
         }
         if (ok) {
             for (const auto& s : slot_rows) {
-                if (fprintf(f, "S\t%016llx\t%d\t%016llx\t%u\t%u\t%s\n",
-                        static_cast<unsigned long long>(std::get<0>(s)),
-                        std::get<1>(s),
-                        static_cast<unsigned long long>(std::get<2>(s)),
-                        std::get<3>(s),
-                        std::get<4>(s),
-                        std::get<5>(s).c_str()) < 0) {
+                const uint32_t src_lod = std::get<6>(s);
+                const int      rc = src_lod
+                    ? fprintf(f, "S\t%016llx\t%d\t%016llx\t%u\t%u\t%s\t%08x\n",
+                          static_cast<unsigned long long>(std::get<0>(s)),
+                          std::get<1>(s),
+                          static_cast<unsigned long long>(std::get<2>(s)),
+                          std::get<3>(s),
+                          std::get<4>(s),
+                          std::get<5>(s).c_str(),
+                          src_lod)
+                    : fprintf(f, "S\t%016llx\t%d\t%016llx\t%u\t%u\t%s\n",
+                          static_cast<unsigned long long>(std::get<0>(s)),
+                          std::get<1>(s),
+                          static_cast<unsigned long long>(std::get<2>(s)),
+                          std::get<3>(s),
+                          std::get<4>(s),
+                          std::get<5>(s).c_str());
+                if (rc < 0) {
                     ok = false;
                     break;
                 }
@@ -1137,11 +1290,14 @@ private:
     {
         EnsureDiskCacheLoadedLocked();
         if (gen_ == load) return;
+        PublishSeq::Guard pub(state_seq_);
         gen_ = load;
         indices_.clear();
         neutralizers_.clear();
         exact_hits_.clear();
         small_hash_comps_.clear();
+        comp_evidence_seq_.clear();
+        comp_evaluated_seq_.clear();
         shared_engine_hashes_.clear();
         observed_lods_.clear();
         cooccur_pairs_.clear();
@@ -1155,21 +1311,26 @@ private:
     {
         if (!rule) return;
         std::shared_ptr<const ModStructIndex> re_idx;
-        bool                                  requeue = false;
+        std::vector<int>                      requeue_comps;
         {
             std::lock_guard l(mtx_);
             ResetIfNeededLocked(load);
             if (exact_hits_[dm].insert(rule).second) {
-                // New invariant anchor discovered: if we already observed lods on this comp, refresh assignment.
-                auto oit = observed_lods_.find(DmCompKey(dm, comp));
                 auto iit = indices_.find(dm);
-                if (oit != observed_lods_.end() && !oit->second.empty() && iit != indices_.end()) {
-                    re_idx = iit->second;
-                    requeue = true;
+                if (iit != indices_.end()) re_idx = iit->second;
+                for (const auto& kv : observed_lods_) {
+                    if (static_cast<int>(kv.first >> 32) == dm && !kv.second.empty()) {
+                        ++comp_evidence_seq_[kv.first];
+                        if (re_idx) requeue_comps.push_back(static_cast<int>(kv.first & 0xffffffffu));
+                    }
                 }
+                state_seq_.bump();
+                (void)comp;
             }
         }
-        if (requeue && re_idx) EnqueueCompAdapt(load, dm, comp, re_idx);
+        if (re_idx) {
+            for (int c : requeue_comps) EnqueueCompAdapt(load, dm, c, re_idx);
+        }
     }
 
     bool IsExactHitRule(unsigned load, int dm, uint32_t rule)
@@ -1197,6 +1358,7 @@ private:
             for (uint64_t v = mask; v; v &= (v - 1)) ++bits;
             shared_now = (bits >= 3);
             if (shared_now && shared_engine_hashes_[dm].insert(hash).second) {
+                PublishSeq::Guard pub(state_seq_);
                 // Newly identified cross-component engine/FX texture (seen on >=3 components with no seed ref):
                 // purge any premature entries written while only 1-2 components had been observed.
                 auto iit = indices_.find(dm);
@@ -1280,11 +1442,13 @@ private:
             std::lock_guard l(mtx_);
             ResetIfNeededLocked(load);
             const DiskKey dk{ fp, comp, lod };
-            visual_resolved_.erase(dk);
-            if (disk_cache_.erase(dk)) {
+            const bool    erased_mem = (visual_resolved_.erase(dk) > 0);
+            const bool    erased_disk = (disk_cache_.erase(dk) > 0);
+            if (erased_disk) {
                 disk_dirty_ = true;
                 need_flush = true;
             }
+            if (erased_mem || erased_disk) state_seq_.bump();
         }
         if (need_flush) RequestDiskFlush();
     }
@@ -1309,6 +1473,7 @@ private:
             if (iit != indices_.end() && FindResourceInIndex(*iit->second, fq, &matched_fq, &matched_name)) {
                 VisualResolvedEntry e{ matched_fq, matched_name, 1.f, "cached" };
                 visual_resolved_[dk] = e;
+                state_seq_.bump();
                 *out = e;
                 return true;
             }
@@ -1328,6 +1493,7 @@ private:
             const DiskKey dk{ fp, comp, hash };
             auto          prev = visual_resolved_.find(dk);
             changed = (prev == visual_resolved_.end() || _wcsicmp(prev->second.fq.c_str(), vr.fq.c_str()) != 0);
+            const bool tier_changed = (prev == visual_resolved_.end() || prev->second.tier != vr.tier);
             visual_resolved_[dk] = vr;
             const std::string fq_u8 = WideToUtf8(vr.fq);
             auto              dp = disk_cache_.find(dk);
@@ -1336,6 +1502,7 @@ private:
                 disk_dirty_ = true;
                 need_flush = true;
             }
+            if (changed || tier_changed || need_flush) state_seq_.bump();
         }
         if (changed) {
             logger::probe("TEX-AUTO-ADAPT gen=%u mod=%d guid=%u comp=%d lod=%08x tier=%s score=1.000 -> %ls",
@@ -1362,6 +1529,10 @@ private:
                 if (set.insert(PairKey(keys[i], keys[j])).second) added = true;
             }
         }
+        if (added) {
+            ++comp_evidence_seq_[DmCompKey(dm, comp)];
+            state_seq_.bump();
+        }
         return added;
     }
 
@@ -1377,7 +1548,7 @@ private:
     }
 
     void NoteProvenSlot(unsigned load, uint64_t fp, int dm, int comp, uint64_t ps_hash, unsigned reg, uint32_t vfmt,
-        const VisualResolvedEntry& vr)
+        uint32_t source_lod, const VisualResolvedEntry& vr)
     {
         if (!ps_hash || vr.fq.empty()) return;
         const ProvenSlotKey pk{ dm, comp, ps_hash, reg, vfmt };
@@ -1385,28 +1556,48 @@ private:
         {
             std::lock_guard l(mtx_);
             ResetIfNeededLocked(load);
+            // Guard against a concurrent worker revocation between LookupVisualResolved and NoteProvenSlot.
+            if (fp && source_lod) {
+                auto vit = visual_resolved_.find(DiskKey{ fp, comp, source_lod });
+                if (vit == visual_resolved_.end() || _wcsicmp(vit->second.fq.c_str(), vr.fq.c_str()) != 0)
+                    return;
+            }
+            bool mutated = false;
             auto it = proven_slots_.find(pk);
-            if (it == proven_slots_.end() || _wcsicmp(it->second.fq.c_str(), vr.fq.c_str()) != 0)
-                proven_slots_[pk] = vr;
+            if (it == proven_slots_.end() || _wcsicmp(it->second.fq.c_str(), vr.fq.c_str()) != 0 ||
+                (source_lod && (it->second.source_lod == 0 || (it->second.source_lod != source_lod && vr.tier == "high_visual")))) {
+                VisualResolvedEntry tagged = vr;
+                tagged.source_lod = source_lod;
+                proven_slots_[pk] = std::move(tagged);
+                mutated = true;
+            }
             if (fp) {
                 const DiskSlotKey dsk{ fp, comp, ps_hash, reg, vfmt };
                 if (!ambiguous_disk_slots_.count(dsk)) {
                     const std::string fq_u8 = WideToUtf8(vr.fq);
                     auto              dit = disk_slot_cache_.find(dsk);
                     if (dit == disk_slot_cache_.end()) {
-                        disk_slot_cache_[dsk] = fq_u8;
+                        disk_slot_cache_[dsk] = DiskSlotValue{ fq_u8, source_lod };
                         disk_dirty_ = true;
                         need_flush = true;
-                    } else if (_stricmp(dit->second.c_str(), fq_u8.c_str()) != 0) {
+                        mutated = true;
+                    } else if (_stricmp(dit->second.fq.c_str(), fq_u8.c_str()) != 0) {
                         // Multiple distinct textures observed on the same (fp, comp, ps, reg, vfmt)
                         // (e.g. dual-form toggle); never persist an ambiguous slot binding.
                         disk_slot_cache_.erase(dit);
                         ambiguous_disk_slots_.insert(dsk);
                         disk_dirty_ = true;
                         need_flush = true;
+                        mutated = true;
+                    } else if (source_lod && (dit->second.source_lod == 0 || (dit->second.source_lod != source_lod && vr.tier == "high_visual"))) {
+                        dit->second.source_lod = source_lod;
+                        disk_dirty_ = true;
+                        need_flush = true;
+                        mutated = true;
                     }
                 }
             }
+            if (mutated) state_seq_.bump();
         }
         if (need_flush) RequestDiskFlush();
     }
@@ -1430,15 +1621,17 @@ private:
             if (!ambiguous_disk_slots_.count(dsk)) {
                 auto dit = disk_slot_cache_.find(dsk);
                 if (dit != disk_slot_cache_.end()) {
-                    const std::wstring fq = Utf8ToWide(dit->second);
+                    const std::wstring fq = Utf8ToWide(dit->second.fq);
+                    const uint32_t     src_lod = dit->second.source_lod;
                     auto               iit = indices_.find(dm);
                     if (iit != indices_.end()) {
                         for (const auto& c : iit->second->all_dds) {
                             if (_wcsicmp(c.fq.c_str(), fq.c_str()) == 0) {
                                 for (const auto& u : used_fqs)
                                     if (_wcsicmp(u.c_str(), c.fq.c_str()) == 0) return false;
-                                VisualResolvedEntry e{ c.fq, c.name, 1.f, "cached_slot" };
+                                VisualResolvedEntry e{ c.fq, c.name, 1.f, "cached_slot", src_lod };
                                 proven_slots_[pk] = e;
+                                state_seq_.bump();
                                 *out = e;
                                 return true;
                             }
@@ -1450,18 +1643,26 @@ private:
         return false;
     }
 
+    bool IsCompEvidenceSettled(unsigned load, int dm, int comp)
+    {
+        std::lock_guard l(mtx_);
+        ResetIfNeededLocked(load);
+        const uint64_t qk = DmCompKey(dm, comp);
+        const auto     eit = comp_evidence_seq_.find(qk);
+        if (eit == comp_evidence_seq_.end() || eit->second == 0) return false;
+        const auto vit = comp_evaluated_seq_.find(qk);
+        return vit != comp_evaluated_seq_.end() && vit->second == eit->second;
+    }
+
     bool RecordObservedLod(unsigned load, int dm, int comp, uint32_t lod, uint32_t vfmt, uint32_t dim)
     {
         std::lock_guard l(mtx_);
         ResetIfNeededLocked(load);
-        auto& vec = observed_lods_[DmCompKey(dm, comp)];
-        for (auto& e : vec) {
-            if (e.lod != lod) continue;
-            if (dim <= e.max_dim) return false;
-            e.max_dim = dim;
-            return true;
-        }
-        vec.push_back(ObsLod{ lod, vfmt, dim });
+        const uint64_t qk = DmCompKey(dm, comp);
+        auto&          vec = observed_lods_[qk];
+        if (!UpsertObservedLod(vec, lod, vfmt, dim)) return false;
+        ++comp_evidence_seq_[qk];
+        state_seq_.bump();
         return true;
     }
 
@@ -1630,10 +1831,13 @@ private:
         std::lock_guard l(mtx_);
         ResetIfNeededLocked(load);
         auto [it, inserted] = indices_.emplace(dm, built);
-        if (inserted && (!built->all_dds.empty() || !built->extra_override_dds.empty())) {
-            logger::probe("TEX-STRUCT-INDEX gen=%u mod=%d guid=%u dds=%zu extra_dds=%zu excl_buckets=%zu fp=%016llx",
-                load, dm + 1, mod.object_guid, built->all_dds.size(), built->extra_override_dds.size(),
-                built->excl_by_comp_fmt.size(), static_cast<unsigned long long>(built->fingerprint));
+        if (inserted) {
+            state_seq_.bump();
+            if (!built->all_dds.empty() || !built->extra_override_dds.empty()) {
+                logger::probe("TEX-STRUCT-INDEX gen=%u mod=%d guid=%u dds=%zu extra_dds=%zu excl_buckets=%zu fp=%016llx",
+                    load, dm + 1, mod.object_guid, built->all_dds.size(), built->extra_override_dds.size(),
+                    built->excl_by_comp_fmt.size(), static_cast<unsigned long long>(built->fingerprint));
+            }
         }
         return it->second;
     }
@@ -1694,6 +1898,7 @@ private:
         {
             std::lock_guard l(mtx_);
             if (gen_ != job.load) return;
+            PublishSeq::Guard pub(state_seq_);
             neutralizers_[job.dm] = st;
         }
         if (st.found) {
@@ -1742,11 +1947,15 @@ private:
         std::unordered_set<uint32_t>                    shared_hashes;
         std::unordered_map<std::wstring, StrongFqOwner> strong_owners;
         std::unordered_map<uint32_t, std::wstring>      persisted_fqs;
+        const uint64_t                                  qk = DmCompKey(job.dm, job.comp);
+        uint64_t                                        snap_ev_seq = 0;
         {
             std::lock_guard l(mtx_);
             if (gen_ != job.load) return;
-            auto oit = observed_lods_.find(DmCompKey(job.dm, job.comp));
+            auto oit = observed_lods_.find(qk);
             if (oit == observed_lods_.end() || oit->second.empty()) return;
+            if (auto ev_it = comp_evidence_seq_.find(qk); ev_it != comp_evidence_seq_.end())
+                snap_ev_seq = ev_it->second;
             obs = oit->second;
             auto eit = exact_hits_.find(job.dm);
             if (eit != exact_hits_.end()) exact_anchors = eit->second;
@@ -1772,11 +1981,32 @@ private:
                 }
             }
         }
+        std::vector<uint8_t> obs_missing_sig;
+        auto mark_evaluated = [&]() {
+            if (!snap_ev_seq) return;
+            std::lock_guard l(mtx_);
+            if (gen_ != job.load) return;
+            bool mutated = false;
+            if (!obs_missing_sig.empty()) {
+                auto oit = observed_lods_.find(qk);
+                if (oit != observed_lods_.end()) {
+                    const auto cur_ev = comp_evidence_seq_.find(qk);
+                    const bool unchanged = (cur_ev != comp_evidence_seq_.end() && cur_ev->second == snap_ev_seq);
+                    mutated |= ApplyWorkerSigAvailability(oit->second, obs, obs_missing_sig, unchanged);
+                }
+            }
+            auto& ev = comp_evaluated_seq_[qk];
+            if (ev < snap_ev_seq) {
+                ev = snap_ev_seq;
+                mutated = true;
+            }
+            if (mutated) state_seq_.bump();
+        };
         if (!shared_hashes.empty()) {
             obs.erase(std::remove_if(obs.begin(), obs.end(),
                           [&](const ObsLod& e) { return shared_hashes.count(e.lod) != 0; }),
                 obs.end());
-            if (obs.empty()) return;
+            if (obs.empty()) { mark_evaluated(); return; }
         }
         // Collapse streaming sub-mip observations whose proven mip0 parent is already present
         // in obs or already resolved, so a lower mip never competes against its own parent
@@ -1791,11 +2021,11 @@ private:
                 return obs_keys.count(parent) != 0 || persisted_fqs.count(parent) != 0;
             }),
                 obs.end());
-            if (obs.empty()) return;
+            if (obs.empty()) { mark_evaluated(); return; }
         }
 
         auto cit = job.idx->by_comp.find(job.comp);
-        if (cit == job.idx->by_comp.end() || cit->second.empty()) return;
+        if (cit == job.idx->by_comp.end() || cit->second.empty()) { mark_evaluated(); return; }
 
         // Build component candidate pool (excluding invariant exact-hit anchors)
         std::vector<const ModTexCandidate*> pool;
@@ -1805,7 +2035,7 @@ private:
             if (c.file_hash && exact_anchors.count(c.file_hash)) continue;
             pool.push_back(&c);
         }
-        if (pool.empty()) return;
+        if (pool.empty()) { mark_evaluated(); return; }
 
         // Decode 5-patch signatures (cached per file; ~1.3 MB seek-read per 8K DDS)
         std::vector<const PatchSig*> pool_sigs(pool.size(), nullptr);
@@ -1817,6 +2047,7 @@ private:
         // Copy canonical HD seed references OR live-texture 5-patch signatures for each observed key
         std::vector<PatchSig> obs_refs(obs.size());
         std::vector<uint32_t> eff_dims(obs.size());
+        obs_missing_sig.assign(obs.size(), 0u);
         for (size_t gi = 0; gi < obs.size(); ++gi) {
             uint32_t rw = 0, rh = 0;
             if (TexLookCopyAnySig(obs[gi].lod, &obs_refs[gi].codec, &obs_refs[gi].nch,
@@ -1841,6 +2072,8 @@ private:
                     }
                     obs_refs[gi].valid = !obs_refs[gi].is_flat();
                 }
+            } else {
+                obs_missing_sig[gi] = 1u;
             }
             eff_dims[gi] = (std::max)(obs[gi].max_dim, (std::max)(rw, rh));
         }
@@ -1882,14 +2115,6 @@ private:
                 const PatchSig*        csig = pool_sigs[ri];
                 if (!csig || !csig->valid) continue;
 
-                // Exclude non-exclusive candidates already strongly claimed (SSIM >= 0.55) by another component
-                // for a different game texture hash (prevents e.g. 6-component hair DDS from hijacking torso).
-                if (!c->exclusive) {
-                    auto oit = strong_owners.find(LowerStr(c->fq));
-                    if (oit != strong_owners.end() && oit->second.comp != job.comp && oit->second.key != obs[gi].lod)
-                        continue;
-                }
-
                 const bool flat = csig->is_flat();
                 const bool exact_fmt = (c->dxgi_fmt == vfmt);
                 double     ssim = -1.0;
@@ -1902,6 +2127,18 @@ private:
                     comb = 0.60 * (std::max)(0.0, ssim) + 0.40 * hist;
                     if (exact_fmt) comb += 0.05;
                     if (c->exclusive) comb += 0.03;
+                }
+
+                // Exclude non-exclusive candidates already strongly claimed (SSIM >= 0.55) by another component
+                // for a different game texture hash unless this observation itself is a direct high-SSIM match
+                // (prevents e.g. 6-component hair DDS from hijacking torso while allowing streaming mip upgrades
+                // of a shared multi-component texture to bind cleanly regardless of component worker ordering).
+                if (!c->exclusive) {
+                    auto oit = strong_owners.find(LowerStr(c->fq));
+                    if (oit != strong_owners.end() &&
+                        ShouldExcludeCrossCompStrongOwner(c->exclusive, flat, ssim,
+                            oit->second.comp, oit->second.key, job.comp, obs[gi].lod))
+                        continue;
                 }
 
                 // Order-independent exclusive-first gating: when this component already has non-flat exclusive
@@ -1928,9 +2165,9 @@ private:
         const auto match = SolveVisualAssignment(evals, obs_refs, eff_dims, twins, cooccurs);
         const auto& assigned = match.assigned;
 
-        // Evaluate confidence + twin-variant consistency check and publish resolved entries
+        // Evaluate confidence + twin-variant / direct-SSIM owner reconciliation and publish resolved entries
         std::vector<std::tuple<uint32_t, VisualResolvedEntry, double, double, bool>> resolved_batch;
-        std::vector<std::pair<uint32_t, const std::wstring*>> rejected_twins;
+        std::vector<std::pair<uint32_t, const std::wstring*>> revoked_bindings;
         for (size_t gi = 0; gi < obs.size(); ++gi) {
             const int chosen_ri = assigned[gi];
 
@@ -1950,11 +2187,16 @@ private:
                 if (ev.exclusive && ev.exact_fmt) ++excl_same_all;
                 if (ev.ri == chosen_ri) {
                     chosen = &ev;
-                } else if (!ev.is_flat && (chosen_ri >= 0 || twins.colors[ev.ri])) {
-                    if (match.blocked[gi][ev.ri] || taken_by_cooccur(ev.ri)) {
-                        if (twins.colors[ev.ri]) rejected_twins.emplace_back(obs[gi].lod, &pool[ev.ri]->fq);
-                    } else if (chosen_ri >= 0) {
-                        others.push_back(&ev);
+                } else {
+                    const bool claimed_direct = (ev.ssim < kDirectSsim) &&
+                        IsClaimedByOtherDirectSsim(gi, ev.ri, evals, assigned);
+                    if (!ev.is_flat && (chosen_ri >= 0 || twins.colors[ev.ri] || claimed_direct)) {
+                        if (match.blocked[gi][ev.ri] || taken_by_cooccur(ev.ri) || claimed_direct) {
+                            if (twins.colors[ev.ri] || claimed_direct)
+                                revoked_bindings.emplace_back(obs[gi].lod, &pool[ev.ri]->fq);
+                        } else if (chosen_ri >= 0) {
+                            others.push_back(&ev);
+                        }
                     }
                 }
             }
@@ -2023,16 +2265,17 @@ private:
                 win->exclusive);
         }
 
-        if (resolved_batch.empty() && rejected_twins.empty()) return;
+        if (resolved_batch.empty() && revoked_bindings.empty()) { mark_evaluated(); return; }
         std::vector<int> requeue_others;
         {
             std::lock_guard l(mtx_);
             if (gen_ != job.load) return;
             const auto shared = shared_engine_hashes_.find(job.dm);
+            bool       mutated = false;
 
-            // A binding published before a larger mip or co-occurrence appeared must
-            // not survive a twin rejection via the visual or anti-flicker cache.
-            for (const auto& [lod, fq] : rejected_twins) {
+            // A weak binding published before a larger mip, co-occurrence, or direct-SSIM owner
+            // appeared must not survive via the visual, disk, or anti-flicker proven-slot cache.
+            for (const auto& [lod, fq] : revoked_bindings) {
                 const DiskKey dk{ job.idx->fingerprint, job.comp, lod };
                 const auto prev = visual_resolved_.find(dk);
                 const auto disk = disk_cache_.find(dk);
@@ -2041,6 +2284,7 @@ private:
                 const std::string fq_u8 = WideToUtf8(*fq);
                 const bool was_cached = disk != disk_cache_.end() && _stricmp(disk->second.c_str(), fq_u8.c_str()) == 0;
                 if (!(was_visual || was_cached)) continue;
+                mutated = true;
                 if (was_visual) visual_resolved_.erase(prev);
                 if (was_cached) {
                     disk_cache_.erase(disk);
@@ -2048,13 +2292,17 @@ private:
                 }
                 std::erase_if(proven_slots_, [&](const auto& kv) {
                     return kv.first.dm == job.dm && kv.first.comp == job.comp &&
-                        _wcsicmp(kv.second.fq.c_str(), fq->c_str()) == 0;
+                        _wcsicmp(kv.second.fq.c_str(), fq->c_str()) == 0 &&
+                        ShouldRevokeSlotForSource(kv.second.source_lod, lod);
                 });
                 if (std::erase_if(disk_slot_cache_, [&](const auto& kv) {
                         return kv.first.fp == dk.fp && kv.first.comp == job.comp &&
-                            _stricmp(kv.second.c_str(), fq_u8.c_str()) == 0;
+                            _stricmp(kv.second.fq.c_str(), fq_u8.c_str()) == 0 &&
+                            ShouldRevokeSlotForSource(kv.second.source_lod, lod);
                     }))
                     disk_dirty_ = true;
+                logger::probe("TEX-AUTO-ADAPT gen=%u mod=%d guid=%u comp=%d lod=%08x action=revoke_displaced -> %s",
+                    job.load, job.dm + 1, job.idx->object_guid, job.comp, lod, fq_u8.c_str());
             }
             auto& owner_map = strong_fq_owners_[job.dm];
             bool  new_strong_shared = false;
@@ -2067,12 +2315,15 @@ private:
                 const DiskKey              dk{ job.idx->fingerprint, job.comp, lod };
                 auto                       prev = visual_resolved_.find(dk);
                 const bool                 changed = (prev == visual_resolved_.end() || prev->second.fq != ent.fq);
+                const bool                 tier_changed = (prev == visual_resolved_.end() || prev->second.tier != ent.tier);
+                if (changed || tier_changed) mutated = true;
                 visual_resolved_[dk] = ent;
                 const std::string          fq_u8 = WideToUtf8(ent.fq);
                 auto                       dp = disk_cache_.find(dk);
                 if (dp == disk_cache_.end() || dp->second != fq_u8) {
                     disk_cache_[dk] = fq_u8;
                     disk_dirty_ = true;
+                    mutated = true;
                 }
                 if (!is_excl && ssim >= 0.55) {
                     const std::wstring lfq = LowerStr(ent.fq);
@@ -2080,6 +2331,7 @@ private:
                     if (oit == owner_map.end() || ssim > oit->second.ssim + 0.02) {
                         owner_map[lfq] = StrongFqOwner{ job.comp, lod, ssim };
                         new_strong_shared = true;
+                        mutated = true;
                     }
                 }
                 if (changed) {
@@ -2088,14 +2340,32 @@ private:
                         ent.tier.c_str(), ent.score, ssim, std::get<3>(item), ent.name.c_str());
                 }
             }
+            if (!obs_missing_sig.empty()) {
+                auto oit = observed_lods_.find(qk);
+                if (oit != observed_lods_.end()) {
+                    const auto cur_ev = comp_evidence_seq_.find(qk);
+                    const bool unchanged = (cur_ev != comp_evidence_seq_.end() && cur_ev->second == snap_ev_seq);
+                    mutated |= ApplyWorkerSigAvailability(oit->second, obs, obs_missing_sig, unchanged);
+                }
+            }
+            if (snap_ev_seq) {
+                auto& ev = comp_evaluated_seq_[qk];
+                if (ev < snap_ev_seq) {
+                    ev = snap_ev_seq;
+                    mutated = true;
+                }
+            }
             if (new_strong_shared) {
                 for (const auto& kv : observed_lods_) {
                     const int dm_k = static_cast<int>(kv.first >> 32);
                     const int comp_k = static_cast<int>(kv.first & 0xffffffffu);
-                    if (dm_k == job.dm && comp_k != job.comp && !kv.second.empty())
+                    if (dm_k == job.dm && comp_k != job.comp && !kv.second.empty()) {
+                        ++comp_evidence_seq_[kv.first];
                         requeue_others.push_back(comp_k);
+                    }
                 }
             }
+            if (mutated) state_seq_.bump();
         }
         for (int other_c : requeue_others) EnqueueCompAdapt(job.load, job.dm, other_c, job.idx);
     }

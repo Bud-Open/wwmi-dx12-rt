@@ -5,6 +5,7 @@
 // ===========================================================================
 #include "tex_lod.h"
 #include "tex_seed_dirs.hpp"
+#include "tex_struct_recipe_cache.hpp"
 #include "../../src/log.h"
 
 extern bool g_tex_struct_fallback;
@@ -131,6 +132,7 @@ std::atomic<const std::vector<uint32_t>*> g_degen_snap{ nullptr }; // g_degenera
 
 void publish_degenerate()
 { // caller holds g_mtx
+    wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
     g_degen_snap.store(new std::vector<uint32_t>(g_degenerate.begin(), g_degenerate.end()), std::memory_order_release);
 }
 
@@ -276,7 +278,10 @@ void publish(uint32_t low)
 {
     auto it = g_records.find(low);
     if (it == g_records.end() || it->second.links.empty()) {
-        if (entry_of(low)) tab_set(low, nullptr);
+        if (entry_of(low)) {
+            wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
+            tab_set(low, nullptr);
+        }
         return;
     }
     const Rec&  r = it->second;
@@ -294,6 +299,7 @@ void publish(uint32_t low)
         delete e;
         return;
     }
+    wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
     tab_set(low, e);
 }
 
@@ -789,10 +795,13 @@ void TexLodInit(const std::wstring& cache_dir)
 void TexLodSetCache(bool on)
 {
     std::lock_guard l(g_mtx);
-    if (g_texlod_cache == on) return;
+    if (g_texlod_cache.load(std::memory_order_relaxed) == on) return;
     if (!on && g_dirty) rewrite_cache(); // what was learned while it was on is kept for when it is on again
-    g_texlod_cache = on;
-    load_all();
+    {
+        wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
+        g_texlod_cache.store(on, std::memory_order_release);
+        load_all();
+    }
     if (on) logger::write("TexLod: texture match cache on -- read back; learning and saving again");
 }
 
@@ -848,11 +857,24 @@ void TexLodTargetsReady(bool (*is_target)(uint32_t hash, void* user), void* user
         g_records.size(), folded, narrowed, dropped.size());
 }
 
+void TexLodSetAliasOff(bool on)
+{
+    std::lock_guard l(g_mtx);
+    if (g_texlod_alias_off.load(std::memory_order_relaxed) == on) return;
+    {
+        wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
+        g_texlod_alias_off.store(on, std::memory_order_release);
+    }
+}
+
 void TexLodSetResemblance(bool on)
 {
     std::lock_guard l(g_mtx);
-    if (g_texlod_resemblance == on) return;
-    g_texlod_resemblance = on;
+    if (g_texlod_resemblance.load(std::memory_order_relaxed) == on) return;
+    {
+        wwmi_struct_tex::PublishSeq::Guard pub(TexStructMetaSeq());
+        g_texlod_resemblance.store(on, std::memory_order_release);
+    }
     size_t lookalike = 0;
     for (auto& kv : g_records) lookalike += !exact(kv.second);
     logger::write("TexLod: look-alike matches %s -- %zu look-alike low(s) %s", on ? "ON" : "OFF", lookalike,
@@ -902,10 +924,10 @@ uint32_t exact_high(const Entry* e)
 
 uint32_t TexLodLookup(uint32_t hash)
 {
-    if (g_texlod_alias_off) return 0;
+    if (g_texlod_alias_off.load(std::memory_order_acquire)) return 0;
     const Entry* e = entry_of(hash); // no lock: see g_tab
     if (!e || e->exact) return exact_high(e);
-    return g_texlod_resemblance && e->highs.size() == 1 ? e->highs.front() : 0;
+    return g_texlod_resemblance.load(std::memory_order_acquire) && e->highs.size() == 1 ? e->highs.front() : 0;
 }
 uint32_t TexLodKnown(uint32_t hash)
 {

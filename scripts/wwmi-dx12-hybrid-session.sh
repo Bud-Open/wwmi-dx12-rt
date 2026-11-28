@@ -11,6 +11,7 @@ export QT_IM_MODULE=compose
 APPID=3513350
 MODE="run"
 SKIN="exact"
+PERF_WINDOW=0
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PLAY="${HERE%/*}/play.sh"
 # 本包只替换含绘制摘要的主 DLL，沿用已验证的 Wine 文件名编码兼容库。
@@ -45,9 +46,10 @@ while [[ $# -gt 0 ]]; do
         --dry-run) MODE="dry-run" ;;
         --recover) MODE="recover" ;;
         --base-skin) SKIN="base" ;;
+        --perf-window) PERF_WINDOW=1 ;;
         -h|--help)
-            printf '用法：%s [--base-skin] [--dry-run|--recover]\n' "${PLAY##*/}"
-            printf '%s\n' '默认：缺准确形变的原生 draw 保留游戏外观。' '--base-skin：第三方全外观－基础蒙皮；保留真实骨骼，可能省略额外表情。'
+            printf '用法：%s [--base-skin] [--perf-window] [--dry-run|--recover]\n' "${PLAY##*/}"
+            printf '%s\n' '默认：缺准确形变的原生 draw 保留游戏外观。' '--base-skin：第三方全外观－基础蒙皮；保留真实骨骼，可能省略额外表情。' '--perf-window：仅开启一次性性能拆解令牌（需写入 wwmi-rt-scene-arm.request 才触发，默认关闭）。'
             exit 0 ;;
         *) printf '未知参数：%s\n' "$1" >&2; exit 64 ;;
     esac
@@ -328,8 +330,15 @@ export WWMI_HYBRID_RASTER_MODE="$SKIN"
 # 继承的变量名虽为 CAPTURE_DIR，用于存放本轮会话独立日志，同时保持回调注册激活。
 runtime_dir="$(cd -- "$RUN_DIR/deploy" && pwd -P)" || finish 1 "runtime-dir-unavailable"
 export WWMI_RT_CAPTURE_DIR="Z:${runtime_dir//\//\\}"
-# 不提供观察令牌，不开 Material CHS/场景快照或 Shape 采集。
-unset WWMI_RT_CAPTURE_SESSION WWMI_RT_SHAPE_EVIDENCE WWMI_RT_SHAPE_EVIDENCE_DIR
+# 默认不提供观察令牌，不开 Material CHS/场景快照或 Shape 采集；仅 --perf-window 启用一次性性能拆解令牌。
+unset WWMI_RT_SHAPE_EVIDENCE WWMI_RT_SHAPE_EVIDENCE_DIR WWMI_RT_CAPTURE_SESSION
+if (( PERF_WINDOW )); then
+    export WWMI_RT_PERF_SESSION="perf-$STAMP"
+    export WWMI_RT_PERF_QUIET_CLOTH=1
+    log "性能拆解模式：session=$WWMI_RT_PERF_SESSION 触发文件=$RUN_DIR/deploy/wwmi-rt-scene-arm.request"
+else
+    unset WWMI_RT_PERF_SESSION WWMI_RT_PERF_QUIET_CLOTH
+fi
 export LANG=zh_CN.UTF-8 LC_ALL=zh_CN.UTF-8 HOST_LC_ALL=zh_CN.UTF-8
 export STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_DIR"
 export STEAM_COMPAT_DATA_PATH="$COMPAT_DATA"

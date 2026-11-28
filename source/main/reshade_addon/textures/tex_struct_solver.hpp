@@ -276,6 +276,50 @@ inline double DifferingPatchBonus(const PatchColors& obs, const PatchColors& can
 
 inline constexpr double kDirectSsim = 0.75;
 
+// True when candidate `ri` is already assigned in this component solve to a *different* row `gj`
+// with direct high-SSIM proof (`ssim >= kDirectSsim`). Used to exclude already-proven owners from
+// acting as local rivals against weaker competing rows, and to revoke stale weak bindings.
+inline bool IsClaimedByOtherDirectSsim(
+    size_t gi, int ri,
+    const std::vector<std::vector<CandEval>>& evals,
+    const std::vector<int>& assigned)
+{
+    if (ri < 0) return false;
+    for (size_t gj = 0; gj < assigned.size(); ++gj) {
+        if (gj == gi || assigned[gj] != ri) continue;
+        for (const auto& ev : evals[gj]) {
+            if (ev.ri == ri) {
+                if (ev.ssim >= kDirectSsim) return true;
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+// True when a proven-slot entry recorded under `slot_source_lod` (0 for legacy unattributed rows)
+// belongs to the displaced visual key `revoked_lod` and should be erased without harming a direct
+// owner that proved a different shader slot for the same mod DDS.
+inline bool ShouldRevokeSlotForSource(uint32_t slot_source_lod, uint32_t revoked_lod) noexcept
+{
+    return slot_source_lod == 0u || slot_source_lod == revoked_lod;
+}
+
+// True when a non-exclusive candidate already strongly owned by another component (`owner_comp != job_comp`)
+// for a different texture key (`owner_key != obs_key`) should be excluded from this row's candidate pool.
+// A direct high-SSIM match (`!flat && ssim >= kDirectSsim`) is never excluded: streaming mip upgrades
+// (e.g. 512px -> 1024px -> 2048px) of a shared native texture carry different mip hashes across components
+// and must still match their true shared DDS regardless of worker order or which mip populated strong_owners.
+inline bool ShouldExcludeCrossCompStrongOwner(
+    bool exclusive, bool flat, double ssim,
+    int owner_comp, uint32_t owner_key,
+    int job_comp, uint32_t obs_key) noexcept
+{
+    if (exclusive) return false;
+    if (owner_comp == job_comp || owner_key == obs_key) return false;
+    return flat || ssim < kDirectSsim;
+}
+
 inline double TwinRankWeight(const CandEval& ev, const std::vector<CandEval>& row,
     const TwinGroups& twins, const PatchSig& ref, std::optional<PatchColors>& ref_colors)
 {

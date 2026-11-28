@@ -174,6 +174,56 @@ ID3D12Resource* CustomResourceDx12(const void* custom)
     return wr ? wr->dx12 : nullptr;
 }
 
+static bool ReadCustomBufferLocked(CustomResource& cr, BufferResourceInfo* out)
+{
+    if (!cr.substantiated) {
+        const CustomResourceType t = cr.override_type;
+        const bool               declared_buffer = (t == CustomResourceType::BUFFER ||
+            t == CustomResourceType::STRUCTURED_BUFFER ||
+            t == CustomResourceType::RAW_BUFFER);
+        const bool               buf_file = !declared_buffer && HasBufExt(cr.filename);
+
+        if (!declared_buffer && !buf_file) return false;
+
+        cr.Substantiate(g_dev.GetPassThroughOrigDevice1(),
+            (D3D11_BIND_FLAG)0, (D3D11_RESOURCE_MISC_FLAG)0);
+    }
+
+    MigotoPort::WrapResource* wr = MigotoPort::AsWrapResource(cr.resource);
+    if (!wr || !wr->dx12) return false;
+    if (wr->dim != D3D11_RESOURCE_DIMENSION_BUFFER) return false; // textures go through the SRV walk
+
+    out->dx12 = wr->dx12;
+    out->gpu_va = (unsigned long long)wr->dx12->GetGPUVirtualAddress() + wr->gpu_va;
+
+    if (auto* wb = static_cast<MigotoPort::WrapBuffer*>(wr)) {
+        out->byte_width = wb->desc.ByteWidth;
+        out->stride = wb->desc.StructureByteStride;
+    }
+    if (cr.stride) out->stride = cr.stride;
+    if (!out->byte_width && cr.buf_size) out->byte_width = cr.buf_size;
+    return true;
+}
+
+const void* FindCustomResourceHandle(const wchar_t* fq_name)
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded || !fq_name) return nullptr;
+    thread_local std::wstring lookup_key;
+    lookup_key.assign(fq_name);
+    auto it = customResources.find(lookup_key);
+    return (it == customResources.end()) ? nullptr : static_cast<const void*>(&it->second);
+}
+
+bool ReadBufferResourceHandle(const void* handle, BufferResourceInfo* out)
+{
+    if (!out) return false;
+    *out = BufferResourceInfo{};
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded || !handle) return false;
+    return ReadCustomBufferLocked(*const_cast<CustomResource*>(static_cast<const CustomResource*>(handle)), out);
+}
+
 bool GetBufferResource(const wchar_t* fq_name, BufferResourceInfo* out)
 {
     if (!out) return false;
@@ -185,34 +235,7 @@ bool GetBufferResource(const wchar_t* fq_name, BufferResourceInfo* out)
     lookup_key.assign(fq_name);
     auto it = customResources.find(lookup_key);
     if (it == customResources.end()) return false;
-
-    if (!it->second.substantiated) {
-        const CustomResourceType t = it->second.override_type;
-        const bool               declared_buffer = (t == CustomResourceType::BUFFER ||
-            t == CustomResourceType::STRUCTURED_BUFFER ||
-            t == CustomResourceType::RAW_BUFFER);
-        const bool               buf_file = !declared_buffer && HasBufExt(it->second.filename);
-
-        if (!declared_buffer && !buf_file) return false;
-
-        it->second.Substantiate(g_dev.GetPassThroughOrigDevice1(),
-            (D3D11_BIND_FLAG)0, (D3D11_RESOURCE_MISC_FLAG)0);
-    }
-
-    MigotoPort::WrapResource* wr = MigotoPort::AsWrapResource(it->second.resource);
-    if (!wr || !wr->dx12) return false;
-    if (wr->dim != D3D11_RESOURCE_DIMENSION_BUFFER) return false; // textures go through the SRV walk
-
-    out->dx12 = wr->dx12;
-    out->gpu_va = (unsigned long long)wr->dx12->GetGPUVirtualAddress() + wr->gpu_va;
-
-    if (auto* wb = static_cast<MigotoPort::WrapBuffer*>(wr)) {
-        out->byte_width = wb->desc.ByteWidth;
-        out->stride = wb->desc.StructureByteStride;
-    }
-    if (it->second.stride) out->stride = it->second.stride;
-    if (!out->byte_width && it->second.buf_size) out->byte_width = it->second.buf_size;
-    return true;
+    return ReadCustomBufferLocked(it->second, out);
 }
 
 size_t BufferInitialData(const wchar_t* fq_name, void* out, size_t cap)

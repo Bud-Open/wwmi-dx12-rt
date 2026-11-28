@@ -1155,11 +1155,13 @@ uint32_t SwitchOfResource(const wchar_t* res_fq)
     if (!res_fq || !*res_fq) return 0;
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     if (!g_loaded) return 0;
-    static std::unordered_map<const CustomResource*, uint32_t> s_switch;
-    static unsigned                                            s_gen = ~0u;
-    const unsigned                                             gen = LoadGeneration();
+    static std::unordered_map<const CustomResource*, uint32_t>                       s_switch;
+    static std::unordered_map<size_t, std::vector<std::pair<std::wstring, uint32_t>>> s_name_switch;
+    static unsigned                                                                  s_gen = ~0u;
+    const unsigned                                                                   gen = LoadGeneration();
     if (gen != s_gen) {
         s_switch.clear();
+        s_name_switch.clear();
         s_gen = gen;
         const auto t0 = std::chrono::steady_clock::now();
         size_t     sections = 0;
@@ -1176,10 +1178,19 @@ uint32_t SwitchOfResource(const wchar_t* res_fq)
         logger::write("RFX-SWITCHES gen=%u: %zu [TextureOverride] section(s) switch among %zu resource(s), found in %.2f ms",
             gen, sections, s_switch.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
-    auto it = customResources.find(res_fq);
-    if (it == customResources.end()) return 0;
-    auto sw = s_switch.find(&it->second);
-    return sw == s_switch.end() ? 0 : sw->second;
+    const std::wstring_view key(res_fq);
+    const size_t            kh = std::hash<std::wstring_view>{}(key);
+    auto&                   bucket = s_name_switch[kh];
+    for (const auto& entry : bucket)
+        if (entry.first == key) return entry.second;
+    uint32_t result = 0;
+    auto     it = customResources.find(std::wstring(key));
+    if (it != customResources.end()) {
+        auto sw = s_switch.find(&it->second);
+        if (sw != s_switch.end()) result = sw->second;
+    }
+    bucket.emplace_back(std::wstring(key), result);
+    return result;
 }
 
 std::vector<uint32_t> TextureOverrideHashesOfResource(const wchar_t* res_fq)
